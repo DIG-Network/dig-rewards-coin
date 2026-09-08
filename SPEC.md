@@ -63,7 +63,7 @@ of them may be derived from another.
 | name in this document | what it is | who owns it |
 |---|---|---|
 | **distributor epoch** | `RewardDistributorConstants::epoch_seconds` — the CHIP-0051 reward-accrual window, curried at launch, immutable | this crate (§8) |
-| **mirror-collateral epoch** | the `epoch` ordinal in a mirror advertisement `(store, root, owner, epoch)`; a coin qualifies for the census of epoch `n` only by declaring `n-1` exactly | `dig-mirror-coin` / `dig-mirror-collateral`; the calendar is an INPUT neither crate owns (`dig-mirror-coin/SPEC.md` §8.2 C4 and :371-372) |
+| **mirror-collateral epoch** | the `epoch` ordinal in a mirror advertisement `(store, root, owner, epoch)`; a coin qualifies for the census of epoch `n` only by declaring `n-1` exactly. **Its length is undefined in the codebase** — see below | nobody yet. The calendar is an INPUT neither `dig-mirror-coin` nor `dig-mirror-collateral` owns (`dig-mirror-coin/SPEC.md` §8.2 C4 and :371-372); ownership is #3259 |
 | **`dig-epoch` L2 epoch** | DIG L2 epoch geometry — phases, checkpoint competition, `EPOCH_L1_BLOCKS = 32` (`modules/crates/30-network/dig-epoch/src/constants.rs:174`) | `dig-epoch` |
 
 Normatively:
@@ -77,11 +77,26 @@ Normatively:
 3. Prose, log lines, field names and RPC fields MUST qualify the word: `distributor_epoch_seconds`,
    `mirror_collateral_epoch`. A bare `epoch` in this crate's public API is a defect.
 
-The two lengths coincide by choice and not by wiring: §8.1 sets `epoch_seconds` to seven days, which
-is also the mirror-collateral epoch length (`dig-mirror-collateral/src/constants.rs:216-217`). The
-**phases** are independent — `first_epoch_start` is chosen per distributor at launch — and an
-implementation MUST NOT align them, assume they are aligned, or read a distributor boundary as a
-collateral boundary.
+**The mirror-collateral epoch has no defined length anywhere in the codebase.** There is no
+epoch-length constant in `dig-mirror-coin` or `dig-mirror-collateral`, and this document MUST NOT
+assert one. The "seven-day epoch" phrase that appears in
+`dig-mirror-collateral/src/constants.rs:216-217` is an illustrative ratio inside the doc comment on
+`CENSUS_FINALITY_DEPTH_BLOCKS = 32` — it says 32 blocks is about 0.1% of a seven-day epoch — and it is
+**not** a definition. An earlier revision of this section cited it as one; that was wrong, and the
+correction is recorded here rather than quietly dropped, because the citation was load-bearing for an
+immutable curried value (§8.1) and a mis-citation is worse than no citation.
+
+Establishing the mirror-collateral epoch calendar, including its length, is
+**DIG-Network/dig_ecosystem#3259** (§15.3). Until it lands:
+
+1. An implementation MUST NOT infer the mirror-collateral epoch length from `epoch_seconds`, from
+   `CENSUS_FINALITY_DEPTH_BLOCKS`, or from any prose in another crate's comments.
+2. The two clocks MUST be treated as having **unrelated lengths and unrelated phases**. Nothing in
+   this document depends on them coinciding, and §8.1's justification for `epoch_seconds` does not
+   rest on it.
+3. `first_epoch_start` is chosen per distributor at launch, so even if the lengths were ever made
+   equal the phases would still be independent. An implementation MUST NOT align them, assume they
+   are aligned, or read a distributor boundary as a collateral boundary.
 
 ### 0.4 What a reader may NOT conclude
 
@@ -90,10 +105,16 @@ reading is the natural one.
 
 1. **A passing challenge is not evidence that a peer stores the bytes.** It is evidence the peer
    returned the exact bytes for windows it could not predict, within a deadline (§3). A peer that
-   fetches each window from another holder on demand passes. The deadline makes that expensive; it
-   does not make it impossible. This mechanism buys **availability under a bounded latency**, which
-   is what a mirror is for, and it MUST NOT be described as a proof of storage or a proof of
-   replication.
+   fetches each window from another holder on demand passes, at a cost of roughly **256 KiB per
+   hour** (§3.7.1) — which is to say the deadline does not make relaying meaningfully expensive, and
+   §3.7.1 gives the number rather than leaving "expensive" as an adjective. This mechanism buys
+   **availability under a bounded latency**, which is what a mirror is for, and it MUST NOT be
+   described as a proof of storage, a proof of replication, or an anti-relay measure.
+
+   **The product accepts this.** A relay that reliably returns the right bytes on demand is
+   delivering the availability the funder is paying for, so it earns a full share by design and not
+   by oversight. The one case that is pathological — relays sourcing the bytes from the funder
+   itself — is §3.7.1's, and its detection is amendment C8.
 2. **An entry in the set is not evidence that a peer is mirroring now.** It is evidence it passed at
    its last completed evaluation. Between evaluations the set is a claim about the past, and while
    the prover is not running the set is frozen and the claim keeps aging (§2.1).
@@ -245,13 +266,29 @@ In `Managed` mode the authority split is not what an operator assumes:
 
 So while the prover is dead:
 
-- accrual **continues** (`Sync` is permissionless, and any claimant may spend it),
+- accrual **continues within the current epoch** (`Sync` is permissionless, and any claimant may
+  spend it),
 - payouts **continue** (`InitiatePayout` is permissionless — §7.1), and
 - **only the entry set freezes.**
 
 The harm is therefore not "nothing happens". It is: **peers that stopped mirroring keep earning, and
 peers that started mirroring cannot begin.** A frozen set drains the reserve to the wrong parties.
 This is worse than a stall and the operator MUST be told so in exactly these terms.
+
+**"Continues" is bounded by the epoch, and `NewEpoch` has an owner.** Accrual stops at `epoch_end`
+until someone spends `NewEpoch`, which is permissionless — so "anyone may" also means "nobody is
+obliged", and at the §8.1 default that is a rare, load-bearing, unowned spend. This document assigns
+it:
+
+1. The **peer claim loop (#3251) MUST spend `NewEpoch`** when it finds `epoch_end` has passed and
+   the reward slot for the next epoch is initialized, before attempting its own claim. It is the
+   right owner because it is already reading the distributor state on its cadence and it is the
+   beneficiary of the roll — an unrolled epoch is a claim it cannot make.
+2. The prover (#3250) MUST also spend it when it needs a synced state for an entry-set write (§8.2)
+   and the epoch has rolled. Two willing spenders is correct here, not a conflict: the action is
+   idempotent in effect — whoever gets there first rolls the epoch and the other observes the new
+   state.
+3. Neither MUST treat a not-yet-rolled epoch as an error, and neither MUST assume the other did it.
 
 ### 2.2 The creation-time uptime warning
 
@@ -262,7 +299,14 @@ Before the launch spend is signed, the creation flow MUST state all four:
    clawed back (§7.4).
 3. **While the prover is stopped the entry set is frozen: peers that have stopped mirroring continue
    to earn, and peers that begin mirroring cannot start.** Distribution to the frozen set continues.
-4. Losing the manager singleton key freezes the entry set **permanently** (§7.3).
+4. Losing the manager singleton key freezes the entry set **permanently** (§7.2 clause 3) — unless
+   the manager's inner puzzle was chosen recovery-capable at launch, which is available **only** at
+   launch (§7.2 clause 1a).
+5. **How large the clause-3 loss can get, as a number:** it is bounded by the funder's commitment
+   depth, defaulting to `COMMITMENT_DEPTH_EPOCHS = 2` future epochs (§7.4 clause 1). The warning MUST
+   state the bound alongside the risk — "at your current commitment, a dead prover can pay a frozen
+   set for at most N more epochs" — because a risk with a stated bound is a decision a funder can
+   make, and a risk without one is only alarming.
 
 The warning MUST NOT be reducible to "requires consistent uptime". That phrasing invites the reader
 to conclude that downtime merely pauses payment, which is the false half of §2.1.
@@ -315,7 +359,24 @@ For the same reason:
 3. `entry_count` MUST be rendered with `last_entry_write_at`. An entry count with no write timestamp
    is a claim about the past presented as the present.
 
-### 2.5 Heartbeat and cycle deadline
+### 2.5 Cycle period, heartbeat and cycle deadline
+
+**`PROVER_CYCLE_PERIOD_SECONDS = 3_600`.** A prover MUST begin a new cycle per distributor once per
+period. This constant was previously left undefined while §3.6 derived a time-to-eviction from it and
+§6.5.2 derives a sweep time from it — a number two other sections depend on cannot be implicit, and
+an implementer choosing it silently would set both the eviction latency and the challenge bandwidth
+by accident.
+
+One hour is chosen to match `ENTRY_WRITE_MIN_INTERVAL_SECONDS` (§6.3 clause 2): a cycle that reaches
+a decision it cannot write for another 50 minutes has spent the peer's bandwidth for nothing, so the
+decision rate and the write rate are the same rate. It also fixes the two derived quantities:
+
+- **time to eviction** = `CHALLENGE_STRIKES_TO_EVICT x PROVER_CYCLE_PERIOD_SECONDS` = 3 hours of
+  continuous failure (§3.6), and
+- **full-set sweep** = `ceil(250 / 64)` = 4 cycles = 4 hours at the §6.5 cap (§6.5.2).
+
+`next_cycle_due_at` (§2.3) MUST be derived from this constant, so a reader can tell a late cycle from
+a dead prover.
 
 1. The prover MUST refresh `observed_at` at least every `PROVER_HEARTBEAT_SECONDS = 60`, including
    while `Idle`. A heartbeat is what makes "the process is gone" distinguishable from "the process is
@@ -489,6 +550,33 @@ day.
 4. Every string a peer supplies — an error message, a URL term (§4.4) — MUST be treated as
    attacker-controlled: bounded in length before logging, never interpolated into a shell, a path, or
    a UI without escaping.
+
+#### 3.7.1 What the relay deterrent actually costs an attacker — the number, not the adjective
+
+Clause 1 says the deadline makes on-demand proxying "expensive rather than free". **Stated
+numerically, that deterrent is close to nil, and this document MUST NOT leave the adjective standing
+alone.** At 4 x 64 KiB per cycle and one cycle per hour (§2.5), a relay-only peer that stores nothing
+pays on the order of **256 KiB per hour** — about 6 MiB per day — to earn a full share. Fetching
+64 KiB from an honest holder inside a 30 s window is comfortable on any real link.
+
+So the honest position, which §0.4 clause 1 already takes and this clause quantifies: the product buys
+**availability under a bounded latency**, and a relay that reliably returns the right bytes on demand
+is delivering that availability. It gets paid, and that is not a defect.
+
+**The pathological case is proxying from the funder itself, and only the funder can see it.** §1
+requires the funder to hold the bytes and the funder generally serves them, so a set of relays can
+re-serve the funder's own bytes back to the funder — the funder paying 250 mirrors for its own
+bandwidth. The funder is uniquely placed to detect this: an inbound `dig.fetchRange` for the same
+`(root, retrieval_key, offset, length)` window from, or on behalf of, the peer it is concurrently
+challenging, inside that challenge's deadline, is a relay signature no other party in the network can
+observe.
+
+Requiring the prover to correlate that is a design addition rather than a clarification, so it is
+recorded as amendment **C8** (§15.4) and not specified here. What IS normative now: an implementation
+MUST NOT describe the challenge as anti-relay, MUST NOT present "mirrors detected" as a count of
+independent storing hosts (§6.2), and MUST NOT tighten `CHALLENGE_DEADLINE_SECONDS` believing it
+closes the relay path — it does not, and both that constant and the window count are non-curried, so
+either can be revisited without touching a launched distributor.
 
 ---
 
@@ -732,6 +820,35 @@ second charge would fall on honest mirrors too, and it would duplicate a cost th
 already. The correct Sybil lever, if one is ever needed, is the collateral requirement in
 `dig-mirror-collateral`, which is not this crate's to set.
 
+#### 6.2.1 The inequality this design's Sybil resistance rests on — named, because there is no second defence
+
+Splitting one identity into two is profitable in the abstract: with equal shares (§11) it moves the
+splitter's take from `1/(n+1)` to `2/(n+2)`. The only thing that stops it is that each identity needs
+its own mirror coin and its own collateral lock. So the entire Sybil resistance of this design is one
+inequality:
+
+```
+marginal value of one additional share  <  the epoch's mirror-collateral requirement per (owner, store, root)
+```
+
+Three consequences an implementer and a funder both need:
+
+1. **The right-hand side is not set here.** It lives in `dig-mirror-collateral`, which this epic does
+   not own — and, like the epoch calendar at §15.3 / #3259, is a dependency this document can state
+   but not control.
+2. **If the inequality flips, one operator takes the whole set, and there is no fallback.** §5.4
+   deliberately refuses co-location and "related peer" heuristics as unknowable, so no second defence
+   exists by construction. That refusal is still right — a heuristic would exclude honest co-located
+   mirrors — but it means this inequality is load-bearing alone.
+3. **Therefore the funder-facing count is a count of IDENTITIES, not of independent hosts.** A
+   surface MUST label it "mirror identities" or equivalent, and MUST NOT label it "mirrors detected",
+   "independent mirrors", "hosts", or "replicas". The distributor cannot distinguish 250 operators
+   from one operator with 250 collateralised identities, and presenting the number as though it could
+   is a durability claim the mechanism does not support.
+
+Monitoring whether the inequality still holds is amendment **C9** (§15.4): it is an ecosystem-level
+question about a constant in another crate, not something this crate can enforce.
+
 ### 6.3 Four bounds on entry-set writes
 
 Every add and every remove is a distributor singleton spend concurrent with a manager singleton spend,
@@ -775,24 +892,67 @@ Consequences that MUST be stated, because both are counter-intuitive:
 
 `MAX_ENTRIES_PER_DISTRIBUTOR = 250`.
 
-The per-mirror stream is the epoch's rewards divided across `active_shares`, and `payout_threshold`
-(§8.3) is enforced by the puzzle. So an unbounded set drives every mirror's claimable amount below the
-threshold and **nobody can claim at all** — the set grows until the distributor stops working. With
-equal shares (§11) the funder's floor is arithmetic they can be shown before they fund:
+**There is no funding level at which this mechanism stops working.** An earlier revision of this
+section said an under-funded set drives every mirror below `payout_threshold` so that "nobody can
+claim at all", and that "the set grows until the distributor stops working". **Both were false and
+are withdrawn.** The correction matters more than the error, because the false version was ordered to
+be *displayed to funders as a gate*:
+
+- §8.6 requires a sub-threshold claim to be **skipped, not failed**, and
+- `cumulative_payout` is monotone with no reset at an epoch boundary, so a mirror's entitlement keeps
+  accumulating until it clears the threshold.
+
+So under-funding does not break anything. It makes claims **less frequent**. A mirror whose daily
+accrual is a third of `payout_threshold` claims every third day and is paid the same total.
+
+#### 6.5.1 What the funder MUST be shown — a cadence, not a floor
+
+The honest number is a claim interval, and it is what #3253 MUST display:
 
 ```
-minimum daily funding (base units) = entry_count x payout_threshold x (86400 / claim_cadence_seconds)
+days between a mirror's claims = (payout_threshold x entry_count) / daily_funding_in_base_units
 ```
 
-At the §8.3 threshold, a 24 h cadence and 250 entries that is `250 x 1_000` base units = **250 $DIG
-per day**.
+The surface MUST render this as **"at this funding rate a mirror clears the claim threshold every N
+days"**, for the distributor's current entry count, at the moment the funder chooses an amount. It
+MUST NOT present any funding level as a minimum, a floor, a requirement, or a gate, and MUST NOT
+block or warn on a low rate as though the distributor would fail — it would not. A funder choosing to
+fund thinly is choosing a slower claim cadence, which is a legitimate choice, and telling them
+otherwise talks them out of a workable distributor.
 
-**This floor MUST be displayed, not merely documented.** The creation and refill surfaces MUST show
-it for the distributor's current entry count, at the moment the funder chooses an amount (#3253). A
-funder who cannot see the floor discovers it when mirrors stop being paid — the payout falls below
-`payout_threshold`, the puzzle refuses every claim, and nothing anywhere reports an error, because
-nothing is broken. That silence is why documenting the arithmetic is insufficient: this is the one
-number whose absence looks exactly like normal operation.
+What still deserves a plain statement is the far end of that curve: at a rate where N becomes very
+large, mirrors are technically accruing but practically unpaid, and a mirror deciding whether to lock
+collateral needs the same number the funder sees. Exposing N — rather than a pass/fail floor — serves
+both parties with one honest quantity.
+
+#### 6.5.2 Why 250, on the grounds that actually bound it
+
+The cap is **not** derived from threshold arithmetic, which §6.5 has just established does not bind.
+It is derived from the two things that do:
+
+1. **Challenge bandwidth.** 4 x 64 KiB per peer per cycle (§3.2) is 256 KiB per peer, so a full set
+   is about 62 MiB of inbound per full sweep. At `CHALLENGE_MAX_PEERS_PER_CYCLE = 64` (§3.7) a full
+   set takes four cycles to cover, which is the longest sweep the strike rule (§3.6) can tolerate
+   while still evicting a dead mirror inside a day.
+2. **Write rate.** Filling a set from empty is `250 / 8` bundles at one bundle per hour (§6.3), so
+   **at least 31 hours**. A cap materially above 250 makes the set take longer to converge than a
+   mirror's collateral epoch, which means the set is never in a steady state.
+
+Both bounds are non-curried and changeable later without touching a launched distributor. Raising the
+cap requires re-deriving both, and §8.4's `precision` bound as well.
+
+#### 6.5.3 The occupy-the-cap case, stated because it is real
+
+A well-funded party can take slots **first** and, because clause 3 below forbids displacing a passing
+incumbent, hold them — excluding honest mirrors from ever joining. Each slot costs that party one
+full mirror-collateral lock (§6.2), so this is priced, not free, but it is a genuine censorship
+primitive inherent to any capped set with no displacement rule.
+
+This document accepts it, and the reason the alternative is worse: a displacement rule is a griefing
+primitive available to *everyone* (clause 3), whereas occupying the cap costs collateral per slot and
+is visible on chain. An implementation MUST NOT "fix" this by adding displacement. The funder-facing
+surface SHOULD show the entry count against the cap so a full set is visible rather than inferred
+from mirrors that never appear.
 
 When the set is full:
 
@@ -832,16 +992,39 @@ that singleton (`.../add_entry.rs:110-117`, `.../remove_entry.rs:100-110`). Stak
 this mode — `.../stake.rs:177` returns *"Stake action not available in managed mode"* — so the
 manager singleton's key **is** the entry set's custody boundary, and there is no second path.
 
-1. The manager singleton MUST be controlled by the funding node's **operator wallet**. It MUST NOT be
-   held by a DIG network service, a hub backend, a relay, or any shared key. This crate MUST NOT
-   provide a mode in which a third party holds it.
+1. **The prohibition is on third-party custody, not on recoverable custody.** These are different
+   things and conflating them closes a door that cannot be re-opened.
+
+   - **Forbidden:** the manager singleton being controlled by a party other than the funder — a DIG
+     network service, a hub backend, a relay, a shared operator key, or any escrow. This crate MUST
+     NOT provide a mode in which a third party can move the entry set.
+   - **Explicitly permitted, and RECOMMENDED:** the manager singleton's **inner puzzle** being a
+     multisig, a k-of-n, a time-delayed recovery puzzle, or any other recovery-capable puzzle of the
+     funder's choosing. A 2-of-3 the funder holds two keys to is not third-party custody — the
+     authority stays with the funder — and it is the **only** mitigation that exists for clause 3's
+     permanent freeze. An implementation MUST NOT refuse one, and MUST NOT hard-code a bare
+     single-key `p2_delegated_puzzle_or_hidden_puzzle` as the only supported inner puzzle.
+
+   The distinction is *who may authorize a move*, not *how many keys authorize it*.
+
+1a. **This is a launch-time-only choice.** The manager singleton launcher id is curried into the
+   action puzzles (clause 2), so the inner puzzle's shape is fixed at launch for the life of the
+   distributor. An operator not offered a recovery-capable puzzle **before the launch spend is
+   signed** can never have one. The creation surface MUST therefore offer the choice at creation, and
+   MUST state that it is permanent — see §15 clause 3a.
 2. The manager singleton launcher id is curried into the action puzzles and is therefore **immutable**
    for the life of the distributor. There is no key rotation.
 3. **Losing the manager key freezes the entry set permanently**: no add, no remove, ever — while
    accrual and payouts to the frozen set continue permissionlessly (§2.1). This is the worst
-   irreversible outcome in the design, it cannot be recovered by anyone including the funder, and the
-   creation flow MUST state it (§2.2 clause 4). The funder's only remedy afterwards is
+   irreversible outcome in the design, and after launch it cannot be recovered by anyone including the
+   funder. The creation flow MUST state it (§2.2 clause 4). The funder's only remedy afterwards is
    `WithdrawIncentives` on future commitments (§7.4) and launching a new distributor.
+
+   **Clause 1's recovery-capable inner puzzle is the only thing that prevents this, and it is only
+   available at launch.** A funder who chose a single key and then lost it has no path at all; a
+   funder who chose 2-of-3 has one. That asymmetry is the whole reason clause 1 must not be read as
+   forbidding a multisig, and the reason §7.4 clause 1 bounds commitment depth: the two together turn
+   an unbounded permanent loss into a recoverable one, or failing that a bounded one.
 
 ### 7.3 `fee_bps = 0` is the MVP default, and `fee_payout_puzzle_hash` is the funder's own
 
@@ -857,33 +1040,60 @@ The epoch fee is skimmed at `NewEpoch`: `fee = epoch_total_rewards * fee_bps / 1
    MVP mirror before anyone had decided to levy anything, in favour of whoever's puzzle hash happened
    to be curried in. Of the two, the untaken tax is the easy one to undo and the taken one is not.
 
-   This is an **MVP default, not a permanent property of the mechanism.** A treasury fee, if one is
-   ever levied, arrives as the §7.3a policy hook and MUST NOT be introduced by changing this default
-   under existing distributors, which is impossible anyway.
+   This is an **MVP default**, in the narrow sense §7.3a defines and no wider. It is **not** a
+   promise that an ecosystem-level fee is reachable later: read §7.3a before concluding anything
+   about that, because the honest answer is that this design provides no mechanism for one.
 2. The builder MUST require an explicit opt-in to set it non-zero, and the MVP creation surface MUST
    NOT offer the field.
 3. `fee_payout_puzzle_hash` MUST be the funder's own refund/change puzzle hash — the same one passed
    as `cat_refund_puzzle_hash`. It MUST NOT be a zero hash (a later non-zero fee would burn to it) and
    MUST NOT be the DIG treasury (with `fee_bps = 0` that is inert, and it misleads a reader into
    believing the treasury takes a cut).
+4. **Consequence of clause 3 that MUST be stated: with the recipient set to the funder's own hash,
+   any non-zero `fee_bps` is a funder self-skim taken off the mirrors.** It is not an ecosystem fee,
+   a protocol fee, or an infrastructure fee, and it MUST NOT be labelled as one. `NewEpoch` skims it
+   from `epoch_total_rewards` before the remainder accrues to entries
+   (`.../new_epoch.rs:124`), so every basis point is a basis point the mirrors do not receive, paid
+   to the party that set it. If the field is exposed at all under clause 2's opt-in, the creation
+   surface MUST display the **mirror-facing net rate** — what fraction of each epoch's commitment
+   actually reaches entries — beside the gross amount, and MUST NOT show the gross alone.
 
-### 7.3a The policy hook, named
+### 7.3a There is no ecosystem-fee path, and this section says so instead of implying one
 
-If a protocol-level fee is ever levied, this is the only shape it may take, and stating it here is
-what keeps §7.3's default from being mistaken for a decision nobody may revisit.
+An earlier revision of this section described a "policy hook" for a future protocol-level fee. **It
+was not implementable and the claim is withdrawn.** The reasoning that killed it is worth keeping,
+because it is the reason no amount of rewording rescues it:
 
-1. The launch builder MUST read `fee_bps` and `fee_payout_puzzle_hash` from a single named policy
-   input with the MVP default of `(0, <the funder's own refund puzzle hash>)`. An implementation MUST
-   NOT scatter the two values across call sites, because a policy that cannot be changed in one place
-   will be changed in two and disagree.
-2. A change to that policy MUST apply **only to distributors launched after it**. An implementation
-   MUST NOT attempt to apply a new fee to an existing distributor — it is curried, so the attempt can
-   only produce an unspendable construction — and MUST NOT present a fee change as retroactive.
-3. A non-zero policy MUST be surfaced at creation before the launch spend is signed, in the same
-   place §2.2's warning appears, stating the rate and that it is permanent for this distributor.
-4. This crate MUST NOT hard-code the DIG treasury puzzle hash for this purpose. The treasury is not a
-   party to a distributor anyone may mint (§7.3 clause 3), and a hard-coded recipient is a policy
-   decision smuggled in as a constant.
+- the rate and recipient are **curried at launch**, so they can only ever be set by whoever builds
+  the launch spend — which is the funder;
+- this crate MUST NOT hard-code a treasury recipient (a policy decision smuggled in as a constant,
+  and the treasury is not a party to a distributor anyone may mint — §7.3 clause 3); and
+- no third source exists or is proposed: there is no policy coin, no signed policy document, and no
+  version gate that a launch builder could read a network-wide rate from.
+
+Config plus those two prohibitions leaves exactly one conforming implementation — the funder sets
+it — and a funder sets it to 0. So:
+
+1. **`fee_bps` and `fee_payout_puzzle_hash` are a single config-supplied policy input**, defaulting
+   to `(0, <the funder's own refund puzzle hash>)`. One input, read in one place: a policy that
+   cannot be changed in one place will be changed in two and disagree.
+2. **The input is forward-only.** A change applies only to distributors launched afterwards. An
+   implementation MUST NOT attempt to apply a new value to an existing distributor — it is curried,
+   so the attempt can only produce an unspendable construction — and MUST NOT present a change as
+   retroactive.
+3. **A non-zero value MUST be surfaced at creation** before the launch spend is signed, in the same
+   place §2.2's warning appears, stating the rate, the mirror-facing net rate (§7.3 clause 4), and
+   that it is permanent for this distributor.
+4. **This document makes no claim that an ecosystem-level or treasury fee is reachable.** Nothing
+   here provides one. If DIG ever wants protocol revenue from this mechanism it requires a new
+   mechanism — a policy source a launch builder can read and a reason a funder would honour it — and
+   that is a design change, not a configuration change. An implementer MUST NOT build toward a
+   treasury fee on the strength of this section.
+
+**Recorded product-policy position (for the user, not settled by this document):** the recommendation
+carried by the adversarial review is that DIG should *not* levy a fee here — a distributor anyone may
+mint with the funder's own money is a poor place to take protocol revenue. This spec adopts that as
+its MVP position. Reversing it is a design change per clause 4, not a default flip.
 
 ### 7.4 Clawback: `CommitIncentives` is the funding path, `AddIncentives` is a donation
 
@@ -900,6 +1110,21 @@ Therefore:
 
 1. The default "fund" action MUST use `CommitIncentives`, per future distributor epoch. Only this
    makes the requirement's "ability to clawback funds from the distributor" true.
+
+   **Commitment depth is exactly the blast radius of prover death, and it MUST be bounded by
+   default.** §2.1's loss — the reserve draining to a frozen set of peers that stopped mirroring — is
+   bounded by how many future epochs the funder has already committed, because an uncommitted epoch
+   has nothing in it to drain. A funder who committed twelve epochs has committed to twelve weeks of
+   paying a frozen set; a funder who committed one has capped the exposure at one epoch.
+
+   So the fund action MUST default to `COMMITMENT_DEPTH_EPOCHS = 2` future epochs — not "fund the
+   distributor" — and MUST require an explicit, informed choice to commit deeper. Two rather than
+   one because one leaves no margin: a funder who forgets to re-commit before the boundary starves a
+   set that is passing its challenges, and the re-commit is a manual act. Two epochs is one full
+   epoch of slack at the §8.1 default.
+
+   This is a **design bound, not a warning label**, and it is the reason §2.2's warning is honest
+   rather than merely alarming: the funder can point at the number that limits the loss.
 2. `AddIncentives` MUST be exposed under a different, clearly irrevocable label, and MUST NOT be the
    default. An implementation that funds with `AddIncentives` and offers a clawback button is lying.
 3. **Who may claw back:** the holder of the key for the commitment slot's recorded `clawback_ph`, and
@@ -918,6 +1143,15 @@ The committer recovers 90% of a withdrawn commitment and forfeits 10% to the res
 1. Not `10000`: a costless retraction lets a funder advertise a large reward, induce mirrors to lock
    real $DIG collateral and spend real bandwidth, then withdraw everything. The mirrors' costs are
    unrecoverable; the funder's would not be. 10% is the smallest retraction cost that is not zero.
+
+   **Where the forfeited 10% actually lands, which is not where the justification implies.** It stays
+   in the reserve, so it is distributed to whoever holds entries when that value is later paid out —
+   i.e. to **future** mirrors, not to the mirrors whose sunk costs the penalty is nominally pricing.
+   Those mirrors are typically evicted or gone by then. Stating this plainly rather than as "the
+   remainder stays in the reserve for the mirrors": the 10% is a **deterrent against the funder**,
+   priced correctly, and it is **not compensation to the party harmed**. This mechanism has no way to
+   compensate that party — the distributor knows only current entries — and an implementation MUST
+   NOT describe the forfeit as making induced mirrors whole.
 2. Not lower: this is a funder's own money, and a large penalty deters funding — the behaviour the
    whole epic exists to encourage.
 3. `9000` is also the value the upstream reference flow exercises
@@ -941,13 +1175,25 @@ All four values are curried at launch and immutable. The creation surface MUST s
    mid-epoch starts accruing from its join time, because `AddEntry` snapshots
    `initial_cumulative_payout` from the current state (`.../add_entry.rs:88-100`). So epoch length is
    not a payout latency.
-3. Seven days matches the mirror-collateral epoch length
-   (`modules/crates/00-foundation/dig-mirror-collateral/src/constants.rs:216-217`), so a mirror coin's
-   useful life and a distributor epoch have the same duration and eligibility does not churn against
-   the reward accounting on a different beat. **Only the length matches; the phases are independent
-   and MUST NOT be aligned or assumed aligned** (§0.3).
-4. Seven days is short enough that a funder can change the funding rate within a week, and long enough
+3. Seven days is short enough that a funder can change the funding rate within a week, and long enough
    that a rollover is a weekly event rather than background noise.
+
+**Three reasons, not four.** An earlier revision gave a fourth: that seven days matched the
+mirror-collateral epoch length. **It does not, because that length is not defined anywhere** — see
+§0.3, where the mis-citation and its correction are recorded, and #3259, which must establish the
+calendar. The value stands on the three reasons above, each of which is independent of the other two
+and none of which depends on the other clock.
+
+**But epoch length is not free of operational consequence, and this section MUST NOT be read as
+saying so.** Clause 2's claim is narrow and exact: epoch length is not a *payout latency*. It is
+nevertheless the granularity of two other things:
+
+- **The funder's exposure to its own downtime.** Funding is per epoch (§7.4), so `epoch_seconds` is
+  the unit in which a funder commits to paying a set it may not be maintaining. §7.4 clause 1 bounds
+  the depth; the epoch length is what that bound is denominated in. An operator with flaky uptime has
+  a real reason to choose a shorter epoch, and the creation surface MUST NOT present the choice as
+  cosmetic.
+- **The funder's ability to change the rate**, which is clause 3 above.
 
 `epoch_seconds` MUST be a settable parameter with this default; it MUST NOT be hard-coded, because a
 funder with a different funding rhythm has no other lever.
@@ -1153,7 +1399,7 @@ The reasons, in order:
    return the exact bytes for windows it could not predict? A binary test can only justify a binary
    share; a graded share would be a number with no measurement behind it.
 4. **Equal shares make the funder's arithmetic knowable in advance.** The per-mirror stream, the
-   §6.5 funding floor, and the §8.3 threshold interaction are all computable before funding. Under
+   §6.5.1 claim cadence, and the §8.3 threshold interaction are all computable before funding. Under
    weighting, the floor depends on a distribution the funder cannot see at funding time.
 5. **It pins the `precision` overflow bound** (§8.4).
 
@@ -1370,6 +1616,11 @@ An implementation conforms when all of the following hold.
 
    built `without_launcher_id(..)` then `.with_launcher_id(..)`, in that order and no other
    (`.../reward_distributor_info.rs:180-215`).
+3a. **Launch-time choices the creation surface MUST offer before the launch spend is signed**, each
+   because it is curried and therefore unavailable afterwards: the manager singleton's inner puzzle
+   including a recovery-capable option (§7.2 clauses 1, 1a), `epoch_seconds` with its downtime-
+   granularity consequence stated (§8.1), and `first_epoch_start` (§8.5). An implementation that
+   defaults all three silently has closed three one-way doors on the funder's behalf.
 4. **Eligibility.** Every entry admitted passed §3's challenge, §4's three-call chain, §4.5's
    transport pinning, and §5's self-exclusion — with no path that bypasses any of them (§5.3, §10.3).
 5. **Entry shape.** Every entry carries `payout_puzzle_hash = MirrorCoin::owner_puzzle_hash()` and
@@ -1383,17 +1634,53 @@ An implementation conforms when all of the following hold.
    `chia-sdk-driver-0.36.0/src/primitives/action_layer/launch_drivers.rs:2738`
    `test_managed_reward_distributor()` — launch, fund, add entry, roll epoch, self-claim payout,
    remove entry and observe the settlement of §6.4 — not by a mock.
+9a. **Required simulator case: the empty-set epoch, which every distributor passes through.**
+   `first_epoch_start` defaults to `now + 600` (§8.5) while the first entry cannot exist for at least
+   an hour (§6.3's write rate, plus §14.1 requires mirrors to have published pointers), so **every
+   distributor spends its first epoch with `active_shares == 0`.** This is not an edge case; it is the
+   launch path.
+
+   `REWARD_DISTRIBUTOR_SYNC_PUZZLE`
+   (`chia-sdk-types-0.36.0/src/puzzles/action_layer/actions/reward_distributor/sync.rs:9-21`) does
+   appear to guard the per-share delta behind a `(> x 0)` test with a `0` else-branch, which would
+   mean **nothing is consumed while the set is empty** — the good outcome.
+
+   **That reading is an inference, not a citation, and this document MUST NOT rest on it.** Those
+   lines are the compiled CLVM hex blob; the file contains no `active_shares` identifier, and which
+   state slot the guarded argument refers to cannot be established from the bytecode without
+   decompiling it. §0.3's withdrawn citation is what over-reading a source looks like, and the same
+   discipline applies here: an inference from a hex blob is exactly the kind of claim that must be
+   settled by execution.
+
+   So what is **not** established, and what this crate MUST NOT assume in either direction, is
+   whether the value untouched during an empty epoch is later distributable or accumulates un-payable
+   in `remaining_rewards` — the accrual rate derives from the reward slot's `epoch_total_rewards`
+   rather than from `remaining_rewards`, so the two possibilities are not distinguishable by reading.
+
+   A simulator test MUST settle it: launch, fund, let a full epoch elapse with **zero** entries, add
+   an entry, roll the epoch, claim, and **assert where the value went**. The answer is a money
+   question with an irreversible answer, and if it strands funds the remedy is launch-time guidance
+   on `first_epoch_start` — another one-way door, which is why this must be measured before any
+   distributor is launched rather than after.
 
 ### 15.1 Which side each clause lands on
 
 - **This crate (#3249):** §0.1, §0.2, §0.5, §1.3, §4.3's call sequence as a reusable predicate, §6.4's
   settlement amount, §7, §8, §9, §10.2, §11, §12.1 clause 1, §12.5 clause 3, §15.3.
-- **`dig-node` prover (#3250):** §1.1-§1.2, §1.4-§1.5, §2, §3, §4.1-§4.2, §4.4-§4.7, §5, §6.3, §6.5,
-  §12.1-§12.4, §12.6, §13.1.
-- **`dig-node` claim loop (#3251):** §8.6, §12.5.
+- **`dig-node` prover (#3250):** §1.1-§1.2, §1.4-§1.5, §2 (except §2.4's rendering and §2.2's
+  wording, which are #3253's), §3, §4.1-§4.2, §4.4-§4.7, §5, §6.3, §6.5, §12.1-§12.3, §12.6, §13.1,
+  and §2.1's `NewEpoch` clause 2.
+- **`dig-node` claim loop (#3251):** §8.6, §12.5, **§2.1's `NewEpoch` clause 1** (it is the obliged
+  spender), and **§12.4** — the chain-derived `EntrySetStale` signal. §12.4 was previously allocated
+  to the prover, which was wrong: the clause exists so a **mirror** can judge a distributor without
+  trusting the operator, and a mirror does not run a prover. The prover MAY compute it too for the
+  funder's own view.
 - **`dig-gossip` (#3252):** §13.2.
-- **`dig-app` (#3253):** §1.5 clause 4, §2.2, §2.4 clauses 1-3, §6.5's funding floor **as a displayed
-  value**, §7.3a clause 3, §7.4 clause 5, §14.1 clause 2.
+- **`dig-app` (#3253):** §1.5 clause 4, §2.2 (all five clauses, including clause 5's commitment-depth
+  bound), §2.4 clauses 1-3, **§6.5.1's claim-cadence display — "a mirror clears the threshold every N
+  days", never a funding floor or a gate**, §6.5.3's entry-count-against-cap, §7.3 clause 4's
+  mirror-facing net rate, §7.3a clause 3, §7.4 clause 5, §14.1 clause 2, and §15 clause 3a's three
+  launch-time choices.
 - **Docs (#3254):** §2.2, §14.1 clause 1.
 - **`dig-rpc-protocol`:** the three §2.6 methods.
 
@@ -1404,6 +1691,17 @@ Every clause above is **specified, not yet implemented**: at the time of writing
 (DIG-Network/dig_ecosystem#3247). Every `file:line` citation in this document is to the **pinned
 upstream SDK** (`chia-sdk-driver-0.36.0`, `chia-sdk-types-0.36.0`) or to an **existing sibling crate**
 in `dig_ecosystem`, measured on 2026-09-08. No citation is to code this specification introduces.
+
+**Citation discipline, after one failure.** A first revision cited a doc comment's illustrative ratio
+as if it defined a constant (§0.3), and it was propping up an immutable curried value. Two rules
+follow, and §15.4 records both as fixed rather than silently corrected:
+
+1. A citation MUST support the exact proposition it is attached to. A source that *mentions* a
+   quantity in passing does not *define* it, and a reader cannot tell the difference from a line
+   number.
+2. Where the only available source is compiled bytecode — every reward-distributor puzzle is shipped
+   as a hex blob — a reading of it is an **inference** and MUST be labelled as one, with the question
+   pushed to an executable test instead (§15 clause 9a is the worked example).
 
 ### 15.3 Open item — the mirror-collateral epoch calendar has no owner (#3259)
 
@@ -1421,3 +1719,34 @@ computes requirements from an ordinal it is given. The prover needs a supplier f
    excludes or excludes coins it counts — in either direction the money goes to the wrong set.
 3. **DIG-Network/dig_ecosystem#3259** carries the ownership question. When it lands, the named owner
    replaces clause 2's configuration input; clause 1 is unaffected by its outcome and stays.
+
+### 15.4 Gate conditions and amendments
+
+PR #2's three gates returned security **PASS**, adversarial **RATIFY-WITH-CONDITIONS** (C1-C9 plus
+two silence gaps), and correctness **CHANGES-REQUIRED** on one blocking citation defect. No settled
+constant changed. This subsection records every condition and its disposition so none is lost, and so
+a later reader can tell a decision from an open item.
+
+| # | condition | disposition |
+|---|---|---|
+| — | **Fabricated citation** — `dig-mirror-collateral/src/constants.rs:216-217` cited as defining a seven-day mirror-collateral epoch. It is an illustrative ratio in the doc comment on `CENSUS_FINALITY_DEPTH_BLOCKS = 32`; **no epoch-length constant exists in the codebase** | **fixed** — §0.3 (table + the paragraph that carried it) and §8.1. `epoch_seconds = 604_800` now stands on three independent reasons, and the correction is stated rather than dropped, because a mis-citation propping up a curried value is worse than no citation |
+| C1 | §7.2 clause 1, read literally, banned the only mitigation for the permanent manager-key freeze it calls the worst outcome in the document — a recovery-capable **inner** puzzle is not third-party custody, and the launcher id is curried, so it is a launch-time-only door | **fixed** — §7.2 clauses 1 and 1a split custody from recoverability and RECOMMEND a multisig; §7.2 clause 3 and §15 clause 3a carry it through |
+| C2 | A warning is not an answer to prover death; commitment depth is exactly its blast radius | **fixed** — §7.4 clause 1 defaults `COMMITMENT_DEPTH_EPOCHS = 2`; §2.2 clause 5 states the bound beside the risk |
+| C3 | §8.1 overclaimed that epoch length has no operational consequence | **fixed** — §8.1's closing states the two consequences it does have, downtime granularity being the load-bearing one |
+| C4 | §7.3a was un-implementable: config plus two prohibitions leaves no ecosystem-fee path, while §7.3 implied one | **fixed** — §7.3a withdraws the claim and says so; §7.3 clause 4 adds that any non-zero `fee_bps` with the funder's own recipient is a **funder self-skim off the mirrors**, with a mandatory mirror-facing net rate |
+| C5 | §6.5's "nobody can claim at all" was false — §8.6 skips sub-threshold claims and `cumulative_payout` is monotone — and the false framing was ordered displayed to funders as a gate | **fixed** — §6.5 withdraws it; §6.5.1 replaces the floor with a claim cadence; §6.5.2 re-derives the 250 cap on challenge bandwidth and write rate |
+| C6 | `NewEpoch` is permissionless and therefore unowned, so §2.1's "payouts continue" held only inside the current epoch | **fixed** — §2.1 now bounds the claim and assigns the spend to the claim loop (#3251) primarily, the prover secondarily |
+| C7 | The forfeited 10% lands on future mirrors, not the mirrors whose sunk costs it prices | **fixed** — §7.5 clause 1 states the incidence and that the forfeit is a deterrent, not compensation |
+| C8 | Relay economics unstated (~256 KiB/hour for a full share); the collapse case is relays sourcing from the **funder**, which only the funder can detect | **partly fixed, partly amendment.** The numbers and the honest position are in §3.7.1 and §0.4 clause 1. **Open:** requiring the prover to correlate an inbound fetch of a window it is concurrently challenging as a relay signal — a new mechanism, to be ticketed as hardening |
+| C9 | Sybil resistance rests on one unstated inequality, in a constant this epic does not own | **partly fixed, partly amendment.** §6.2.1 names the inequality, its owner, the absence of a second defence, and requires the funder-facing count be labelled **identities**. **Open:** monitoring whether it still holds — an ecosystem question, not enforceable here |
+| gap A | `active_shares == 0` unmeasured, and **every** distributor passes through it at launch | **fixed as a required test** — §15 clause 9a mandates the simulator case and states what it must assert. Must land before any distributor is launched |
+| gap B | `PROVER_CYCLE_PERIOD_SECONDS` was never defined, yet §3.6 derived a time-to-eviction from it | **fixed** — §2.5 defines it at 3_600 and derives both dependent quantities from it; §12.4 also reallocated to the claim loop (§15.1) |
+
+Two items are genuine **product policy** rather than engineering, are recorded with the position this
+document takes, and remain the user's to reverse:
+
+1. **Should DIG ever levy a fee on this mechanism?** Position: no (§7.3a). Reversing it is a design
+   change, not a default flip.
+2. **Is the product willing to pay relay peers a full share?** Position: yes, accepted explicitly
+   (§0.4 clause 1, §3.7.1) — availability is what a mirror is for and a relay delivers it — with C8's
+   funder-as-source detection as the outstanding mitigation for the one pathological case.
