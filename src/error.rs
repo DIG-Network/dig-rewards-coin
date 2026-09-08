@@ -36,6 +36,25 @@ pub enum RewardsError {
     #[error("invalid launch terms: {0}")]
     InvalidLaunchTerms(String),
 
+    /// The entry set is at `SPEC.md` §15 clause 7's cap and cannot take another entry.
+    ///
+    /// A named refusal rather than a silent stop: an operator whose adds quietly stopped landing
+    /// would keep paying network fees to add nobody, and would read the frozen set as a prover
+    /// fault.
+    #[error("the entry set is full at its cap of {cap} entries")]
+    EntrySetFull {
+        /// The cap that was reached.
+        cap: u32,
+    },
+
+    /// The caller is not the authority recorded in the commitment slot being withdrawn.
+    ///
+    /// Authority for a clawback is the slot's own `clawback_ph` and nothing else — not the manager
+    /// singleton, not the launcher (`SPEC.md` §7.5). Refused here rather than on chain, because the
+    /// operator pays the network fee for a spend the puzzle then rejects.
+    #[error("not the clawback authority recorded in the commitment slot")]
+    NotTheClawbackAuthority,
+
     /// A puzzle construction or spend-building step failed inside the Chia driver layer.
     ///
     /// Boxed because `DriverError` is large and would otherwise bloat every `Result` in the

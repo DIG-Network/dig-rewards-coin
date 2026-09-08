@@ -34,6 +34,8 @@ dig-constants = "0.13.1"
 # link — chia-sdk-driver 0.36.0 pins the 0.36.1 cohort; the primitives publish 0.48.x but taking
 # that links two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
 chia-bls = "0.36.1"
+# `ConsensusConstants` is a required argument of the upstream launch call, and it lives here.
+chia-consensus = "0.36.1"
 chia-protocol = "0.36.1"
 chia-puzzle-types = "0.36.1"
 chia-puzzles = "0.20.3"

@@ -54,10 +54,17 @@
 
 #![warn(missing_docs)]
 
+pub mod clawback;
 pub mod comment;
 pub mod constants;
 pub mod eligibility;
+pub mod entries;
+pub mod epoch;
 mod error;
+pub mod fund;
+pub mod launch;
+pub mod payout;
+pub mod state;
 
 pub use comment::LaunchComment;
 pub use constants::{
@@ -70,4 +77,7 @@ pub use constants::{
 pub use eligibility::{
     judge_candidate, judge_candidate_for_epoch, EligibilityQuestion, Ineligible, MirrorCoinFacts,
 };
+pub use entries::ManagerAuthority;
 pub use error::RewardsError;
+pub use launch::{launch_dig_distributor, LaunchedDistributor};
+pub use state::{read_distributor, DistributorSlots, DistributorSnapshot};
