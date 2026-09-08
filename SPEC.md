@@ -346,6 +346,13 @@ nothing but public chain data and MAY be promoted to `PublicRead` or peer-reacha
 promotion is a deliberate security decision taken at the allowlist, in the terms `method.rs`'s own
 `is_peer_reachable` documentation sets, and MUST NOT be done as a convenience.
 
+**Control is the correct default because the two directions are not symmetric.** Promoting a method
+later is **additive** — no existing caller breaks. Demoting one is **breaking**, and it breaks exactly
+the anonymous callers nobody can enumerate or notify. So an entry set and a payout history stay
+operator data until someone argues otherwise on the record, and the cost of having been too strict is
+one additive change while the cost of having been too loose is a withdrawal of access that is already
+being relied on.
+
 A mirror MUST NOT depend on any of these to decide whether a distributor is worth chasing: an
 operator's self-report about its own liveness is worthless to a counterparty. §12.4 specifies the
 chain-derived signal a mirror uses instead.
@@ -778,8 +785,14 @@ minimum daily funding (base units) = entry_count x payout_threshold x (86400 / c
 ```
 
 At the §8.3 threshold, a 24 h cadence and 250 entries that is `250 x 1_000` base units = **250 $DIG
-per day**. The creation and refill surfaces MUST display this floor for the current entry count
-(#3253).
+per day**.
+
+**This floor MUST be displayed, not merely documented.** The creation and refill surfaces MUST show
+it for the distributor's current entry count, at the moment the funder chooses an amount (#3253). A
+funder who cannot see the floor discovers it when mirrors stop being paid — the payout falls below
+`payout_threshold`, the puzzle refuses every claim, and nothing anywhere reports an error, because
+nothing is broken. That silence is why documenting the arithmetic is insufficient: this is the one
+number whose absence looks exactly like normal operation.
 
 When the set is full:
 
@@ -830,21 +843,47 @@ manager singleton's key **is** the entry set's custody boundary, and there is no
    creation flow MUST state it (§2.2 clause 4). The funder's only remedy afterwards is
    `WithdrawIncentives` on future commitments (§7.4) and launching a new distributor.
 
-### 7.3 `fee_bps = 0`, and `fee_payout_puzzle_hash` is the funder's own
+### 7.3 `fee_bps = 0` is the MVP default, and `fee_payout_puzzle_hash` is the funder's own
 
 The epoch fee is skimmed at `NewEpoch`: `fee = epoch_total_rewards * fee_bps / 10000`, paid to
 `fee_payout_puzzle_hash` (`.../new_epoch.rs:124`). Both are curried at launch and immutable.
 
-1. `fee_bps` MUST default to **0**. This distributor exists so a funder can pay mirrors. There is no
-   protocol operator taking a cut, and the DIG treasury is not a party to a distributor that anyone
-   may mint. A non-zero default would tax every funder in favour of whoever's puzzle hash happened to
-   be curried in at launch, permanently and invisibly.
+1. `fee_bps` MUST default to **0** in the MVP.
+
+   **Immutability is per distributor, not per product.** Because the value is curried at launch, a
+   distributor keeps the terms it was launched with for its whole life — so a later $DIG treasury
+   policy would apply to distributors launched *after* it and would leave existing ones alone.
+   Choosing 0 now therefore **forecloses nothing**, while a non-zero default would silently tax every
+   MVP mirror before anyone had decided to levy anything, in favour of whoever's puzzle hash happened
+   to be curried in. Of the two, the untaken tax is the easy one to undo and the taken one is not.
+
+   This is an **MVP default, not a permanent property of the mechanism.** A treasury fee, if one is
+   ever levied, arrives as the §7.3a policy hook and MUST NOT be introduced by changing this default
+   under existing distributors, which is impossible anyway.
 2. The builder MUST require an explicit opt-in to set it non-zero, and the MVP creation surface MUST
    NOT offer the field.
 3. `fee_payout_puzzle_hash` MUST be the funder's own refund/change puzzle hash — the same one passed
    as `cat_refund_puzzle_hash`. It MUST NOT be a zero hash (a later non-zero fee would burn to it) and
    MUST NOT be the DIG treasury (with `fee_bps = 0` that is inert, and it misleads a reader into
    believing the treasury takes a cut).
+
+### 7.3a The policy hook, named
+
+If a protocol-level fee is ever levied, this is the only shape it may take, and stating it here is
+what keeps §7.3's default from being mistaken for a decision nobody may revisit.
+
+1. The launch builder MUST read `fee_bps` and `fee_payout_puzzle_hash` from a single named policy
+   input with the MVP default of `(0, <the funder's own refund puzzle hash>)`. An implementation MUST
+   NOT scatter the two values across call sites, because a policy that cannot be changed in one place
+   will be changed in two and disagree.
+2. A change to that policy MUST apply **only to distributors launched after it**. An implementation
+   MUST NOT attempt to apply a new fee to an existing distributor — it is curried, so the attempt can
+   only produce an unspendable construction — and MUST NOT present a fee change as retroactive.
+3. A non-zero policy MUST be surfaced at creation before the launch spend is signed, in the same
+   place §2.2's warning appears, stating the rate and that it is permanent for this distributor.
+4. This crate MUST NOT hard-code the DIG treasury puzzle hash for this purpose. The treasury is not a
+   party to a distributor anyone may mint (§7.3 clause 3), and a hard-coded recipient is a policy
+   decision smuggled in as a constant.
 
 ### 7.4 Clawback: `CommitIncentives` is the funding path, `AddIncentives` is a donation
 
@@ -912,6 +951,22 @@ All four values are curried at launch and immutable. The creation surface MUST s
 
 `epoch_seconds` MUST be a settable parameter with this default; it MUST NOT be hard-coded, because a
 funder with a different funding rhythm has no other lever.
+
+**`epoch_seconds` and the claim cadence measure different things, and MUST NOT be reconciled.** The
+24 h figure in §8.6 is the *peer's* polling interval — how often a mirror asks to be paid. The
+604,800 here is the *distributor's* reward-accrual window — how the funder's commitments are
+partitioned in time. They are not two settings for one quantity, and making them equal buys nothing:
+
+1. Accrual is continuous inside an epoch (clause 2), so a mirror does not wait for an epoch boundary
+   to earn, and a shorter epoch would not pay it sooner.
+2. A mirror claiming daily against a 7-day epoch is the *normal* case, not a mismatch. It collects
+   whatever accrued since its last claim, seven times per epoch.
+3. Setting `epoch_seconds = 86_400` "to match the cadence" multiplies the funder's commitment slots
+   and `NewEpoch` spends by seven for no change in what any mirror receives.
+
+An implementation MUST NOT derive either value from the other, and a later change to §8.6's cadence
+MUST NOT propagate here. This clause exists because "these two numbers should agree" is the plausible
+wrong fix, and it is the one a reader arrives at without reading clause 2.
 
 ### 8.2 `max_seconds_offset = 300`
 
@@ -1248,7 +1303,7 @@ clause quietly deleted to make the MVP look complete, are both the failure this 
 | §1 Local-holding precondition | **ships** | including §1.4 `LocalCopyMissing` and the §1.5 root-advance refusal |
 | §2 Liveness honesty | **ships** | not polish. §2.2's warning and §2.3-§2.6's surface are money-honesty clauses and are **not deferrable** |
 | §3 Challenge soundness | **ships** | full sampling, deadlines, strike rule |
-| §4 Mirror-coin gate | **ships** | via the §4.2 pointer path. The hint-scan / census fallback for a mirror that publishes no pointer is **specified, deferred** — no ticket filed yet; it MUST be filed before #3250 closes, because until it exists a mirror that does not announce with collateral cannot be paid (§14.1) |
+| §4 Mirror-coin gate | **ships** | via the §4.2 pointer path. The hint-scan / census fallback for a mirror that publishes no pointer is **specified, deferred — #3258**; until it lands, a mirror that does not announce with collateral cannot be paid (§14.1) |
 | §5 Self-exclusion | **ships** | both coordinates, every path, with the §5.3 clause-4 control test |
 | §6 Sybil and eviction economics | **ships** | all four bounds, the §6.4 settlement statement, the §6.5 cap |
 | §7 Custody | **ships** | `require_payout_approval = false`, `fee_bps = 0`, `CommitIncentives` as the default fund action, per-epoch clawback presentation |
@@ -1282,6 +1337,9 @@ is not invisible, and it MUST be handled rather than left to be found:
 2. The funder-facing surface MUST distinguish "no eligible mirrors" from "no mirrors found", so an
    operator is not left concluding nobody is mirroring their store when the real state is that nobody
    published the pointer.
+3. The hint-scan / census fallback that removes the limitation is
+   **DIG-Network/dig_ecosystem#3258** — specified as deferred, not dropped. Until it lands, clauses 1
+   and 2 are what stop this limitation from reading to a funder as "nobody is mirroring my store".
 
 ---
 
@@ -1334,8 +1392,8 @@ An implementation conforms when all of the following hold.
   §12.1-§12.4, §12.6, §13.1.
 - **`dig-node` claim loop (#3251):** §8.6, §12.5.
 - **`dig-gossip` (#3252):** §13.2.
-- **`dig-app` (#3253):** §1.5 clause 4, §2.2, §2.4 clauses 1-3, §6.5's funding floor, §7.4 clause 5,
-  §14.1 clause 2.
+- **`dig-app` (#3253):** §1.5 clause 4, §2.2, §2.4 clauses 1-3, §6.5's funding floor **as a displayed
+  value**, §7.3a clause 3, §7.4 clause 5, §14.1 clause 2.
 - **Docs (#3254):** §2.2, §14.1 clause 1.
 - **`dig-rpc-protocol`:** the three §2.6 methods.
 
@@ -1347,11 +1405,19 @@ Every clause above is **specified, not yet implemented**: at the time of writing
 upstream SDK** (`chia-sdk-driver-0.36.0`, `chia-sdk-types-0.36.0`) or to an **existing sibling crate**
 in `dig_ecosystem`, measured on 2026-09-08. No citation is to code this specification introduces.
 
-### 15.3 Open item
+### 15.3 Open item — the mirror-collateral epoch calendar has no owner (#3259)
 
 The **mirror-collateral epoch calendar** (§4.6 clause 2) has no owner in the tree: `dig-mirror-coin`
-takes the epoch start as an input and `dig-mirror-collateral` computes requirements from an ordinal it
-is given. The prover therefore needs a supplier for that ordinal before §4.6 can be enforced, and this
-crate MUST NOT become that supplier — a rewards crate deciding the collateral calendar is the wiring
-§0.3 forbids. Until a supplier exists, an implementation MUST take the ordinal from configuration and
-MUST report `ChainSourceUnavailable` rather than guessing when it is absent.
+takes the epoch start as an input (`dig-mirror-coin/SPEC.md:371-372`) and `dig-mirror-collateral`
+computes requirements from an ordinal it is given. The prover needs a supplier for that ordinal before
+§4.6 can be enforced.
+
+1. **This crate MUST NOT become that supplier.** A rewards crate deciding the collateral calendar is
+   exactly the wiring §0.3 forbids, and it would make every consumer of the calendar depend on a
+   rewards crate to learn what epoch it is.
+2. **The interim rule**, which holds until an owner exists: an implementation MUST take the ordinal
+   from configuration, and MUST report `ChainSourceUnavailable` rather than guessing when it is
+   absent. Guessing here silently shifts the acceptable epoch window, which admits coins the census
+   excludes or excludes coins it counts — in either direction the money goes to the wrong set.
+3. **DIG-Network/dig_ecosystem#3259** carries the ownership question. When it lands, the named owner
+   replaces clause 2's configuration input; clause 1 is unaffected by its outcome and stays.
