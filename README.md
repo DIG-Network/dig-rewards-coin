@@ -2,12 +2,43 @@
 
 Reward-distributor coin driver for the DIG Network, on Chia.
 
-This crate is scaffolding only — no driver logic yet. It exists to be a first-class ecosystem
-crate from commit one: publishable, gated (CI, commitlint, version-increment), and releasable
-(tag-driven `crates.io` publish) before any behaviour lands.
+**Scaffolding only — no driver logic yet.** This crate exists to be a first-class ecosystem crate
+from commit one: publishable, gated (CI, commitlint, version-increment) and releasable
+(tag-driven `crates.io` publish) before any behaviour lands. See the parent epic
+[#3246](https://github.com/DIG-Network/dig_ecosystem/issues/3246) and the scaffolding ticket
+[#3247](https://github.com/DIG-Network/dig_ecosystem/issues/3247).
 
-See the parent epic: https://github.com/DIG-Network/dig_ecosystem/issues/3246
-and the scaffolding ticket: https://github.com/DIG-Network/dig_ecosystem/issues/3247
+## Shape, copied from `dig-mirror-coin`
+
+Like its `10-primitives` sibling
+[`dig-mirror-coin`](https://github.com/DIG-Network/dig-mirror-coin), this crate will own the
+reward-distributor driver outright: no `datalayer-driver` dependency, no re-export layer over
+anything else.
+
+## Layering
+
+This crate sits at `10-primitives`. Chain reads arrive through the canonical `ChainSource` trait
+(`dig-chainsource-interface`, `00-foundation`) — a `10-primitives` crate never pulls a network
+stack down into itself. Two same-level edges are illegal from here and deliberately not taken:
+`chia-query` (also `10-primitives`, despite being "the canonical coinset access layer") and
+`dig-mirror-coin` (also `10-primitives` — that gate belongs to a `dig-node`-level consumer, not
+to this crate).
+
+## Dependency ceiling
+
+Pinned to the `chia-wallet-sdk` 0.36 ceiling, not to crates.io latest — `chia-sdk-driver` 0.36.0
+pins a `0.36.1` cohort across `chia-bls`/`chia-protocol`/`chia-puzzle-types`/`clvm-traits`/
+`clvm-utils`, `chia-puzzles` 0.20.3 and `clvmr` 0.16.2. Taking the primitives' newer 0.48.x
+releases would link two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
+`chia-sdk-driver` and `chia-sdk-types` both carry the `action-layer` feature — it is what exposes
+the reward distributor at all.
+
+## Release model
+
+Copied verbatim from `dig-mirror-coin`: merge to `main` runs `release.yml`, which regenerates
+`CHANGELOG.md` with `git-cliff`, commits it, and tags `vX.Y.Z` with a `RELEASE_TOKEN` PAT (a tag
+pushed by the default `GITHUB_TOKEN` does not trigger downstream workflows). The tag triggers
+`publish.yml`, which publishes to crates.io.
 
 ## License
 
