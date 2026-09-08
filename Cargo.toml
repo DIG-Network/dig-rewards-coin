@@ -1,0 +1,46 @@
+# dig-rewards-coin — reward-distributor coin driver, on Chia.
+#
+# Scaffolding only: this crate carries no driver logic yet. Like its 10-primitives sibling
+# `dig-mirror-coin`, it deliberately does NOT depend on `datalayer-driver` and is not a re-export
+# layer over anything. Chain reads arrive through the canonical `ChainSource` trait
+# (dig-chainsource-interface, 00-foundation) — a 10-primitives crate never pulls a network stack
+# down into itself, and it may never depend on a same-level crate such as `chia-query` or
+# `dig-mirror-coin`.
+[package]
+name = "dig-rewards-coin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81.0"
+description = "Reward-distributor coin driver for the DIG Network on Chia (scaffolding — no driver logic yet)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DIG-Network/dig-rewards-coin"
+readme = "README.md"
+keywords = ["chia", "dig", "cat", "rewards", "distributor"]
+categories = ["cryptography::cryptocurrencies"]
+
+# Agent instructions are not part of the crate. Without this they ride into the published tarball,
+# which is IMMUTABLE — it happened to dig-mirror-coin 0.7.0, which shipped six
+# `.claude/skills/**/SKILL.md` plus `AGENTS.md` and `CLAUDE.md` to every consumer, unfixably.
+# `cargo package --list` is the only thing that proves this exclusion still bites.
+exclude = [".claude", "AGENTS.md", "CLAUDE.md"]
+
+[dependencies]
+dig-chainsource-interface = "0.3.3"
+dig-constants = "0.13.1"
+
+# The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
+# the SDK crates, `chia-puzzles` and `clvmr` each cap at a different version. Normalising them to a
+# single version would either strand this crate below the SDK or move it past what the SDK can
+# link — chia-sdk-driver 0.36.0 pins the 0.36.1 cohort; the primitives publish 0.48.x but taking
+# that links two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
+chia-bls = "0.36.1"
+chia-protocol = "0.36.1"
+chia-puzzle-types = "0.36.1"
+chia-puzzles = "0.20.3"
+# `action-layer` is what exposes the reward distributor at all; without it the crate cannot see it.
+chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+clvm-traits = "0.36.1"
+clvm-utils = "0.36.1"
+clvmr = "0.16.2"
+thiserror = "2.0.20"
