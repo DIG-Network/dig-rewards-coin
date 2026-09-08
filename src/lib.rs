@@ -56,6 +56,7 @@
 
 pub mod comment;
 pub mod constants;
+pub mod eligibility;
 mod error;
 
 pub use comment::LaunchComment;
@@ -65,5 +66,8 @@ pub use constants::{
     DEFAULT_DISTRIBUTOR_EPOCH_SECONDS, DEFAULT_FEE_BPS, ENTRY_SHARES,
     FIRST_EPOCH_START_LEAD_SECONDS, MAX_ENTRIES_PER_DISTRIBUTOR, MAX_SECONDS_OFFSET,
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
+};
+pub use eligibility::{
+    judge_candidate, judge_candidate_for_epoch, EligibilityQuestion, Ineligible, MirrorCoinFacts,
 };
 pub use error::RewardsError;
