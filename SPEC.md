@@ -292,9 +292,13 @@ it:
 
 ### 2.2 The creation-time uptime warning
 
-Before the launch spend is signed, the creation flow MUST state all four:
+Before the launch spend is signed, the creation flow MUST state all five:
 
-1. Rewards are distributed only while **this node's** prover runs.
+1. **This node's prover determines *who* is paid, not *whether* anyone is paid.** Distribution does
+   not depend on this node: accrual and payouts are permissionless and continue while the prover is
+   stopped (§2.1). What the prover's liveness governs is the **entry set** — whether the set being
+   paid still tracks who is actually mirroring. The consequence of stopping it is clause 3, not a
+   pause in payment.
 2. The funds are not lost when it stops — they stay in the reserve, and future commitments can be
    clawed back (§7.4).
 3. **While the prover is stopped the entry set is frozen: peers that have stopped mirroring continue
@@ -308,8 +312,26 @@ Before the launch spend is signed, the creation flow MUST state all four:
    set for at most N more epochs" — because a risk with a stated bound is a decision a funder can
    make, and a risk without one is only alarming.
 
-The warning MUST NOT be reducible to "requires consistent uptime". That phrasing invites the reader
-to conclude that downtime merely pauses payment, which is the false half of §2.1.
+**What clause 1 previously said, and why the correction is recorded.** Clause 1 read: *"Rewards are
+distributed only while this node's prover runs."* That is the false half of §2's opening sentence
+restated as a normative instruction to the creation flow, and it contradicted three things at once:
+§2.1's measurement, which governs, because `Sync` and `InitiatePayout` are permissionless (§2.1's
+table, §7.1) and so distribution is not this node's to stop; clause 3, two clauses down, which had
+said all along that distribution to the frozen set continues; and the paragraph below, which
+banned a weaker form of the same claim. §2.1 exists because this premise had been corrected once
+already — it is the requirement's own sentence, quoted at the head of §2 — and clause 1 had carried
+it back in.
+
+The correction is stated rather than applied silently because a consumer reading the old clause in
+isolation writes an operator warning that **under-states** a dead prover, which is the expensive
+direction for a funder: the real harm is not a pause but that peers who stopped mirroring keep being
+paid while peers who started cannot begin. A contradiction that is quietly fixed regenerates in the
+next consumer; one that is recorded does not. §15.4 carries the amendment row.
+
+The warning MUST NOT be reducible to "requires consistent uptime", nor to any paraphrase that makes
+payment conditional on this node — the withdrawn clause-1 wording above is one, and a stronger one.
+Such phrasing invites the reader to conclude that downtime merely pauses payment, which is the false
+half of §2.1.
 
 ### 2.3 The status surface
 
@@ -1741,6 +1763,11 @@ a later reader can tell a decision from an open item.
 | C9 | Sybil resistance rests on one unstated inequality, in a constant this epic does not own | **partly fixed, partly amendment.** §6.2.1 names the inequality, its owner, the absence of a second defence, and requires the funder-facing count be labelled **identities**. **Open:** monitoring whether it still holds — an ecosystem question, not enforceable here |
 | gap A | `active_shares == 0` unmeasured, and **every** distributor passes through it at launch | **fixed as a required test** — §15 clause 9a mandates the simulator case and states what it must assert. Must land before any distributor is launched |
 | gap B | `PROVER_CYCLE_PERIOD_SECONDS` was never defined, yet §3.6 derived a time-to-eviction from it | **fixed** — §2.5 defines it at 3_600 and derives both dependent quantities from it; §12.4 also reallocated to the claim loop (§15.1) |
+| A1 | **§2.2 clause 1 contradicted §2.1 and its own clause 3** — "Rewards are distributed only while **this node's** prover runs" is the false half of §2's opening sentence restated as an instruction, and a stronger form of the phrasing §2.2's closing paragraph bans | **fixed** — clause 1 now states that the prover governs *who* is paid, not *whether* anyone is paid, with the withdrawn wording recorded in place; the closing ban widened to any paraphrase making payment conditional on this node; the lead-in count corrected to "all five". Clauses 2-5 unchanged; no constant, default or driver shape changed |
+
+Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
+reason the gate conditions are: a reader must be able to tell a decision from a correction, and a
+silently fixed contradiction regenerates in the next consumer that reads the clause in isolation.
 
 Two items are genuine **product policy** rather than engineering, are recorded with the position this
 document takes, and remain the user's to reverse:
