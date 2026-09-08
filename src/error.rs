@@ -50,7 +50,10 @@ mod tests {
     #[test]
     fn chain_unavailable_displays_the_reason() {
         let err = RewardsError::ChainUnavailable("peer timed out".to_string());
-        assert_eq!(err.to_string(), "chain source could not answer: peer timed out");
+        assert_eq!(
+            err.to_string(),
+            "chain source could not answer: peer timed out"
+        );
     }
 
     #[test]
