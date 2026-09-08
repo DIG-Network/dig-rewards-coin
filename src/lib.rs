@@ -25,6 +25,10 @@
 
 #![warn(missing_docs)]
 
+mod error;
+
+pub use error::RewardsError;
+
 /// Placeholder module for the reward-distributor coin driver.
 ///
 /// Empty until the driver logic in a follow-up ticket lands. Kept as a named module (rather than
