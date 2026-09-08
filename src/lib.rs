@@ -1,38 +1,69 @@
 //! # dig-rewards-coin — the reward-distributor coin driver, on Chia
 //!
-//! This crate will own the reward-distributor coin driver for the DIG Network outright, the same
-//! way its `10-primitives` sibling `dig-mirror-coin` owns the mirror-coin driver: no
-//! `datalayer-driver` dependency, no re-export layer over anything else.
+//! A **rewards distributor** is a CHIP-0051 reward distributor, in its `Managed` mode, that pays
+//! $DIG to the peers that actually mirror one DIG generation — one `storeId:root`. Anyone may mint
+//! one, anyone may fund it, the funder's node continuously proves which peers really serve those
+//! bytes, and a mirroring peer collects its own rewards without asking anyone.
 //!
-//! **This is scaffolding only.** No driver logic has landed yet — this commit exists so the
-//! crate is publishable, gated (CI, commitlint, version-increment) and releasable (tag-driven
-//! `crates.io` publish) before any behaviour does. See the parent epic
-//! <https://github.com/DIG-Network/dig_ecosystem/issues/3246> and the scaffolding ticket
-//! <https://github.com/DIG-Network/dig_ecosystem/issues/3247>.
+//! This crate is the **driver** over that mechanism: the DIG-shaped constants a DIG distributor
+//! MUST carry ([`constants`]), the comment that ties its money to a generation ([`comment`]), the
+//! spend builders that launch it and mutate its entry set, the eligibility rule that decides who is
+//! in that set, and the observable state that makes "is anyone being paid?" answerable.
 //!
-//! ## Layering
+//! `SPEC.md` at the repository root is normative and is what every implementation reads **instead
+//! of** the SDK.
 //!
-//! This crate sits at `10-primitives`. Chain reads will arrive through the canonical
-//! `ChainSource` trait (`dig-chainsource-interface`, `00-foundation`) — a `10-primitives` crate
-//! never pulls a network stack down into itself, and it may never depend on a same-level crate
-//! (`chia-query`, `dig-mirror-coin`) or anything above its own level.
+//! ## What this crate is not
 //!
-//! ## `action-layer`
+//! The on-chain mechanism is not ours. It is CHIP-0051, implemented upstream in `chia-wallet-sdk`
+//! 0.36 (`chia-sdk-driver` + `chia-sdk-types`). This crate therefore:
 //!
-//! The reward distributor is exposed by `chia-sdk-driver`'s `action-layer` feature; without that
-//! feature enabled the crate cannot see it at all. See `Cargo.toml` for the pinned dependency
-//! table this crate builds against.
+//! - never reimplements or restates puzzle arithmetic — the per-share accrual, the payout division,
+//!   the epoch fee and the withdrawal share belong to the puzzle, and a restated formula drifts
+//!   (§0.1 clause 1);
+//! - performs no socket I/O, holds no keys, and never broadcasts. Chain reads arrive through the
+//!   caller-supplied `ChainSource` (`dig-chainsource-interface`); spend builders return unsigned
+//!   spends (§0.1 clause 2);
+//! - contains neither the prover loop nor the claim loop. Those are `dig-node`
+//!   (<https://github.com/DIG-Network/dig_ecosystem/issues/3250>,
+//!   <https://github.com/DIG-Network/dig_ecosystem/issues/3251>); this crate supplies what they
+//!   call.
+//!
+//! ## Units, named once
+//!
+//! $DIG amounts are always **DIG CAT base units** ($DIG carries three decimals, so
+//! `1 $DIG = 1_000` base units). Network fees are **XCH mojos**. The two never share a type and are
+//! never added, compared or displayed in one column. `fee_bps` and `withdrawal_share_bps` are basis
+//! points out of `10_000`, carried as basis points end to end — a percentage round-trip is how a
+//! `420` becomes a `4`. **No float appears anywhere in the money path** (§0.2).
+//!
+//! ## Three clocks share the word "epoch"
+//!
+//! The distributor epoch, the mirror-collateral epoch and the `dig-epoch` L2 epoch are unrelated,
+//! and none may be derived from another. A bare `epoch` in this crate's public API is a defect, so
+//! every identifier here reads `distributor_epoch_*` or `mirror_collateral_epoch` (§0.3).
+//!
+//! ## Version pinning is a money question
+//!
+//! `RewardDistributorConstants` are curried into the action puzzles at launch, so a distributor's
+//! on-chain identity is a function of the exact upstream puzzle bytes. A client built on different
+//! bytes cannot reconstruct or spend a distributor launched under the old ones — the reserve is not
+//! lost, it is invisible, which is worse than an error. The `chia-sdk-driver` 0.36 cohort is
+//! therefore pinned, and a guard test asserts every action puzzle hash so an upstream bump arrives
+//! as a red build (§0.5).
 
 #![warn(missing_docs)]
 
+pub mod comment;
+pub mod constants;
 mod error;
 
+pub use comment::LaunchComment;
+pub use constants::{
+    dig_distributor_constants, dig_distributor_constants_with_funder_self_skim,
+    with_dig_launcher_id, DistributorLaunchTerms, COMMITMENT_DEPTH_EPOCHS,
+    DEFAULT_DISTRIBUTOR_EPOCH_SECONDS, DEFAULT_FEE_BPS, ENTRY_SHARES,
+    FIRST_EPOCH_START_LEAD_SECONDS, MAX_ENTRIES_PER_DISTRIBUTOR, MAX_SECONDS_OFFSET,
+    PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
+};
 pub use error::RewardsError;
-
-/// Placeholder module for the reward-distributor coin driver.
-///
-/// Empty until the driver logic in a follow-up ticket lands. Kept as a named module (rather than
-/// leaving `lib.rs` bare) so the crate's public shape is visible from commit one.
-pub mod distributor {
-    // Intentionally empty: no driver logic yet (see the ticket referenced in the crate docs).
-}

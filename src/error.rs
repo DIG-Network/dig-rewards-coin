@@ -28,6 +28,14 @@ pub enum RewardsError {
     #[error("malformed chain data: {0}")]
     Malformed(String),
 
+    /// The launch terms a caller supplied cannot produce a valid DIG distributor.
+    ///
+    /// These are the values curried at launch and immutable afterwards, so refusing here is the
+    /// only chance to refuse at all: a distributor launched with a zero fee-payout hash or a zero
+    /// epoch length carries that mistake for its whole life (`SPEC.md` §7.3, §8.1).
+    #[error("invalid launch terms: {0}")]
+    InvalidLaunchTerms(String),
+
     /// A puzzle construction or spend-building step failed inside the Chia driver layer.
     ///
     /// Boxed because `DriverError` is large and would otherwise bloat every `Result` in the
