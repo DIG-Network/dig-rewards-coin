@@ -92,6 +92,38 @@ pub struct EligibilityQuestion {
     pub mirror_collateral_epoch: u32,
 }
 
+/// A payout puzzle hash that an eligibility verdict produced.
+///
+/// The only way to obtain one is [`judge_candidate`] returning `Ok(Ok(_))`, and
+/// [`crate::entries::add_entry`] takes nothing else. That makes "the entry's payout hash came from
+/// the chain" a fact the type system carries rather than a rule a caller is asked to remember: a
+/// buggy or compromised caller holding a legitimate [`crate::entries::ManagerAuthority`] cannot
+/// route a DIG payout to a hash of its choosing, because it cannot build this value.
+///
+/// The field is private to this module, so not even the rest of this crate can mint one — a
+/// `pub(crate)` constructor would put [`crate::entries`] back in the business of inventing payout
+/// hashes. There is deliberately no public constructor, no `From<Bytes32>` and no public field;
+/// the same discipline [`crate::entries::ManagerAuthority`] uses.
+///
+/// A caller that needs one for an entry it decided about earlier judges the candidate again. That
+/// is not a workaround: eligibility is a statement about current chain facts, and a stored verdict
+/// may already be stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EligiblePayoutHash {
+    payout_puzzle_hash: Bytes32,
+}
+
+impl EligiblePayoutHash {
+    /// The payout puzzle hash the verdict established.
+    ///
+    /// It is a puzzle hash and never a public key, a BLS key, a peer id or an address string
+    /// (`SPEC.md` §10.2 clause 1), because it came from the mirror coin's lineage proof.
+    #[must_use]
+    pub const fn payout_puzzle_hash(self) -> Bytes32 {
+        self.payout_puzzle_hash
+    }
+}
+
 /// Why a candidate is not eligible.
 ///
 /// Each variant names a chain fact that did not hold. None of them is an accusation, and none MUST
@@ -120,8 +152,10 @@ pub enum Ineligible {
 /// `facts` is `None` when no mirror coin was found for the candidate — the absent-coin case, which
 /// is ineligibility and not an error.
 ///
-/// On success the returned [`Bytes32`] is the `payout_puzzle_hash` the entry MUST carry. It is a
-/// puzzle hash and never a public key, a BLS key, a peer id or an address string (§10.2 clause 1).
+/// On success the returned [`EligiblePayoutHash`] carries the `payout_puzzle_hash` the entry MUST
+/// carry, and it is the only thing [`crate::entries::add_entry`] accepts — the verdict and the
+/// hash travel as one value so that no caller can pair a legitimate authority with a hash of its
+/// own choosing.
 ///
 /// Fails closed: any one of the three checks failing, or the coin being absent, is ineligibility
 /// with no weaker fallback.
@@ -134,7 +168,7 @@ pub fn judge_candidate(
     question: EligibilityQuestion,
     peer_id: Bytes32,
     facts: Option<&impl MirrorCoinFacts>,
-) -> Result<Result<Bytes32, Ineligible>, RewardsError> {
+) -> Result<Result<EligiblePayoutHash, Ineligible>, RewardsError> {
     let Some(facts) = facts else {
         return Ok(Err(Ineligible::NoMirrorCoin));
     };
@@ -151,7 +185,10 @@ pub fn judge_candidate(
         return Ok(Err(Ineligible::DoesNotDeclarePeer));
     }
 
-    Ok(Ok(facts.owner_puzzle_hash()))
+    // The one mint point. The hash is the coin's own, derived from its lineage proof.
+    Ok(Ok(EligiblePayoutHash {
+        payout_puzzle_hash: facts.owner_puzzle_hash(),
+    }))
 }
 
 /// Judge one candidate when the mirror-collateral epoch may not have been established.
@@ -170,7 +207,7 @@ pub fn judge_candidate_for_epoch(
     mirror_collateral_epoch: Option<u32>,
     peer_id: Bytes32,
     facts: Option<&impl MirrorCoinFacts>,
-) -> Result<Result<Bytes32, Ineligible>, RewardsError> {
+) -> Result<Result<EligiblePayoutHash, Ineligible>, RewardsError> {
     let Some(mirror_collateral_epoch) = mirror_collateral_epoch else {
         return Err(RewardsError::ChainUnavailable(
             "mirror-collateral epoch not established; the census cannot run".to_string(),
@@ -253,7 +290,11 @@ mod tests {
     #[test]
     fn eligibility_all_three_passing_yields_the_owner_puzzle_hash() {
         let verdict = judge_candidate(question(), PEER, Some(&StubCoin::all_passing())).unwrap();
-        assert_eq!(verdict, Ok(OWNER_PH));
+        assert_eq!(
+            verdict.map(EligiblePayoutHash::payout_puzzle_hash),
+            Ok(OWNER_PH),
+            "the entry's payout hash is the coin's own, carried out of the verdict"
+        );
     }
 
     #[test]
@@ -305,7 +346,9 @@ mod tests {
         // peer and the advertised ordinal is eligible. The pair together is only satisfiable if
         // `question.mirror_collateral_epoch` is what reaches `advertises`.
         assert_eq!(
-            judge_candidate(question(), PEER, Some(&coin)).unwrap(),
+            judge_candidate(question(), PEER, Some(&coin))
+                .unwrap()
+                .map(EligiblePayoutHash::payout_puzzle_hash),
             Ok(OWNER_PH),
             "the advertised census must still be eligible, or the refusal above proves nothing"
         );
@@ -329,6 +372,9 @@ mod tests {
             Some(&StubCoin::all_passing()),
         )
         .unwrap();
-        assert_eq!(verdict, Ok(OWNER_PH));
+        assert_eq!(
+            verdict.map(EligiblePayoutHash::payout_puzzle_hash),
+            Ok(OWNER_PH)
+        );
     }
 }

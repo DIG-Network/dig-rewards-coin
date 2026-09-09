@@ -78,7 +78,8 @@ pub use constants::{
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
 };
 pub use eligibility::{
-    judge_candidate, judge_candidate_for_epoch, EligibilityQuestion, Ineligible, MirrorCoinFacts,
+    judge_candidate, judge_candidate_for_epoch, EligibilityQuestion, EligiblePayoutHash,
+    Ineligible, MirrorCoinFacts,
 };
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;

@@ -22,11 +22,12 @@
 //!
 //! ## What an entry is keyed by
 //!
-//! `payout_puzzle_hash: Bytes32`, and nothing else. It comes from
-//! [`crate::eligibility::judge_candidate`], which derives it from the mirror coin's lineage proof.
-//! A public key, a BLS key, a peer id or an address string in that position is a defect (§10.2
-//! clause 1) — and note that the distributor knows nothing about peer identity at all: every
-//! statement tying a payment to a peer lives in the mirror coin.
+//! A payout puzzle hash, and nothing else. It arrives as an [`EligiblePayoutHash`], which only
+//! [`crate::eligibility::judge_candidate`] can mint from the mirror coin's lineage proof — so
+//! [`add_entry`] cannot be handed a bare hash at all, and the manager authority alone does not let
+//! a caller choose where DIG goes. A public key, a BLS key, a peer id or an address string in that
+//! position is a defect (§10.2 clause 1) — and note that the distributor knows nothing about peer
+//! identity at all: every statement tying a payment to a peer lives in the mirror coin.
 //!
 //! `shares` is not a caller parameter. Every mirror of one generation is worth the same, so the DIG
 //! path always passes [`ENTRY_SHARES`] (§11.1, §11.3).
@@ -40,6 +41,7 @@ use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
 use chia_sdk_types::Conditions;
 
 use crate::constants::{ENTRY_SHARES, MAX_ENTRIES_PER_DISTRIBUTOR};
+use crate::eligibility::EligiblePayoutHash;
 use crate::RewardsError;
 
 /// Proof that the caller is acting as the distributor's manager singleton.
@@ -113,14 +115,18 @@ pub struct EntryRemoval {
 
 /// Add one eligible mirror to the entry set.
 ///
-/// `payout_puzzle_hash` must be the value [`crate::eligibility::judge_candidate`] returned.
-/// `now_unix_seconds` is the caller's current time, from which the validity window is settled.
+/// `payout` is the verdict [`crate::eligibility::judge_candidate`] returned, and there is no other
+/// way to obtain one — the hash an entry carries is bound to the eligibility decision in the type,
+/// not by a docs sentence a buggy caller can miss. `now_unix_seconds` is the caller's current time,
+/// from which the validity window is settled.
 ///
 /// # Errors
 ///
 /// - [`RewardsError::EntrySetFull`] if the distributor already holds
 ///   [`MAX_ENTRIES_PER_DISTRIBUTOR`] entries. A named refusal, never a silent stop (§15 clause 7).
-/// - [`RewardsError::InvalidLaunchTerms`] if `payout_puzzle_hash` is the zero hash.
+/// - [`RewardsError::InvalidLaunchTerms`] if the verdict's payout puzzle hash is the zero hash. It
+///   cannot be an arbitrary caller value, but a coin whose lineage proof yielded nothing would
+///   otherwise send every DIG payment to a puzzle nobody can spend.
 /// - [`RewardsError::EntrySetWriteWindowClosed`] if no `Sync` could bring the write inside its
 ///   window, because the distributor's epoch has ended.
 /// - [`RewardsError::Driver`] if either upstream action could not be built.
@@ -128,9 +134,10 @@ pub fn add_entry(
     ctx: &mut SpendContext,
     distributor: &mut RewardDistributor,
     authority: ManagerAuthority,
-    payout_puzzle_hash: Bytes32,
+    payout: EligiblePayoutHash,
     now_unix_seconds: u64,
 ) -> Result<EntrySetWrite, RewardsError> {
+    let payout_puzzle_hash = payout.payout_puzzle_hash();
     if payout_puzzle_hash == Bytes32::default() {
         return Err(RewardsError::InvalidLaunchTerms(
             "payout puzzle hash must not be the zero hash".to_string(),

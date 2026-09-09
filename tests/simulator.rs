@@ -39,6 +39,9 @@ use dig_rewards_coin::constants::{
     dig_distributor_constants, DistributorLaunchTerms, ENTRY_SHARES, MAX_SECONDS_OFFSET,
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
 };
+use dig_rewards_coin::eligibility::{
+    judge_candidate, EligibilityQuestion, EligiblePayoutHash, MirrorCoinFacts,
+};
 use dig_rewards_coin::entries::{add_entry, remove_entry, ManagerAuthority};
 use dig_rewards_coin::epoch::{
     current_distributor_epoch_end, last_update, start_next_distributor_epoch, sync_distributor,
@@ -63,6 +66,51 @@ const MINTED_BASE_UNITS: u64 = 10_000_000_000;
 
 /// What the funder commits to one distributor epoch.
 const COMMITTED_BASE_UNITS: u64 = 1_000_000;
+
+/// The mirror-collateral epoch these tests judge candidates against. Any ordinal will do; what
+/// matters is that the same one is asked and advertised (§4.3 clause 1).
+const TEST_MIRROR_COLLATERAL_EPOCH: u32 = 7;
+
+/// A mirror coin that passes every §4.3 check and pays out to one hash.
+///
+/// `add_entry` accepts only an [`EligiblePayoutHash`], which nothing outside `judge_candidate` can
+/// mint, so these tests reach the entry set exactly the way `dig-node` does: judge a candidate
+/// against a coin, then add the verdict. There is no test-only back door, because a back door here
+/// would test a path production does not have.
+struct EligibleMirrorCoin {
+    payout_puzzle_hash: Bytes32,
+}
+
+impl MirrorCoinFacts for EligibleMirrorCoin {
+    fn advertises(&self, _store: Bytes32, _root: Bytes32, mirror_collateral_epoch: u32) -> bool {
+        mirror_collateral_epoch == TEST_MIRROR_COLLATERAL_EPOCH
+    }
+
+    fn declares_peer(&self, _peer_id: Bytes32) -> bool {
+        true
+    }
+
+    fn owner_puzzle_hash(&self) -> Bytes32 {
+        self.payout_puzzle_hash
+    }
+}
+
+/// Judge a candidate whose mirror coin pays out to `payout_puzzle_hash`, and take the verdict.
+///
+/// The eligible outcome is the only one that yields an [`EligiblePayoutHash`], so an
+/// `add_entry` call site in these tests is by construction downstream of a real verdict.
+fn verdict_for(payout_puzzle_hash: Bytes32) -> EligiblePayoutHash {
+    let question = EligibilityQuestion {
+        store_launcher_id: Bytes32::new([0xaa; 32]),
+        root_hash: Bytes32::new([0xbb; 32]),
+        mirror_collateral_epoch: TEST_MIRROR_COLLATERAL_EPOCH,
+    };
+    let coin = EligibleMirrorCoin { payout_puzzle_hash };
+
+    judge_candidate(question, Bytes32::new([0xcc; 32]), Some(&coin))
+        .expect("the epoch is established")
+        .expect("every §4.3 check passes")
+}
 
 /// A test-only slot source that hands back the slot it was given.
 ///
@@ -521,7 +569,7 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
         ctx,
         &mut harness.distributor,
         authority,
-        harness.entry.puzzle_hash,
+        verdict_for(harness.entry.puzzle_hash),
         0,
     )?;
 
@@ -800,7 +848,7 @@ fn empty_first_epoch_settles_where() -> anyhow::Result<()> {
         ctx,
         &mut harness.distributor,
         authority,
-        harness.entry.puzzle_hash,
+        verdict_for(harness.entry.puzzle_hash),
         epoch_end,
     )?;
 
@@ -1009,7 +1057,7 @@ fn past_the_window_an_entry_set_write_carries_a_sync_in_the_same_bundle() -> any
         ctx,
         &mut harness.distributor,
         authority,
-        harness.entry.puzzle_hash,
+        verdict_for(harness.entry.puzzle_hash),
         past_the_window,
     )?;
 
@@ -1072,7 +1120,7 @@ fn the_entry_set_write_window_closes_at_the_end_of_an_epoch() -> anyhow::Result<
         ctx,
         &mut harness.distributor,
         authority,
-        harness.entry.puzzle_hash,
+        verdict_for(harness.entry.puzzle_hash),
         too_late,
     ) {
         Ok(_) => panic!("no Sync can bring this write inside its window, so it must be refused"),
@@ -1118,7 +1166,7 @@ fn the_entry_set_write_window_closes_at_the_end_of_an_epoch() -> anyhow::Result<
         ctx,
         &mut harness.distributor,
         authority,
-        harness.entry.puzzle_hash,
+        verdict_for(harness.entry.puzzle_hash),
         too_late,
     )?;
     harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
@@ -1150,7 +1198,7 @@ fn a_sync_that_cannot_reach_the_window_is_refused_before_the_operator_pays() -> 
     let epoch_end = harness.distributor.info.state.round_time_info.epoch_end;
     let last_update = harness.distributor.info.state.round_time_info.last_update;
     let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
-    let payout_hash = harness.entry.puzzle_hash;
+    let payout_hash = verdict_for(harness.entry.puzzle_hash);
 
     // The fixture is the fourth state and not one of the three already covered: the epoch has NOT
     // ended, so a Sync is still able to move the clock strictly forward.

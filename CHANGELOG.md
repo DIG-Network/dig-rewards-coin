@@ -26,6 +26,13 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   `RewardsError::EntrySetWriteWindowClosed` when no `Sync` could help because `last_update` has
   reached `epoch_end` — naming the permissionless `NewEpoch` as the remedy the caller can spend
   itself.
+- `EligiblePayoutHash`: the payout puzzle hash an entry carries is bound to the eligibility
+  verdict in the type. Only `eligibility::judge_candidate` can mint one — the field is private to
+  its module, and there is no public constructor, no `From<Bytes32>` and no public field — and
+  `entries::add_entry` accepts nothing else. A caller holding a legitimate `ManagerAuthority` can
+  therefore no longer route a DIG payout to a hash of its own choosing, which is the one thing the
+  manager authority was never meant to grant. Tightening a published parameter is breaking, so it
+  ships in 0.2.0 or never.
 - Simulator acceptance suite against the real CHIP-0051 puzzles (SPEC.md §15 clause 9), modelled on
   upstream `test_managed_reward_distributor()`: launch, fund, add entry, roll epoch, self-claim
   payout, remove entry and observe §6.4's settlement.
@@ -44,6 +51,13 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   a public item later is purely additive, so nothing is foreclosed. `DistributorSlots`,
   `DistributorSnapshot` and its accessors stay public — they work, and they are useful to any caller
   holding a `RewardDistributor` obtained another way, including straight out of a launch.
+- `launch_dig_distributor` takes `first_epoch_start: u64` rather than a whole
+  `DistributorLaunchTerms`. Two of the terms — the manager singleton launcher id and
+  `distributor_epoch_seconds` — are already curried into `constants`, which is what the launch
+  spend reads, so the `terms` argument carried a second copy that was silently ignored and a caller
+  could pass terms disagreeing with the constants. `DistributorLaunchTerms` is unchanged as the
+  required-fields input to `dig_distributor_constants`, where the three launch-time choices are
+  made once. `first_epoch_start` is the one launch value the constants table does not hold.
 - `launch_dig_distributor` no longer takes a `funder_refund_puzzle_hash` parameter. The CAT change
   destination is now derived from `constants.fee_payout_puzzle_hash` through the single
   `funder_refund_puzzle_hash(constants)` accessor, so SPEC.md §15 clause 3's requirement that the
