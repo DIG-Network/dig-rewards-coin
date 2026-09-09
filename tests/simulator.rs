@@ -1125,6 +1125,85 @@ fn the_entry_set_write_window_closes_at_the_end_of_an_epoch() -> anyhow::Result<
     Ok(())
 }
 
+/// `SPEC.md` §8.2, the fourth state: the epoch is still running, so a `Sync` *can* move the clock,
+/// but not far enough — and the write it would carry is already doomed.
+///
+/// This is the state the window guard used to miss. It asked "can the clock move forward?" when the
+/// question is "does the clock reach?". With `last_update < epoch_end` a `Sync` to `epoch_end` is
+/// legal, so the write was built and returned `Ok`; but the write asserts
+/// `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_end + max_seconds_offset)`, and once the caller's clock has
+/// passed that moment the chain rejects the bundle and the operator pays the fee for it.
+#[test]
+fn a_sync_that_cannot_reach_the_window_is_refused_before_the_operator_pays() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (mut harness, _reward_slots) = launch_funded_and_inside_the_first_epoch(ctx)?;
+
+    let epoch_end = harness.distributor.info.state.round_time_info.epoch_end;
+    let last_update = harness.distributor.info.state.round_time_info.last_update;
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let payout_hash = harness.entry.puzzle_hash;
+
+    // The fixture is the fourth state and not one of the three already covered: the epoch has NOT
+    // ended, so a Sync is still able to move the clock strictly forward.
+    assert!(
+        last_update < epoch_end,
+        "a Sync must still be able to move the clock, or this is the already-covered third state"
+    );
+
+    // The furthest a Sync may take `last_update` is `epoch_end`, so the write's own
+    // ASSERT_BEFORE_SECONDS_ABSOLUTE can be no later than this.
+    let furthest_the_write_can_be_valid = epoch_end + MAX_SECONDS_OFFSET;
+
+    let refusal = match add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        payout_hash,
+        furthest_the_write_can_be_valid,
+    ) {
+        Ok(_) => panic!(
+            "the best Sync available reaches only {epoch_end}, whose window closes at {furthest_the_write_can_be_valid}: the write is already invalid, so it must be refused here rather than rejected on chain at the operator's expense"
+        ),
+        Err(error) => error,
+    };
+
+    let RewardsError::EntrySetWriteWindowClosed {
+        last_update: refused_last_update,
+        epoch_end: refused_epoch_end,
+        now_unix_seconds,
+    } = &refusal
+    else {
+        panic!("expected EntrySetWriteWindowClosed, got: {refusal}");
+    };
+    assert_eq!(*refused_last_update, last_update);
+    assert_eq!(*refused_epoch_end, epoch_end);
+    assert_eq!(*now_unix_seconds, furthest_the_write_can_be_valid);
+
+    // And the guard is not simply refusing everything past the window: one second earlier the best
+    // available Sync still lands the write inside its validity window, and the chain accepts the
+    // pair. Without this the fix above could be a blanket refusal and the test would not notice.
+    let still_reachable = furthest_the_write_can_be_valid - 1;
+    harness.sim.set_next_timestamp(still_reachable)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        payout_hash,
+        still_reachable,
+    )?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (_, _) = spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        harness.distributor.info.state.active_shares, ENTRY_SHARES,
+        "one second inside the reachable window the write still lands on chain"
+    );
+
+    Ok(())
+}
+
 /// `SPEC.md` §7.4 clauses 3-5 and §7.5: a clawback is authorized by the commitment slot's own
 /// recorded hash and by nothing else.
 ///

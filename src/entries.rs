@@ -230,7 +230,14 @@ fn sync_if_the_window_needs_it(
     // Sync as far as the caller's clock allows, but never past the epoch the puzzle is in.
     let sync_to = now_unix_seconds.min(epoch_end);
 
-    if sync_to <= last_update {
+    // The question is not "can the clock move?" but "does it REACH?". After the sync, the write's
+    // window closes at `sync_to + max_seconds_offset`; if the caller's clock has already passed
+    // that moment the write is invalid no matter what, and a `Sync` that moved the clock would only
+    // buy a bundle the chain rejects at the operator's expense. This one predicate covers both
+    // refusals: when `sync_to <= last_update` (the epoch has ended, so no forward sync exists) the
+    // window already closed at `last_update + max_seconds_offset`, which is at or before
+    // `sync_to + max_seconds_offset`, so it fires there too.
+    if sync_to.saturating_add(distributor.info.constants.max_seconds_offset) <= now_unix_seconds {
         return Err(RewardsError::EntrySetWriteWindowClosed {
             last_update,
             epoch_end,
