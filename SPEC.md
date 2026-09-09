@@ -292,9 +292,13 @@ it:
 
 ### 2.2 The creation-time uptime warning
 
-Before the launch spend is signed, the creation flow MUST state all four:
+Before the launch spend is signed, the creation flow MUST state all five:
 
-1. Rewards are distributed only while **this node's** prover runs.
+1. **This node's prover determines *who* is paid, not *whether* anyone is paid.** Distribution does
+   not depend on this node: accrual and payouts are permissionless and continue while the prover is
+   stopped (§2.1). What the prover's liveness governs is the **entry set** — whether the set being
+   paid still tracks who is actually mirroring. The consequence of stopping it is clause 3, not a
+   pause in payment.
 2. The funds are not lost when it stops — they stay in the reserve, and future commitments can be
    clawed back (§7.4).
 3. **While the prover is stopped the entry set is frozen: peers that have stopped mirroring continue
@@ -308,8 +312,26 @@ Before the launch spend is signed, the creation flow MUST state all four:
    set for at most N more epochs" — because a risk with a stated bound is a decision a funder can
    make, and a risk without one is only alarming.
 
-The warning MUST NOT be reducible to "requires consistent uptime". That phrasing invites the reader
-to conclude that downtime merely pauses payment, which is the false half of §2.1.
+**What clause 1 previously said, and why the correction is recorded.** Clause 1 read: *"Rewards are
+distributed only while this node's prover runs."* That is the false half of §2's opening sentence
+restated as a normative instruction to the creation flow, and it contradicted three things at once:
+§2.1's measurement, which governs, because `Sync` and `InitiatePayout` are permissionless (§2.1's
+table, §7.1) and so distribution is not this node's to stop; clause 3, two clauses down, which had
+said all along that distribution to the frozen set continues; and the paragraph below, which
+banned a weaker form of the same claim. §2.1 exists because this premise had been corrected once
+already — it is the requirement's own sentence, quoted at the head of §2 — and clause 1 had carried
+it back in.
+
+The correction is stated rather than applied silently because a consumer reading the old clause in
+isolation writes an operator warning that **under-states** a dead prover, which is the expensive
+direction for a funder: the real harm is not a pause but that peers who stopped mirroring keep being
+paid while peers who started cannot begin. A contradiction that is quietly fixed regenerates in the
+next consumer; one that is recorded does not. §15.4 carries the amendment row.
+
+The warning MUST NOT be reducible to "requires consistent uptime", nor to any paraphrase that makes
+payment conditional on this node — the withdrawn clause-1 wording above is one, and a stronger one.
+Such phrasing invites the reader to conclude that downtime merely pauses payment, which is the false
+half of §2.1.
 
 ### 2.3 The status surface
 
@@ -390,22 +412,36 @@ a dead prover.
 
 ### 2.6 The RPC surface
 
-Three methods, added to `modules/crates/00-foundation/dig-rpc-protocol/src/method.rs` (the enum,
-`name()`, `tier()`, and the OpenRPC description), all at **`Tier::Control`**:
+Four methods in `modules/crates/00-foundation/dig-rpc-protocol/src/method.rs` (the enum, `name()`,
+`tier()`, the OpenRPC description, and `ALL`), all at **`Tier::Control`**:
 
 | method | answers |
 |---|---|
 | `dig.listRewardDistributors` | the distributors this node funds, and the distributors this node has a claim to as a mirror |
 | `dig.getRewardProverStatus` | the §2.3 record, for one distributor or all |
 | `dig.getRewardDistributor` | the chain-derived state of one distributor by launcher id: constants, reserve, entry count, current distributor epoch, last entry-write time |
+| `dig.listRewardDistributorCommitments` | the funder's clawback commitment slots for one distributor, **one row per epoch**, each row carrying the amount actually recoverable — the only wire that can satisfy §7.4 clause 5 |
+
+All four are **shipped** in `dig-rpc-protocol` **v0.11.0**; line citations in this subsection are to
+that version. The enumeration test
+`reward_distributor_methods_present_control_and_not_peer_reachable`
+(`src/method.rs:518-539`) asserts that all four are present, resolve by name, appear in `ALL`, are
+`Tier::Control`, and are never peer-reachable. A method added to this section later MUST be added
+to that test in the same change: an enumeration test only covers the enumeration it lists, so a
+fifth method left out of it is unguarded while the test still passes.
 
 `Tier::Control` is loopback / in-process only
-(`modules/crates/00-foundation/dig-rpc-protocol/src/tier.rs:29-36`). All three are Control in the MVP
+(`modules/crates/00-foundation/dig-rpc-protocol/src/tier.rs:29-36`). All four are Control in the MVP
 because the prover surface reveals which stores the operator funds and which peers it is currently
-evaluating, which is the operator's business and not a peer's. `dig.getRewardDistributor` returns
-nothing but public chain data and MAY be promoted to `PublicRead` or peer-reachable later — but that
-promotion is a deliberate security decision taken at the allowlist, in the terms `method.rs`'s own
-`is_peer_reachable` documentation sets, and MUST NOT be done as a convenience.
+evaluating, which is the operator's business and not a peer's — and
+`dig.listRewardDistributorCommitments` is the strongest of the four in that respect, because it
+reveals the funder's forward funding schedule epoch by epoch together with the puzzle hash entitled
+to claw it back. `dig.getRewardDistributor` returns nothing but public chain data and MAY be
+promoted to `PublicRead` or peer-reachable later — but that promotion is a deliberate security
+decision taken at the allowlist, in the terms `method.rs`'s own `is_peer_reachable` documentation
+sets, and MUST NOT be done as a convenience. `dig.listRewardDistributorCommitments` MUST NOT be
+promoted with it: a commitment schedule is a forward statement about the funder's money and it has
+no peer-facing use.
 
 **Control is the correct default because the two directions are not symmetric.** Promoting a method
 later is **additive** — no existing caller breaks. Demoting one is **breaking**, and it breaks exactly
@@ -413,6 +449,86 @@ the anonymous callers nobody can enumerate or notify. So an entry set and a payo
 operator data until someone argues otherwise on the record, and the cost of having been too strict is
 one additive change while the cost of having been too loose is a withdrawal of access that is already
 being relied on.
+
+**`dig.listRewardDistributorCommitments` — the wire §7.4 clause 5 requires, field for field.** §7.4
+clause 5 requires the funder's commitments be presented **per epoch** with the recoverable amount
+computed **per slot**, and calls a single aggregate balance figure the money-honesty failure of that
+section; §7.4 clause 3 makes the clawback destination the parsed on-chain `clawback_ph` and nothing
+else. Neither clause could be fed before v0.11.0: this section defined three methods, and the §2.3
+status record carries no per-slot commitment field at all. The shipped shape is therefore normative
+here rather than merely available:
+
+- **Params** — `ListRewardDistributorCommitmentsParams { launcher_id }` (`src/types.rs:1681-1684`).
+  One distributor per call; `launcher_id` is required, and there is no "all distributors" form.
+- **Element** — `RewardDistributorCommitment { epoch_start: u64, clawback_puzzle_hash: HexId,
+  rewards_base_units: u64, recoverable_base_units: u64 }` (`src/types.rs:1714-1733`).
+- **Result** — `ListRewardDistributorCommitmentsResult { launcher_id, withdrawal_share_bps,
+  epoch_seconds, commitments, observed_at }` (`src/types.rs:1741-1765`), where `commitments` is a
+  `Vec<RewardDistributorCommitment>`. It is **five fields, not one**: the two echoed constants are
+  clause 2 below, and `observed_at` is §2.4 clause 3's rule — a figure with no timestamp is a claim
+  about the past presented as the present.
+
+1. **`recoverable_base_units` is NOT `rewards_base_units`, and the responder owns the computation.**
+   Committed is not recoverable: §7.4 clause 4 and §7.5 return only `withdrawal_share_bps / 10000`
+   of a committed value, forfeiting the remainder to the reserve. So the **responder** MUST compute
+   `recoverable_base_units` itself, as `rewards_base_units * withdrawal_share_bps / 10_000`, with
+   integer arithmetic **in that order** — multiply, then divide — truncated down and never rounded
+   up, because rounding up promises money the chain will not return. A responder MUST NOT return
+   `rewards_base_units` alone and leave a caller to label it recoverable: that overstates every
+   clawback by the forfeit fraction, 10% at the §7.5 default, which is §7.4 clause 5's money-honesty
+   failure moved from a single total into a single per-slot figure. The type does not enforce this —
+   `recoverable_base_units` is a bare `pub u64` with no constructor and no validation
+   (`src/types.rs:1709-1711`) — so the obligation is this clause's, and the conformance test belongs
+   on the responder, not on the wire type.
+2. **The share applied MUST be the echoed one, never a compiled-in constant.**
+   `withdrawal_share_bps` is curried at launch per distributor and is immutable (§7.5, §0.5), so it
+   differs across distributors; the result echoes it so a caller's row arithmetic is auditable
+   against the value that actually governs it (`src/types.rs:1744-1751`). A responder MUST use the
+   echoed value for every row and MUST NOT emit a value above `10_000`. `epoch_seconds` is echoed
+   for the same reason (`src/types.rs:1752-1758`): a caller derives an epoch's end as `epoch_start +
+   epoch_seconds` without a second `dig.getRewardDistributor` call, and MUST NOT hardcode `604_800`
+   — §8.1's value is a per-distributor default, not a property of the mechanism.
+3. **`clawback_ph` and `clawback_puzzle_hash` are ONE value under two names.** The chain field is
+   `clawback_ph: Bytes32` on `RewardDistributorCommitmentSlotValue`
+   (`chia-sdk-types-0.36.0/.../slot_values.rs:422`, inside the struct at :420-425 that §7.4 cites);
+   the wire field is `clawback_puzzle_hash: HexId` (`src/types.rs:1720`). They are the same 32 bytes
+   under a longer name, hex-encoded for a JSON reader. A reader MUST NOT conclude that these are two
+   values, that one is a hash of the other, or that either is a display label. A responder MUST
+   populate it from the parsed slot value and from nothing else (§7.4 clause 3) — not an operator
+   role, not the manager singleton, not the launcher. This is §0.2's discipline applied to an
+   identifier rather than a unit: named once, never silently converted — and a rename across a
+   boundary is the case where a reader most easily concludes there were two.
+4. **`recoverable_base_units` is share arithmetic, not an eligibility claim.** It states what
+   fraction of the slot would return if it were clawed back, never that the caller may claw it back
+   (`src/types.rs:1728-1731`). Entitlement is key-holding against `clawback_puzzle_hash` and nothing
+   else (§7.4 clause 3). A surface that renders the figure as a claimable balance for whoever is
+   looking has invented an entitlement the chain will refuse; §0.4's discipline holds here, in that
+   the figure bounds what the slot would return and says nothing about who may take it.
+5. **An empty `commitments` list is legitimate and MUST NOT render as an error or as a failure to
+   read.** A distributor funded only through `AddIncentives` has no clawback-eligible slot at all —
+   an irrevocable donation, §7.4's first bullet (`src/types.rs:1759-1762`). The surface MUST
+   distinguish "nothing is recoverable, because nothing was committed" from "the commitments could
+   not be read", which is §2.4 clause 2's rule against a reassuring zero in its clawback form.
+6. **Units, named once.** `rewards_base_units` and `recoverable_base_units` are **DIG CAT base
+   units** as integers — `1 $DIG = 1_000 base units` (§0.2) — never XCH mojos, and never a rendered
+   `1.000 $DIG` handed back into an API. `withdrawal_share_bps` is **basis points out of 10_000**,
+   never converted to a percentage, a ratio or a float (§0.2); the `/ 10_000` in clause 1 is the
+   puzzle's own share arithmetic reproduced in integers, not a unit conversion. `epoch_start` and
+   `epoch_seconds` are Unix seconds, and both name the **distributor** epoch (§0.3's first clock),
+   never the mirror-collateral epoch and never `dig-epoch`'s. Both carry their upstream chain names
+   verbatim — `RewardDistributorCommitmentSlotValue::epoch_start` and
+   `RewardDistributorConstants::epoch_seconds` — so that each wire field is traceable to its chain
+   field as in clause 3; §0.3 clause 3's ban is on an **unqualified** `epoch`, and a wire field
+   named `epoch` alone would still be a defect.
+
+**The inconsistency this closed, recorded rather than applied silently.** Until v0.11.0 this
+section specified three methods while §7.4 clause 5 ordered a per-epoch, per-slot clawback
+presentation and §7.4 clause 3 ordered a destination taken from the chain — and no method returned
+a commitment slot, nor could §2.3's record carry one. A consumer reading §7.4 clause 5 in isolation
+therefore had two ways to comply, both wrong: aggregate the reserve into the single balance figure
+that clause calls its money-honesty failure, or divide `rewards_base_units` in the client and label
+the result recoverable, which is the same overstatement per row. The gap was in §2.6, and the fix
+is here. §15.4 carries the amendment row.
 
 A mirror MUST NOT depend on any of these to decide whether a distributor is worth chasing: an
 operator's self-report about its own liveness is worthless to a counterparty. §12.4 specifies the
@@ -1547,7 +1663,7 @@ clause quietly deleted to make the MVP look complete, are both the failure this 
 | section | MVP | note |
 |---|---|---|
 | §1 Local-holding precondition | **ships** | including §1.4 `LocalCopyMissing` and the §1.5 root-advance refusal |
-| §2 Liveness honesty | **ships** | not polish. §2.2's warning and §2.3-§2.6's surface are money-honesty clauses and are **not deferrable** |
+| §2 Liveness honesty | **ships** | not polish. §2.2's warning and §2.3-§2.6's surface are money-honesty clauses and are **not deferrable**. §2.6's four methods are **shipped** in `dig-rpc-protocol` v0.11.0; what remains is the responder, which ships with the prover (#3250) |
 | §3 Challenge soundness | **ships** | full sampling, deadlines, strike rule |
 | §4 Mirror-coin gate | **ships** | via the §4.2 pointer path. The hint-scan / census fallback for a mirror that publishes no pointer is **specified, deferred — #3258**; until it lands, a mirror that does not announce with collateral cannot be paid (§14.1) |
 | §5 Self-exclusion | **ships** | both coordinates, every path, with the §5.3 clause-4 control test |
@@ -1561,7 +1677,7 @@ clause quietly deleted to make the MVP look complete, are both the failure this 
 | §13.1 On-chain discovery | **ships** | |
 | §13.2 Off-chain discovery | **specified, deferred** | **#3252**. Safe to defer only because §13.2 clause 2 holds |
 | §13.3 `Refresh` | **specified, not used** | inapplicable in `Managed` mode; nothing to defer |
-| metrics presentation beyond the §2.3 counters | **specified, deferred** | **#3253** ships create-with-warning, refill, clawback and prover health; per-epoch payout history and charting follow |
+| metrics presentation beyond the §2.3 counters | **specified, deferred** | **#3253** ships create-with-warning, refill, clawback (per epoch, fed by §2.6's `dig.listRewardDistributorCommitments`) and prover health; per-epoch payout history and charting follow |
 
 Driver action coverage for the MVP (#3249): `launch_reward_distributor`, `AddIncentives`,
 `CommitIncentives`, `WithdrawIncentives`, `AddEntry`, `RemoveEntry`, `NewEpoch`, `Sync`,
@@ -1682,7 +1798,11 @@ An implementation conforms when all of the following hold.
   mirror-facing net rate, §7.3a clause 3, §7.4 clause 5, §14.1 clause 2, and §15 clause 3a's three
   launch-time choices.
 - **Docs (#3254):** §2.2, §14.1 clause 1.
-- **`dig-rpc-protocol`:** the three §2.6 methods.
+- **`dig-rpc-protocol`:** the **four** §2.6 methods and their param/result types — **shipped** at
+  **v0.11.0**, so this is the one bullet in this list that is no longer future work (§15.2). The
+  crate owns the wire only: computing each row's `recoverable_base_units` in the order §2.6
+  clause 1 fixes is the **responder's** — the `dig-node` prover's (#3250, which owns §2 above) —
+  and rendering the rows per epoch is #3253's under §7.4 clause 5.
 
 ### 15.2 Status of this document
 
@@ -1691,6 +1811,13 @@ Every clause above is **specified, not yet implemented**: at the time of writing
 (DIG-Network/dig_ecosystem#3247). Every `file:line` citation in this document is to the **pinned
 upstream SDK** (`chia-sdk-driver-0.36.0`, `chia-sdk-types-0.36.0`) or to an **existing sibling crate**
 in `dig_ecosystem`, measured on 2026-09-08. No citation is to code this specification introduces.
+
+**One exception, as of v0.11.0.** §2.6's four methods and their param/result types are no longer
+"specified, not yet implemented": they shipped in `dig-rpc-protocol` v0.11.0, and §2.6's citations
+are to that released version rather than to the pinned SDK. What is not implemented there is the
+**responder** — the code that fills the types and computes `recoverable_base_units` — which is
+#3250's. Every other clause here remains unimplemented, and `main` of `dig-rewards-coin` still
+holds only the bootstrap and the scaffold.
 
 **Citation discipline, after one failure.** A first revision cited a doc comment's illustrative ratio
 as if it defined a constant (§0.3), and it was propping up an immutable curried value. Two rules
@@ -1741,6 +1868,12 @@ a later reader can tell a decision from an open item.
 | C9 | Sybil resistance rests on one unstated inequality, in a constant this epic does not own | **partly fixed, partly amendment.** §6.2.1 names the inequality, its owner, the absence of a second defence, and requires the funder-facing count be labelled **identities**. **Open:** monitoring whether it still holds — an ecosystem question, not enforceable here |
 | gap A | `active_shares == 0` unmeasured, and **every** distributor passes through it at launch | **fixed as a required test** — §15 clause 9a mandates the simulator case and states what it must assert. Must land before any distributor is launched |
 | gap B | `PROVER_CYCLE_PERIOD_SECONDS` was never defined, yet §3.6 derived a time-to-eviction from it | **fixed** — §2.5 defines it at 3_600 and derives both dependent quantities from it; §12.4 also reallocated to the claim loop (§15.1) |
+| A1 | **§2.2 clause 1 contradicted §2.1 and its own clause 3** — "Rewards are distributed only while **this node's** prover runs" is the false half of §2's opening sentence restated as an instruction, and a stronger form of the phrasing §2.2's closing paragraph bans | **fixed** — clause 1 now states that the prover governs *who* is paid, not *whether* anyone is paid, with the withdrawn wording recorded in place; the closing ban widened to any paraphrase making payment conditional on this node; the lead-in count corrected to "all five". Clauses 2-5 unchanged; no constant, default or driver shape changed |
+| A2 | **§2.6 defined three methods, so §7.4 clauses 3 and 5 could not be fed** — clause 5 orders a per-epoch, per-slot clawback presentation and clause 3 orders a destination parsed from the chain's `clawback_ph`, while no §2.6 method returned a commitment slot and §2.3's record carries no slot field | **fixed** — §2.6 gains `dig.listRewardDistributorCommitments` at `Tier::Control`, matching the shipped `dig-rpc-protocol` **v0.11.0** wire field for field, with six normative clauses: the **responder** MUST compute `recoverable_base_units` as `rewards_base_units * withdrawal_share_bps / 10_000` in integer arithmetic in that order, truncated; the echoed `withdrawal_share_bps` and `epoch_seconds` MUST be used rather than compiled-in constants; the chain's `clawback_ph` and the wire's `clawback_puzzle_hash` are stated to be one value; the figure is share arithmetic, never entitlement; an empty list is legitimate. §15.1's `dig-rpc-protocol` line corrected from "the three §2.6 methods"; §14's §2 row and metrics row record the shipped wire; §15.2 records the one implemented exception. No constant, default or driver shape changed |
+
+Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
+reason the gate conditions are: a reader must be able to tell a decision from a correction, and a
+silently fixed contradiction regenerates in the next consumer that reads the clause in isolation.
 
 Two items are genuine **product policy** rather than engineering, are recorded with the position this
 document takes, and remain the user's to reverse:
