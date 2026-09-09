@@ -21,7 +21,7 @@ use chia_sdk_driver::{
 };
 use chia_sdk_types::puzzles::RewardDistributorRewardSlotValue;
 
-use crate::{comment::LaunchComment, constants::DistributorLaunchTerms, RewardsError};
+use crate::{comment::LaunchComment, RewardsError};
 
 /// Everything the launch produced, named rather than positional.
 ///
@@ -56,22 +56,32 @@ pub struct LaunchedDistributor {
 /// caller can forget. `now_unix_seconds` is the caller's current time, used only for the
 /// past-`first_epoch_start` refusal — this crate reads no clock of its own.
 ///
+/// `first_epoch_start` is passed on its own rather than as a whole
+/// [`DistributorLaunchTerms`](crate::constants::DistributorLaunchTerms) for
+/// the same reason. The other two launch-time-only choices — the manager singleton and
+/// `distributor_epoch_seconds` — are already curried into `constants` by
+/// [`dig_distributor_constants`](crate::constants::dig_distributor_constants), and `constants` is
+/// what the launch spend reads. A `terms` argument beside it carried a second copy of both that
+/// the spend silently ignored, so a caller could hand in terms that disagreed with the constants
+/// and get a distributor matching the constants. `first_epoch_start` is the one launch-time value
+/// `constants` does not hold, so it is the one value left to pass.
+///
 /// # Errors
 ///
-/// - [`RewardsError::InvalidLaunchTerms`] if `terms.first_epoch_start` is not strictly in the
+/// - [`RewardsError::InvalidLaunchTerms`] if `first_epoch_start` is not strictly in the
 ///   future. A distributor whose first epoch has already begun cannot have that epoch started, so
 ///   its reserve accrues to nobody.
 /// - [`RewardsError::Driver`] if the upstream launch spend could not be built.
 pub fn launch_dig_distributor(
     ctx: &mut SpendContext,
     offer: &Offer,
-    terms: DistributorLaunchTerms,
+    first_epoch_start: u64,
     constants: RewardDistributorConstants,
     consensus_constants: &ConsensusConstants,
     generation: LaunchComment,
     now_unix_seconds: u64,
 ) -> Result<LaunchedDistributor, RewardsError> {
-    require_future_first_epoch_start(terms.first_epoch_start, now_unix_seconds)?;
+    require_future_first_epoch_start(first_epoch_start, now_unix_seconds)?;
 
     let (
         signature,
@@ -82,7 +92,7 @@ pub fn launch_dig_distributor(
     ) = launch_reward_distributor(
         ctx,
         offer,
-        terms.first_epoch_start,
+        first_epoch_start,
         funder_refund_puzzle_hash(constants),
         constants,
         consensus_constants,

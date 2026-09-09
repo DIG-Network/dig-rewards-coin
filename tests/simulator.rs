@@ -337,16 +337,10 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         funder.puzzle_hash,
         source_cat.info.asset_id,
     );
-    let terms = DistributorLaunchTerms {
-        manager_singleton_launcher_id: manager.launcher_id,
-        distributor_epoch_seconds: TEST_EPOCH_SECONDS,
-        first_epoch_start: FIRST_EPOCH_START,
-    };
-
     let launched = launch_dig_distributor(
         ctx,
         &offer,
-        terms,
+        FIRST_EPOCH_START,
         constants,
         &TESTNET11_CONSTANTS,
         LaunchComment::new(Bytes32::new([0xaa; 32]), Bytes32::new([0xbb; 32])),
@@ -368,6 +362,21 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
     assert_eq!(
         launched.refund_cat.info.p2_puzzle_hash,
         constants.fee_payout_puzzle_hash
+    );
+
+    // The launch curries the constants table and nothing else: the manager singleton and
+    // `epoch_seconds` on the launched distributor come from `constants`, which is the single place
+    // a caller can set them. There is no second copy for them to disagree with.
+    assert_eq!(
+        launched.distributor.info.constants.reward_distributor_type,
+        RewardDistributorType::Managed {
+            manager_singleton_launcher_id: manager.launcher_id,
+        },
+        "the manager singleton is curried from the constants table"
+    );
+    assert_eq!(
+        launched.distributor.info.constants.epoch_seconds, TEST_EPOCH_SECONDS,
+        "epoch_seconds is curried from the constants table"
     );
 
     Ok(Harness {
