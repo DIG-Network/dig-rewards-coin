@@ -58,6 +58,10 @@ thiserror = "2.0.20"
 
 [dev-dependencies]
 anyhow = "1.0.100"
+# `testing` gates `MockChainSource` -- an in-memory `ChainSource` the tests assemble from real
+# simulator coin records/spends, so `read_distributor` (#3267) is exercised through its real
+# trait boundary rather than a bespoke test-only shortcut.
+dig-chainsource-interface = { version = "0.3.3", features = ["testing"] }
 # Cohort crates only the TESTS name. `chia-puzzles`, `clvm-traits`, `clvm-utils` and `clvmr` are all
 # reached transitively by the library through `chia-consensus`/`chia-sdk-driver`, so declaring them
 # under `[dependencies]` added no capability — it only pinned four extra versions, immutably, in

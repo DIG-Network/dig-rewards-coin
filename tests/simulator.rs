@@ -49,7 +49,9 @@ use dig_rewards_coin::epoch::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
-use dig_rewards_coin::{DistributorSlots, DistributorSnapshot, RewardsError};
+use dig_rewards_coin::{
+    read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot, RewardsError,
+};
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
 /// so a mainnet-shaped timestamp would mean passing decades of simulated time.
@@ -599,9 +601,10 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
 
     assert_eq!(harness.distributor.info.state.active_shares, ENTRY_SHARES);
 
-    // The state shape 0.2.0 does publish, exercised on a real distributor. `read_distributor` is
-    // withheld pending #3267, so a caller assembles the snapshot from what it already holds —
-    // which is exactly what this does, and the accessors have to work under that use.
+    // These accessors are exercised directly against an assembled snapshot here (rather than one
+    // read_distributor (#3267) produced) precisely because they must work no matter how the
+    // snapshot was built -- `observed` is a synthetic-but-well-formed value since nothing in this
+    // test is about chain provenance.
     let snapshot = DistributorSnapshot {
         distributor: harness.distributor.clone(),
         slots: DistributorSlots {
@@ -618,6 +621,12 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
                 },
                 harness.first_epoch_slot.info.value,
             ],
+        },
+        observed: ChainObservation {
+            peak_height: 1,
+            peak_timestamp: FIRST_EPOCH_START,
+            tip_coin_id: harness.distributor.coin.coin_id(),
+            last_entry_write_unix: None,
         },
     };
 
@@ -1382,4 +1391,274 @@ fn merge_reward_slots(
 
     merged.extend(created);
     merged
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// `read_distributor` (#3267) -- rebuilding a snapshot from the chain alone.
+//
+// `MockChainSource` (dig-chainsource-interface, `testing` feature) is loaded from real simulator
+// coin records/spends rather than hand-built fixtures, so these tests exercise the actual trait
+// boundary `read_distributor` reads through, not a shortcut that only looks like it.
+// ---------------------------------------------------------------------------------------------
+
+/// Loads `sim`'s own records for every id in `singleton_members` and `extra_coin_ids` into a
+/// fresh `dig_chainsource_interface::MockChainSource`, plus the singleton's lineage and the
+/// current peak/timestamp -- everything `read_distributor` needs to answer for `launcher_id`.
+fn mock_chain_source(
+    sim: &Simulator,
+    launcher_id: Bytes32,
+    singleton_members: &[Bytes32],
+    extra_coin_ids: &[Bytes32],
+) -> dig_chainsource_interface::MockChainSource {
+    let tip = *singleton_members
+        .last()
+        .expect("a singleton chain always has at least the launcher");
+
+    let mut source = dig_chainsource_interface::MockChainSource::new();
+
+    for &id in singleton_members.iter().chain(extra_coin_ids) {
+        if let Some(state) = sim.coin_state(id) {
+            source = source.with_coin(
+                id,
+                dig_chainsource_interface::CoinRecord::from_coin_state(state),
+            );
+        }
+        if let Some(spend) = sim.coin_spend(id) {
+            source = source.with_spend(id, spend);
+        }
+    }
+
+    source = source.with_lineage(
+        launcher_id,
+        dig_chainsource_interface::SingletonLineage::new(tip, singleton_members.iter().copied()),
+    );
+
+    let peak = sim.height();
+    // Synthetic but monotonic: nothing here asserts these equal any real chain clock, only that
+    // every height read_distributor asks about resolves to SOME timestamp.
+    for height in 0..=peak {
+        source = source.with_timestamp(height, u64::from(height) * 1_000 + 1);
+    }
+    source.with_peak(peak)
+}
+
+#[test]
+fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        COMMITTED_BASE_UNITS,
+    )?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    let entry_slot_value = harness.distributor.pending_spend.created_entry_slots[0];
+    let entry_slot = harness
+        .distributor
+        .created_slot_value_to_slot(entry_slot_value, RewardDistributorSlotNonce::ENTRY);
+
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let first_reward_slot = reward_slots
+        .iter()
+        .find(|slot| slot.info.value.epoch_start == FIRST_EPOCH_START)
+        .expect("a reward slot for the first epoch")
+        .clone();
+    let roll = start_next_distributor_epoch(ctx, &mut harness.distributor, first_reward_slot)?;
+    ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let sync_time = FIRST_EPOCH_START + TEST_EPOCH_SECONDS / 2;
+    harness.sim.set_next_timestamp(sync_time)?;
+    let sync_conditions = sync_distributor(ctx, &mut harness.distributor, sync_time)?;
+    ensure_conditions_met(ctx, &mut harness.sim, sync_conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let source = StubSlotSource(entry_slot.clone());
+    let PayoutOutcome::Paid { conditions, .. } = initiate_payout(
+        ctx,
+        &mut harness.distributor,
+        &source,
+        harness.entry.puzzle_hash,
+    )?
+    else {
+        panic!("the entry is in the set, so the claim must build");
+    };
+    ensure_conditions_met(ctx, &mut harness.sim, conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    );
+
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "the rebuilt reserve balance must match what was actually driven"
+    );
+    assert_eq!(
+        snapshot.payout_puzzle_hashes(),
+        vec![harness.entry.puzzle_hash],
+        "the entry set rebuilt from the chain must match the one entry actually added"
+    );
+    assert_eq!(
+        snapshot.observed.tip_coin_id,
+        harness.distributor.coin.coin_id(),
+        "the observed tip must be the real tip"
+    );
+    let zero_lineage_proof = chia_puzzle_types::LineageProof {
+        parent_parent_coin_info: Bytes32::default(),
+        parent_inner_puzzle_hash: Bytes32::default(),
+        parent_amount: 0,
+    };
+    assert_ne!(
+        snapshot.distributor.reserve.child_lineage_proof(),
+        zero_lineage_proof,
+        "REVERT-PROOF: from_parent_spend fabricates an all-zero LineageProof for the reserve; a genuine read must never produce one"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_from_before_a_write_is_not_current() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    let entry_slot_value = harness.distributor.pending_spend.created_entry_slots[0];
+    let entry_slot = harness
+        .distributor
+        .created_slot_value_to_slot(entry_slot_value, RewardDistributorSlotNonce::ENTRY);
+
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    let chain_s1 = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    );
+    let s1 = read_distributor(&chain_s1, launcher_id)?.expect("launched");
+
+    let now = harness.distributor.info.state.round_time_info.last_update;
+    let removal = remove_entry(ctx, &mut harness.distributor, authority, entry_slot, now)?;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, removal.write.sync_conditions)?;
+    let (_, _) = spend_manager_singleton(ctx, &harness.manager, removal.write.manager_conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    let chain_s2 = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    );
+    let s2 = read_distributor(&chain_s2, launcher_id)?.expect("still launched");
+
+    assert_ne!(
+        s1.observed.tip_coin_id, s2.observed.tip_coin_id,
+        "a write must move the observed tip -- this is what is_current relies on"
+    );
+    assert!(
+        !s1.is_current(&chain_s2)?,
+        "S1 was read before the removal; against the post-removal chain it must be stale"
+    );
+    assert!(
+        s2.is_current(&chain_s2)?,
+        "S2 was read after the removal; against the same chain it must still be current"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// `read_distributor` error paths, over a bare `MockChainSource` -- no simulator, since these
+// are about what `read_distributor` does with an incomplete or hostile answer, not about
+// puzzle behaviour.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn zero_launcher_id_is_refused_before_any_chain_read() {
+    let chain = dig_chainsource_interface::MockChainSource::new();
+    let result = read_distributor(&chain, Bytes32::default());
+    assert!(
+        matches!(result, Err(RewardsError::Malformed(_))),
+        "the zero hash is never a real launcher id, and this must be caught before any read"
+    );
+}
+
+#[test]
+fn an_unspent_launcher_reads_as_never_launched() {
+    let chain = dig_chainsource_interface::MockChainSource::new();
+    let launcher_id = Bytes32::new([0x42; 32]);
+    let result = read_distributor(&chain, launcher_id);
+    assert!(
+        result.unwrap().is_none(),
+        "no coin record for the launcher id -- Ok(None) is the ONLY case this reserves"
+    );
 }
