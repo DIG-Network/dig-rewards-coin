@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "dig-rewards-coin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol",
