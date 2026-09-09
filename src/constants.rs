@@ -17,7 +17,7 @@
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{RewardDistributorConstants, RewardDistributorType};
-use dig_constants::DIG_ASSET_ID;
+use dig_constants::{DIG_ASSET_ID, DIG_TREASURY_INNER_PUZZLE_HASH};
 
 use crate::RewardsError;
 
@@ -109,8 +109,9 @@ pub struct DistributorLaunchTerms {
 ///
 /// # Errors
 ///
-/// [`RewardsError::InvalidLaunchTerms`] if `funder_refund_puzzle_hash` is the zero hash or
-/// `distributor_epoch_seconds` is zero.
+/// [`RewardsError::InvalidLaunchTerms`] if `funder_refund_puzzle_hash` is the zero hash or the DIG
+/// treasury (§7.3 clause 3), if `terms.manager_singleton_launcher_id` is the zero hash, or if
+/// `terms.distributor_epoch_seconds` is zero.
 pub fn dig_distributor_constants(
     terms: DistributorLaunchTerms,
     funder_refund_puzzle_hash: Bytes32,
@@ -128,8 +129,9 @@ pub fn dig_distributor_constants(
 ///
 /// # Errors
 ///
-/// [`RewardsError::InvalidLaunchTerms`] if `funder_refund_puzzle_hash` is the zero hash, if
-/// `fee_bps` is zero (use [`dig_distributor_constants`]), or if `fee_bps` is not below `10_000`.
+/// [`RewardsError::InvalidLaunchTerms`] if `fee_bps` is zero (use
+/// [`dig_distributor_constants`]), if `fee_bps` is not below `10_000`, or for any reason
+/// [`dig_distributor_constants`] itself refuses the terms.
 pub fn dig_distributor_constants_with_funder_self_skim(
     terms: DistributorLaunchTerms,
     funder_refund_puzzle_hash: Bytes32,
@@ -172,6 +174,32 @@ fn dig_constants_with_fee(
     if funder_refund_puzzle_hash == Bytes32::default() {
         return Err(RewardsError::InvalidLaunchTerms(
             "funder refund puzzle hash must not be the zero hash".to_string(),
+        ));
+    }
+
+    // §7.3 clause 3: the fee payout hash MUST NOT be the DIG treasury. Refusing the treasury as a
+    // *destination* is the opposite of §7.3a's prohibition on hard-coding it as the recipient — a
+    // non-zero epoch fee is a funder self-skim (§7.3 clause 4), and paying it to the treasury would
+    // dress that skim up as an ecosystem fee. The constant is read from `dig-constants`, so no
+    // policy value is restated here.
+    if funder_refund_puzzle_hash == DIG_TREASURY_INNER_PUZZLE_HASH {
+        return Err(RewardsError::InvalidLaunchTerms(
+            "fee_payout_puzzle_hash must not be the DIG treasury (SPEC.md §7.3 clause 3): the \
+             epoch fee is a funder self-skim, not an ecosystem fee"
+                .to_string(),
+        ));
+    }
+
+    // §7.2 clause 3: the manager singleton launcher id is curried into the action puzzles and is
+    // immutable for the distributor's whole life. A zero id names no singleton, so no spend can
+    // ever satisfy the entry-set write authority — the set is PERMANENTLY unwritable, which the
+    // SPEC calls the worst irreversible outcome in the design. It is refused here because it cannot
+    // be refused anywhere later.
+    if terms.manager_singleton_launcher_id == Bytes32::default() {
+        return Err(RewardsError::InvalidLaunchTerms(
+            "manager_singleton_launcher_id must not be the zero hash: it is curried in at launch \
+             and a zero id freezes the entry set for the distributor's life"
+                .to_string(),
         ));
     }
 
@@ -271,6 +299,45 @@ mod tests {
     fn a_zero_refund_hash_is_refused() {
         let err = dig_distributor_constants(terms(), Bytes32::default()).unwrap_err();
         assert!(matches!(err, RewardsError::InvalidLaunchTerms(_)));
+    }
+
+    #[test]
+    fn a_zero_manager_singleton_launcher_id_is_refused() {
+        // The launcher id is curried into the action puzzles at launch, so a zero one freezes the
+        // entry set for the distributor's whole life (SPEC.md §7.2 clause 3). Nothing downstream
+        // can refuse it, which is why it is refused here.
+        let mut terms = terms();
+        terms.manager_singleton_launcher_id = Bytes32::default();
+
+        let err = dig_distributor_constants(terms, refund_hash()).unwrap_err();
+        assert!(matches!(err, RewardsError::InvalidLaunchTerms(_)));
+
+        // The self-skim constructor shares the one construction path, so it refuses it too.
+        assert!(
+            dig_distributor_constants_with_funder_self_skim(terms, refund_hash(), 250).is_err()
+        );
+    }
+
+    #[test]
+    fn the_dig_treasury_is_refused_as_the_fee_payout_hash() {
+        // SPEC.md §7.3 clause 3. The epoch fee is a funder self-skim (§7.3 clause 4), so sending it
+        // to the treasury would present it as an ecosystem fee. This is the opposite of §7.3a,
+        // which forbids hard-coding the treasury as the RECIPIENT.
+        let err = dig_distributor_constants(terms(), DIG_TREASURY_INNER_PUZZLE_HASH).unwrap_err();
+        assert!(matches!(err, RewardsError::InvalidLaunchTerms(_)));
+
+        assert!(
+            dig_distributor_constants_with_funder_self_skim(
+                terms(),
+                DIG_TREASURY_INNER_PUZZLE_HASH,
+                250
+            )
+            .is_err(),
+            "the fee-bearing path is the one that would actually pay the treasury"
+        );
+
+        // And the refusal is about the treasury specifically, not about non-funder hashes at large.
+        assert!(dig_distributor_constants(terms(), Bytes32::new([9; 32])).is_ok());
     }
 
     #[test]
