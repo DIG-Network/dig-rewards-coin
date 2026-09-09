@@ -65,6 +65,16 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   of truth for where the change CAT goes is a money bug waiting on a mismatch. The constants
   builder's existing zero-hash refusal now covers both uses at once, since there is only one field.
 
+- Only the crates the library compiles against are `[dependencies]`. `chia-puzzles`,
+  `clvm-traits`, `clvm-utils` and `clvmr` are named solely by the tests and moved to
+  `[dev-dependencies]`; the library reaches all four transitively through
+  `chia-consensus`/`chia-sdk-driver`, so nothing is lost. `dig-chainsource-interface` is dropped
+  outright: it had zero uses anywhere once `read_distributor` was withheld, and it returns purely
+  additively with [#3267](https://github.com/DIG-Network/dig_ecosystem/issues/3267). A crates.io
+  version is immutable, so each of those five lines would have been a permanent phantom pin on
+  every consumer of 0.2.0. No version moved — SPEC.md §0.5 pins the 0.36 cohort and a hash-moving
+  bump is a wire-breaking event for an already-launched distributor.
+
 ### Fixed
 - `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps` were already failing before
   this change: `launch_dig_distributor` tripped `too_many_arguments` at 8/7 (dropping the redundant

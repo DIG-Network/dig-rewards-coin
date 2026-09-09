@@ -811,16 +811,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dig-chainsource-interface"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6557b694429aa9a27ccf6a079853471826f17b9e71ff167711132fa51907b9d"
-dependencies = [
- "chia-protocol",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "dig-constants"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -847,7 +837,6 @@ dependencies = [
  "clvm-traits 0.36.1",
  "clvm-utils",
  "clvmr",
- "dig-chainsource-interface",
  "dig-constants",
  "hex",
  "thiserror 2.0.20",

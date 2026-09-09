@@ -24,8 +24,12 @@ categories = ["cryptography::cryptocurrencies"]
 # `cargo package --list` is the only thing that proves this exclusion still bites.
 exclude = [".claude", "AGENTS.md", "CLAUDE.md"]
 
+# A crates.io version is IMMUTABLE, so every line below is a permanent pin on every consumer of
+# 0.2.0. A crate the library does not compile against does not belong here: it constrains a
+# consumer's resolver for nothing. `dig-chainsource-interface` is absent for that reason — its only
+# consumer was the withheld `read_distributor`, so 0.2.0 has zero uses of it. It returns, purely
+# additively, when #3267 lands.
 [dependencies]
-dig-chainsource-interface = "0.3.3"
 dig-constants = "0.13.1"
 
 # The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
@@ -38,18 +42,23 @@ chia-bls = "0.36.1"
 chia-consensus = "0.36.1"
 chia-protocol = "0.36.1"
 chia-puzzle-types = "0.36.1"
-chia-puzzles = "0.20.3"
 # `action-layer` is what exposes the reward distributor at all; without it the crate cannot see it.
 chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
 chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
-clvm-traits = "0.36.1"
-clvm-utils = "0.36.1"
-clvmr = "0.16.2"
 hex = "0.4.3"
 thiserror = "2.0.20"
 
 [dev-dependencies]
 anyhow = "1.0.100"
+# Cohort crates only the TESTS name. `chia-puzzles`, `clvm-traits`, `clvm-utils` and `clvmr` are all
+# reached transitively by the library through `chia-consensus`/`chia-sdk-driver`, so declaring them
+# under `[dependencies]` added no capability — it only pinned four extra versions, immutably, in
+# every consumer's resolution. Versions are unchanged: SPEC.md §0.5 pins the 0.36 cohort and a
+# hash-moving bump is a wire-breaking event for an already-launched distributor.
+chia-puzzles = "0.20.3"
+clvm-traits = "0.36.1"
+clvm-utils = "0.36.1"
+clvmr = "0.16.2"
 # The simulator harness the acceptance tests run against — `Simulator`, `Benchmark` and
 # `BlsPairWithCoin` live here. Cohort-matched to `chia-sdk-driver` 0.36.0 on purpose: a test built
 # on different puzzle bytes than the library would prove nothing about the library.
