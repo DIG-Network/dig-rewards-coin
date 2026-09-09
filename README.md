@@ -2,14 +2,12 @@
 
 Reward-distributor coin driver for the DIG Network, on Chia.
 
-The driver ships as of 0.2.0: the DIG-shaped constants table, the launch comment, the launch /
-fund / clawback / entry-set / epoch / payout spend builders, the eligibility rule and the
-observable state. `SPEC.md` at the repository root is normative. See the parent epic
-[#3246](https://github.com/DIG-Network/dig_ecosystem/issues/3246).
-
-**0.2.0 publishes no chain reader.** `read_distributor` was non-functional and is withheld rather
-than shipped broken — [#3267](https://github.com/DIG-Network/dig_ecosystem/issues/3267) tracks it,
-and re-adding a public item later is purely additive.
+The driver ships: the DIG-shaped constants table, the launch comment, the launch / fund /
+clawback / entry-set / epoch / payout spend builders, the eligibility rule, the observable state,
+and — as of 0.3.0 — the chain reader (`state::read_distributor`,
+[#3267](https://github.com/DIG-Network/dig_ecosystem/issues/3267)) that rebuilds a distributor's
+state from its launcher id alone. `SPEC.md` at the repository root is normative. See the parent
+epic [#3246](https://github.com/DIG-Network/dig_ecosystem/issues/3246).
 
 ## Shape, copied from `dig-mirror-coin`
 
@@ -20,10 +18,11 @@ anything else.
 
 ## Layering
 
-This crate sits at `10-primitives`. It performs no socket I/O: chain reads will arrive through the
-canonical caller-supplied `ChainSource` trait (`dig-chainsource-interface`, `00-foundation`) when
-the reader lands with #3267 — a `10-primitives` crate never pulls a network stack down into
-itself. Two same-level edges are illegal from here and deliberately not taken:
+This crate sits at `10-primitives`. It performs no socket I/O itself: chain reads arrive through
+the canonical caller-supplied `ChainSource` trait (`dig-chainsource-interface`, `00-foundation`),
+which the caller constructs and this crate only reads through — a `10-primitives` crate never
+pulls a network stack down into itself. Two same-level edges are illegal from here and
+deliberately not taken:
 `chia-query` (also `10-primitives`, despite being "the canonical coinset access layer") and
 `dig-mirror-coin` (also `10-primitives` — that gate belongs to a `dig-node`-level consumer, not
 to this crate).

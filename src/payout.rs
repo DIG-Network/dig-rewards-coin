@@ -29,10 +29,11 @@ use crate::RewardsError;
 
 /// Where a claim reads the entry slot from, freshly, once per claim.
 ///
-/// Implement this over a `ChainSource`-backed reader. This crate publishes none in 0.2.0 — see
-/// [`crate::state`] and <https://github.com/DIG-Network/dig_ecosystem/issues/3267> — so the
-/// implementation is the caller's until then. The trait exists so
-/// that [`initiate_payout`] cannot be handed a slot value at all — a caller with a stale one in a
+/// [`crate::state::read_distributor`] (#3267) returns a full snapshot, which is the wrong shape
+/// for "read one slot, right before I spend against it" — a claim needs the freshest possible
+/// single read, not last cycle's whole-distributor walk. Implement this trait over a
+/// `ChainSource`-backed lookup for that narrower read. The trait exists so that
+/// [`initiate_payout`] cannot be handed a slot value at all — a caller with a stale one in a
 /// variable has nowhere to put it.
 pub trait EntrySlotSource {
     /// Read the current entry slot for `payout_puzzle_hash`.

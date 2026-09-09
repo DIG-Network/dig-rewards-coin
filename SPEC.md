@@ -161,15 +161,58 @@ worse than an error, because the client's own view simply shows nothing there.
 
 Therefore:
 
-1. This crate MUST pin the `chia-sdk-driver` 0.36 cohort (`chia-bls` / `chia-protocol` /
-   `chia-puzzle-types` / `clvm-traits` / `clvm-utils` at `0.36.1`, `chia-puzzles 0.20.3`,
-   `clvmr 0.16.2`). The ceiling is the cohort, never crates.io latest.
+1. This crate MUST carry an **exact** (`=`) requirement on every upstream crate whose bytes
+   determine a curried puzzle hash: `chia-sdk-driver =0.36.0`, `chia-sdk-types =0.36.0`,
+   `chia-puzzle-types =0.36.1`. These are the requirements a *consumer* inherits, so a consumer
+   that tries to resolve a different cohort gets a **resolution failure at build time** — the loud
+   failure §0.5 exists to force. Wire-type-only cohort members (`chia-protocol`, `chia-bls`,
+   `chia-consensus`) MAY stay semver-compatible: they move no puzzle byte, and a type mismatch is
+   already a compile error.
+
+   **What is enforced where, stated honestly.** The `=` requirements above are enforced in *every*
+   build, this repo's and every consumer's. The guard test of clause 2, and the cohort-lock
+   assertion of clause 2a, are enforced **only in this repo's CI** against this repo's committed
+   `Cargo.lock`; a consumer never runs either. Dev-only cohort members (`chia-puzzles`,
+   `clvm-traits`, `clvm-utils`, `clvmr`) are absent from the published requirement set altogether,
+   and pinning them would constrain nothing downstream; the versions named for them in this section
+   are **descriptive of this repo's lock**, not normative for a consumer.
+
+   **Residual risk that remains unenforceable.** (a) `chia-puzzles` — the standard-puzzle byte
+   blobs reached transitively through `chia-puzzle-types` — is not pinned by us, so a consumer
+   could in principle resolve moved singleton/CAT bytes with nothing in this crate firing; that
+   break would be ecosystem-wide rather than distributor-specific, and it is out of this crate's
+   reach. (b) A consumer using `[patch.crates.io]`, a vendored tree, or a git dependency bypasses
+   every requirement above; no manifest can prevent that. (c) The ceiling is the cohort, never
+   crates.io latest, and clause 3 still governs any bump that moves a hash.
+
+   The cohort, and the version each member resolves to:
+
+   | crate | requirement | normative? |
+   |---|---|---|
+   | `chia-sdk-driver` | `=0.36.0` | yes — consumer-inherited |
+   | `chia-sdk-types` | `=0.36.0` | yes — consumer-inherited |
+   | `chia-puzzle-types` | `=0.36.1` | yes — consumer-inherited |
+   | `chia-protocol` | `0.36.1` (caret) | no — wire types, a mismatch is already a compile error |
+   | `chia-bls` | `0.36.1` (caret) | no — same |
+   | `chia-consensus` | `0.36.1` (caret) | no — same |
+   | `chia-puzzles` | `0.20.3` (caret, dev-only) | descriptive of this repo's lock only |
+   | `clvm-traits` | `0.36.1` (caret, dev-only) | descriptive of this repo's lock only |
+   | `clvm-utils` | `0.36.1` (caret, dev-only) | descriptive of this repo's lock only |
+   | `clvmr` | `0.16.4` (caret `0.16.2`, dev-only) | descriptive of this repo's lock only — a patch of the evaluator moves no puzzle hash, so the `0.16.2` -> `0.16.4` drift #3272 found is benign and this table is corrected to match the lock rather than the lock being forced back |
+
 2. This crate MUST carry a guard test asserting the puzzle hash of **every** reward-distributor
    action it uses — `AddEntry`, `RemoveEntry`, `InitiatePayout` (without-approval variant),
    `NewEpoch`, `Sync`, `AddIncentives`, `CommitIncentives`, `WithdrawIncentives` — against a value
    pinned in this crate, each read from the corresponding `chia-sdk-types` constant at the pinned
    version. An upstream bump MUST fail that test, so the break arrives as a red build and not as a
-   funder whose distributor has vanished.
+   funder whose distributor has vanished. (`tests/puzzle_hash_guard.rs`.)
+2a. This crate MUST also carry a lock-drift guard asserting every §0.5 cohort member resolves, in
+    this repo's own committed `Cargo.lock`, to the version this section's table records. Clause 2's
+    guard cannot substitute for it: it is a test in this crate, and never runs in a consumer's
+    build, so a cohort drift in *this repo's own* lock — as happened when `clvmr` drifted to
+    `0.16.4` while this section still named `0.16.2` — has nothing else that catches it.
+    (`tests/cohort_lock_guard.rs`, run with `--locked` in CI so the resolver cannot silently
+    re-resolve around it.)
 3. A cohort bump that moves any of those hashes MUST be treated as a **wire-breaking event**: it
    requires a migration story for already-launched distributors before it may merge, exactly as
    `dig-mirror-coin/SPEC.md` §3 invariant 1 requires for its CAT outer hash.
@@ -1554,14 +1597,22 @@ per-distributor option.
 
 ### 12.1 Node restart
 
-1. The prover MUST rebuild every distributor's state **from the chain**, never from local cache alone:
-   `RewardDistributor::{from_launcher_solution, from_parent_spend, from_spend}`, with slots found by
-   hint, then the parent's `get_puzzle_and_solution`, then `RewardDistributor::from_spend`, then the
-   `pending_created_*_slots` accessors. **This recipe is already in production** for a CHIP-0051
-   distributor in this ecosystem — hub.dig.net's `/quest?tab=stake` surface reads distributor state,
-   reward/commitment/entry slots and locked NFTs exactly this way (`SYSTEM.md:484`,
-   `apps/web/features/staking/config.ts`, `lib/rewards-distributor.ts`). An implementation MUST reuse
-   that shape rather than invent a second slot-discovery path.
+1. The prover MUST rebuild every distributor's state **from the chain**, never from local cache
+   alone, via `dig_rewards_coin::state::read_distributor` (#3267): `from_launcher_solution` to get
+   the launch constants and eve coin, the authenticated reserve parent-walk to get
+   `reserve_parent_id`/`reserve_lineage_proof`, `from_eve_coin_spend` for the eve generation, then
+   `ChainSource::resolve_singleton_lineage` walked forward with `RewardDistributor::from_spend` —
+   **never** `RewardDistributor::from_parent_spend`, which substitutes an all-zero dummy
+   `LineageProof` for the reserve and produces a snapshot that reads correctly and is unspendable.
+   Slots are **not** found by hint: `ChainSource` has no hint index, and a slot's puzzle hash
+   depends on the slot *value*, so it cannot be derived a priori — the entry/commitment/reward slot
+   set is instead accumulated from each generation's `pending_spend.created_*_slots` /
+   `spent_*_slots` during the same forward walk. This recipe is already in production for a
+   CHIP-0051 distributor in this ecosystem — hub.dig.net's `/quest?tab=stake` surface reads
+   distributor state, reward/commitment/entry slots and locked NFTs this way (`SYSTEM.md:484`,
+   `apps/web/features/staking/config.ts`, `lib/rewards-distributor.ts`) — but that surface predates
+   the authenticated-reserve requirement this crate's reader adds; an implementation MUST reuse the
+   walk shape, not its unauthenticated reserve lookup.
 2. Local prover state is a **cache and advisory**. On restart:
    - challenge **strikes MUST reset to zero** — a strike is evidence about a specific recent window
      the prover no longer holds, and carrying it forward evicts on evidence nobody can re-examine;
