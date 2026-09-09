@@ -49,6 +49,7 @@ pub trait EntrySlotSource {
 
 /// What a claim attempt produced.
 #[must_use]
+#[derive(Debug)]
 pub enum PayoutOutcome {
     /// The claim was built.
     Paid {

@@ -29,6 +29,7 @@ use chia_sdk_types::Conditions;
 use crate::RewardsError;
 
 /// A completed clawback: the conditions to deliver, and what the puzzle returned.
+#[derive(Debug)]
 pub struct Clawback {
     /// Conditions the clawbacker's own coin must assert in the same bundle.
     pub conditions: Conditions,

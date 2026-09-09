@@ -22,6 +22,7 @@ use chia_sdk_types::Conditions;
 use crate::RewardsError;
 
 /// A completed `NewEpoch`: the conditions to deliver, and the fee the puzzle skimmed.
+#[derive(Debug)]
 pub struct DistributorEpochRoll {
     /// Conditions some coin in the same bundle must assert.
     pub conditions: Conditions,

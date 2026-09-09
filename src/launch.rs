@@ -27,6 +27,7 @@ use crate::{comment::LaunchComment, constants::DistributorLaunchTerms, RewardsEr
 ///
 /// The upstream call returns a five-tuple; naming the parts here is what stops a caller from
 /// swapping the security key and the launch signature at a call site where both are opaque bytes.
+#[derive(Debug)]
 pub struct LaunchedDistributor {
     /// Aggregated signature over the launch bundle's security coin.
     pub signature: Signature,

@@ -83,6 +83,7 @@ impl ManagerAuthority {
 /// Both condition sets belong in the **same** bundle. `manager_conditions` are delivered by the
 /// manager singleton's spend; `sync_conditions`, when present, must be asserted by some coin in
 /// the bundle, which is what keeps `last_update` inside `max_seconds_offset` and the write valid.
+#[derive(Debug)]
 pub struct EntrySetWrite {
     /// Conditions the manager singleton's spend must carry.
     pub manager_conditions: Conditions,
@@ -95,6 +96,7 @@ pub struct EntrySetWrite {
 }
 
 /// A removal, which also settles what the entry had accrued.
+#[derive(Debug)]
 pub struct EntryRemoval {
     /// The entry-set write itself.
     pub write: EntrySetWrite,

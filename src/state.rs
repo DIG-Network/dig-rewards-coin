@@ -52,6 +52,7 @@ pub struct DistributorSlots {
 
 /// A distributor as it stands on chain, with everything a UI needs to answer "is anyone being
 /// paid?".
+#[derive(Debug)]
 pub struct DistributorSnapshot {
     /// The live singleton, ready for its next action.
     pub distributor: RewardDistributor,
