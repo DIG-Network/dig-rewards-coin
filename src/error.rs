@@ -1,7 +1,6 @@
 //! [`RewardsError`] — why a reward-distributor operation could not be completed.
 //!
-//! Scaffolding for the error surface the driver logic (a follow-up ticket) will grow into. The
-//! split that matters, matching the sibling `dig-mirror-coin`, is between **"the chain says
+//! The split that matters, matching the sibling `dig-mirror-coin`, is between **"the chain says
 //! no"** and **"the chain did not say"**: a read that could not be established must fail closed,
 //! never degrade into an empty or default answer.
 

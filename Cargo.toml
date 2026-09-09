@@ -1,11 +1,11 @@
 # dig-rewards-coin — reward-distributor coin driver, on Chia.
 #
-# Scaffolding only: this crate carries no driver logic yet. Like its 10-primitives sibling
-# `dig-mirror-coin`, it deliberately does NOT depend on `datalayer-driver` and is not a re-export
-# layer over anything. Chain reads arrive through the canonical `ChainSource` trait
-# (dig-chainsource-interface, 00-foundation) — a 10-primitives crate never pulls a network stack
-# down into itself, and it may never depend on a same-level crate such as `chia-query` or
-# `dig-mirror-coin`.
+# Like its 10-primitives sibling `dig-mirror-coin`, it deliberately does NOT depend on
+# `datalayer-driver` and is not a re-export layer over anything. It performs no socket I/O: chain
+# reads will arrive through the canonical caller-supplied `ChainSource` trait
+# (dig-chainsource-interface, 00-foundation) when the withheld reader lands (#3267) — a
+# 10-primitives crate never pulls a network stack down into itself, and it may never depend on a
+# same-level crate such as `chia-query` or `dig-mirror-coin`.
 [package]
 name = "dig-rewards-coin"
 version = "0.2.0"

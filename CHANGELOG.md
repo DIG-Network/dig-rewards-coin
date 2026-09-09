@@ -14,7 +14,9 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 - `LaunchComment`: the normative `dig-rewards:v1:<store_id_hex>:<root_hex>` launch comment
   (SPEC.md §1.3) — emitted lowercase, parsed in either case, compared as 32 bytes, with a
   non-parsing comment classified as "not a DIG rewards distributor" rather than an error.
-- Launch, fund, clawback, entry-set, epoch, payout and chain-read builders. `AddEntry`/`RemoveEntry`
+- Launch, fund, clawback, entry-set, epoch and payout spend builders, plus the observable-state
+  accessors over a `RewardDistributor` a caller already holds. No chain reader ships — see
+  **Changed** below. `AddEntry`/`RemoveEntry`
   require a `ManagerAuthority`; `Sync`/`NewEpoch`/`InitiatePayout` are permissionless and take none.
 - Entry-set writes settle their own validity window (SPEC.md §8.2 clause 1) instead of emitting a
   `Sync` unconditionally. A `Sync` may only move the distributor's clock **strictly forward**, so
