@@ -34,6 +34,8 @@ dig-constants = "0.13.1"
 # link — chia-sdk-driver 0.36.0 pins the 0.36.1 cohort; the primitives publish 0.48.x but taking
 # that links two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
 chia-bls = "0.36.1"
+# `ConsensusConstants` is a required argument of the upstream launch call, and it lives here.
+chia-consensus = "0.36.1"
 chia-protocol = "0.36.1"
 chia-puzzle-types = "0.36.1"
 chia-puzzles = "0.20.3"
@@ -45,3 +47,10 @@ clvm-utils = "0.36.1"
 clvmr = "0.16.2"
 hex = "0.4.3"
 thiserror = "2.0.20"
+
+[dev-dependencies]
+anyhow = "1.0.100"
+# The simulator harness the acceptance tests run against — `Simulator`, `Benchmark` and
+# `BlsPairWithCoin` live here. Cohort-matched to `chia-sdk-driver` 0.36.0 on purpose: a test built
+# on different puzzle bytes than the library would prove nothing about the library.
+chia-sdk-test = "0.36.0"
