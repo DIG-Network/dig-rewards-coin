@@ -28,10 +28,20 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   upstream `test_managed_reward_distributor()`: launch, fund, add entry, roll epoch, self-claim
   payout, remove entry and observe §6.4's settlement.
 
+### Changed
+- `launch_dig_distributor` no longer takes a `funder_refund_puzzle_hash` parameter. The CAT change
+  destination is now derived from `constants.fee_payout_puzzle_hash` through the single
+  `funder_refund_puzzle_hash(constants)` accessor, so SPEC.md §15 clause 3's requirement that the
+  two be equal holds by construction instead of resting on a check a caller can forget. Two sources
+  of truth for where the change CAT goes is a money bug waiting on a mismatch. The constants
+  builder's existing zero-hash refusal now covers both uses at once, since there is only one field.
+
 ### Fixed
 - `cargo clippy --all-targets -- -D warnings` and `cargo doc --no-deps` were already failing before
-  this change: `launch_dig_distributor` trips `too_many_arguments` at 8/7, and a public doc comment
-  in `state.rs` linked to the private `MAX_GENERATIONS_PER_READ`, rendering a broken link.
+  this change: `launch_dig_distributor` tripped `too_many_arguments` at 8/7 (dropping the redundant
+  refund-hash parameter takes it to 7, so the suppression is gone rather than silenced), and a
+  public doc comment in `state.rs` linked to the private `MAX_GENERATIONS_PER_READ`, rendering a
+  broken link.
 
 ## [0.1.3] - 2026-09-09
 

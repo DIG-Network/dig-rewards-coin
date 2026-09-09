@@ -441,7 +441,6 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         constants,
         &TESTNET11_CONSTANTS,
         LaunchComment::new(Bytes32::new([0xaa; 32]), Bytes32::new([0xbb; 32])),
-        funder.puzzle_hash,
         // The simulator's clock starts at zero, so FIRST_EPOCH_START is in the future.
         0,
     )?;
@@ -454,6 +453,13 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
             funder.sk.clone(),
         ],
     )?;
+
+    // The change CAT went to the hash the constants table carries, which is the only hash the
+    // funder supplied: SPEC.md §15 clause 3 by construction, asserted on real launch output.
+    assert_eq!(
+        launched.refund_cat.info.p2_puzzle_hash,
+        constants.fee_payout_puzzle_hash
+    );
 
     Ok(Harness {
         sim,

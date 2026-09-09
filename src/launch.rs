@@ -48,10 +48,13 @@ pub struct LaunchedDistributor {
 
 /// Mint a DIG rewards distributor for one generation.
 ///
-/// `terms` carries the three launch-time-only choices; `funder_refund_puzzle_hash` receives the CAT
-/// change and is also the (inert, because `fee_bps` is 0) fee payout hash. `now_unix_seconds` is
-/// the caller's current time, used only for the past-`first_epoch_start` refusal — this crate reads
-/// no clock of its own.
+/// `terms` carries the three launch-time-only choices. The funder's refund/change puzzle hash is
+/// **not** a parameter here: it is taken from `constants.fee_payout_puzzle_hash`, which the
+/// constants builder set from the one hash the funder supplied. `SPEC.md` §15 clause 3 requires the
+/// CAT change destination and the fee payout hash to be the same value, so this surface holds one
+/// of them and derives both uses — a mismatch is unrepresentable rather than guarded by a check a
+/// caller can forget. `now_unix_seconds` is the caller's current time, used only for the
+/// past-`first_epoch_start` refusal — this crate reads no clock of its own.
 ///
 /// # Errors
 ///
@@ -59,15 +62,6 @@ pub struct LaunchedDistributor {
 ///   future. A distributor whose first epoch has already begun cannot have that epoch started, so
 ///   its reserve accrues to nobody.
 /// - [`RewardsError::Driver`] if the upstream launch spend could not be built.
-//
-// Eight arguments, one over clippy's default. Every one is load-bearing and distinctly typed, so
-// the count is not the readability problem the lint is aimed at. It is suppressed rather than
-// worked around because the honest fix is a shape change this crate should make deliberately:
-// `funder_refund_puzzle_hash` is redundant with `constants.fee_payout_puzzle_hash` (SPEC.md §15
-// clause 3 requires them to be the same value, and nothing here enforces the agreement), so
-// dropping it would take this to seven AND remove a two-sources-of-truth hazard about where the
-// change CAT goes. That is a public-API decision, not a lint fix.
-#[allow(clippy::too_many_arguments)]
 pub fn launch_dig_distributor(
     ctx: &mut SpendContext,
     offer: &Offer,
@@ -75,7 +69,6 @@ pub fn launch_dig_distributor(
     constants: RewardDistributorConstants,
     consensus_constants: &ConsensusConstants,
     generation: LaunchComment,
-    funder_refund_puzzle_hash: Bytes32,
     now_unix_seconds: u64,
 ) -> Result<LaunchedDistributor, RewardsError> {
     require_future_first_epoch_start(terms.first_epoch_start, now_unix_seconds)?;
@@ -90,7 +83,7 @@ pub fn launch_dig_distributor(
         ctx,
         offer,
         terms.first_epoch_start,
-        funder_refund_puzzle_hash,
+        funder_refund_puzzle_hash(constants),
         constants,
         consensus_constants,
         // §1.3: the comment is rendered from a parsed value, never taken as free-form text.
@@ -104,6 +97,16 @@ pub fn launch_dig_distributor(
         first_distributor_epoch_slot,
         refund_cat,
     })
+}
+
+/// The funder's refund/change puzzle hash for a constants table.
+///
+/// The one derivation point for `SPEC.md` §15 clause 3's equality. The constants builder refuses a
+/// zero hash for `fee_payout_puzzle_hash`, so that single refusal now covers the CAT change
+/// destination as well: there is no second field that could be zero, or different.
+#[must_use]
+pub fn funder_refund_puzzle_hash(constants: RewardDistributorConstants) -> Bytes32 {
+    constants.fee_payout_puzzle_hash
 }
 
 /// Refuse a `first_epoch_start` that is not strictly in the future (`SPEC.md` §8.5 clause 1).
@@ -139,7 +142,33 @@ pub fn standard_puzzle_hash(public_key: chia_bls::PublicKey) -> Bytes32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::FIRST_EPOCH_START_LEAD_SECONDS;
+    use crate::constants::{
+        dig_distributor_constants, DistributorLaunchTerms, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+        FIRST_EPOCH_START_LEAD_SECONDS,
+    };
+
+    /// The whole point of change: `fee_payout_puzzle_hash` and the CAT refund hash cannot disagree,
+    /// because there is only one of them (`SPEC.md` §15 clause 3).
+    #[test]
+    fn the_funder_refund_hash_is_the_fee_payout_hash() {
+        let refund_hash = Bytes32::new([9; 32]);
+        let constants = dig_distributor_constants(
+            DistributorLaunchTerms {
+                manager_singleton_launcher_id: Bytes32::new([7; 32]),
+                distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+                first_epoch_start: 1_800_000_000,
+            },
+            refund_hash,
+        )
+        .unwrap();
+
+        assert_eq!(funder_refund_puzzle_hash(constants), refund_hash);
+        assert_eq!(
+            funder_refund_puzzle_hash(constants),
+            constants.fee_payout_puzzle_hash,
+            "one field, both uses: §15 clause 3's equality holds by construction"
+        );
+    }
 
     #[test]
     fn a_first_epoch_start_in_the_past_is_refused() {
