@@ -716,6 +716,15 @@ fn empty_first_epoch_settles_where() -> anyhow::Result<()> {
         harness.entry.puzzle_hash,
         epoch_end,
     )?;
+
+    // Asserted, not assumed. `ensure_optional_conditions_met` below has a silent `None` arm, so
+    // without this line either decision of `sync_if_the_window_needs_it` would satisfy the test
+    // and the window logic would be untested here.
+    assert!(
+        write.sync_conditions.is_none(),
+        "at last_update == epoch_end the window is still open, so no Sync is emitted"
+    );
+
     let entry_slot = harness.distributor.created_slot_value_to_slot(
         harness.distributor.pending_spend.created_entry_slots[0],
         RewardDistributorSlotNonce::ENTRY,
@@ -739,6 +748,42 @@ fn empty_first_epoch_settles_where() -> anyhow::Result<()> {
     ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
     harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
     harness.sim.spend_coins(ctx.take(), &[])?;
+
+    // ---- The second epoch's roll is proven to have HAPPENED, by its post-state ----
+    //
+    // Everything below this point is the answer to §15 clause 9a, so a silently skipped roll must
+    // not be able to reach it. These two assertions are the guard, and they are deliberately the
+    // FIRST thing after the roll: without them a missing roll surfaces much later as a bare
+    // `clvm raise` out of the next `sync_distributor` — a red, but one that says nothing about
+    // where the money went, and one that a future edit to the tail of this test could mask.
+    //
+    // `epoch_end` is the load-bearing witness: only `NewEpoch` moves it, and it moves to a value
+    // no earlier state of this distributor ever holds.
+    let rolled = harness.distributor.info.state;
+    assert_eq!(
+        rolled.round_time_info.epoch_end,
+        second_epoch_start + TEST_EPOCH_SECONDS,
+        "the distributor is in the SECOND epoch — only NewEpoch moves epoch_end, so this \
+         failing means the roll never happened and the claim below would prove nothing"
+    );
+    assert_eq!(roll.fee_base_units, 0, "SPEC.md §7.3: fee_bps is zero");
+
+    // And this is §15 clause 9a settled at the STATE level, independently of the claim
+    // arithmetic below: `remaining_rewards` is precision-scaled, and after the roll it holds
+    // precision × BOTH commitments. `NewEpoch` added the second epoch's commitment ON TOP OF the
+    // empty epoch's untouched balance rather than replacing or discarding it — which is the whole
+    // question, and the reason two independent measurements of it are better than one.
+    let precision = u128::from(harness.distributor.info.constants.precision);
+    assert_eq!(
+        rolled.round_reward_info.remaining_rewards,
+        precision * u128::from(first_epoch_commitment + second_epoch_commitment),
+        "the empty epoch's value is still in the distributable pool, with the second epoch's \
+         commitment added on top of it"
+    );
+    assert_eq!(
+        rolled.round_reward_info.cumulative_payout, 0,
+        "still nothing accrued to anybody: the second epoch has only just started"
+    );
 
     // Half of the second epoch elapses, then the entry claims.
     let mid_second = second_epoch_start + TEST_EPOCH_SECONDS / 2;
@@ -791,6 +836,202 @@ fn empty_first_epoch_settles_where() -> anyhow::Result<()> {
         amount_base_units > if_stranded * 2,
         "the claim is far more than the second epoch alone could account for, so the first \
          epoch's value was included"
+    );
+
+    Ok(())
+}
+
+/// Launch, fund the first two distributor epochs, and roll into the first one.
+///
+/// The two window tests below both need a distributor that is *inside* a running epoch, with the
+/// next epoch already funded so that `NewEpoch` — the remedy
+/// [`RewardsError::EntrySetWriteWindowClosed`] names — has a reward slot to consume.
+fn launch_funded_and_inside_the_first_epoch(
+    ctx: &mut SpendContext,
+) -> anyhow::Result<(Harness, Vec<Slot<RewardDistributorRewardSlotValue>>)> {
+    let mut harness = launch_harness(ctx)?;
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let mut reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        COMMITTED_BASE_UNITS,
+    )?;
+    let slot_for_second = pick_reward_slot(&reward_slots, second_epoch_start);
+    reward_slots = merge_reward_slots(
+        reward_slots,
+        commit_to_epoch(
+            ctx,
+            &mut harness,
+            slot_for_second,
+            second_epoch_start,
+            COMMITTED_BASE_UNITS,
+        )?,
+    );
+
+    harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let first_reward_slot = pick_reward_slot(&reward_slots, FIRST_EPOCH_START);
+    let roll = start_next_distributor_epoch(ctx, &mut harness.distributor, first_reward_slot)?;
+    ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        harness.distributor.info.state.round_time_info.last_update, FIRST_EPOCH_START,
+        "the roll set last_update to the epoch it started"
+    );
+
+    Ok((harness, reward_slots))
+}
+
+/// `SPEC.md` §8.2 clause 1, past the window: the `Sync` rides in the **same bundle**, and the
+/// chain accepts the pair.
+///
+/// This is the `sync_conditions == Some` branch of the decision `crate::entries` computes. Its
+/// counterpart — the `None` branch, inside the window — is asserted in
+/// [`managed_dig_distributor_end_to_end`] and [`empty_first_epoch_settles_where`].
+#[test]
+fn past_the_window_an_entry_set_write_carries_a_sync_in_the_same_bundle() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (mut harness, _reward_slots) = launch_funded_and_inside_the_first_epoch(ctx)?;
+
+    // Move well past `last_update + max_seconds_offset`, but stay inside the epoch so a Sync is
+    // still able to move the clock forward.
+    let past_the_window = FIRST_EPOCH_START + MAX_SECONDS_OFFSET + 100;
+    assert!(
+        past_the_window < harness.distributor.info.state.round_time_info.epoch_end,
+        "the fixture must sit past the window but inside the epoch, or it tests the wrong branch"
+    );
+    harness.sim.set_next_timestamp(past_the_window)?;
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        harness.entry.puzzle_hash,
+        past_the_window,
+    )?;
+
+    let sync_conditions = write
+        .sync_conditions
+        .clone()
+        .expect("past the window, a Sync must ride along or the write is invalid on chain");
+
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_conditions_met(ctx, &mut harness.sim, sync_conditions)?;
+    let (_, _) = spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+
+    // The chain accepting this is the actual claim: the bundled Sync is what keeps the
+    // `ASSERT_BEFORE_SECONDS_ABSOLUTE` the write carries satisfiable.
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        harness.distributor.info.state.round_time_info.last_update, past_the_window,
+        "the bundled Sync moved the distributor's clock forward"
+    );
+    assert_eq!(
+        harness.distributor.info.state.active_shares, ENTRY_SHARES,
+        "and the entry-set write it protected landed"
+    );
+
+    Ok(())
+}
+
+/// `SPEC.md` §8.2 clause 1, when no `Sync` can help: the write is refused by name, and the remedy
+/// the error names actually works.
+///
+/// Once `last_update` has reached `epoch_end` a `Sync` cannot move the clock at all — it may only
+/// move strictly forward, and never past the epoch's end. So the write is impossible until someone
+/// rolls the epoch. The second half of this test spends that remedy and re-attempts, because an
+/// error message naming a remedy nobody has executed is a claim, not a fact.
+#[test]
+fn the_entry_set_write_window_closes_at_the_end_of_an_epoch() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (mut harness, reward_slots) = launch_funded_and_inside_the_first_epoch(ctx)?;
+
+    // Run the clock to the epoch's end, so `last_update == epoch_end`.
+    let epoch_end = harness.distributor.info.state.round_time_info.epoch_end;
+    harness.sim.set_next_timestamp(epoch_end)?;
+    let sync_conditions = sync_distributor(ctx, &mut harness.distributor, epoch_end)?;
+    ensure_conditions_met(ctx, &mut harness.sim, sync_conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        harness.distributor.info.state.round_time_info.last_update, epoch_end,
+        "the clock has reached the epoch's end, which is as far as a Sync may take it"
+    );
+
+    // Past the window now, with no Sync able to fix it.
+    let too_late = epoch_end + MAX_SECONDS_OFFSET;
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    // Matched rather than `expect_err`: `EntrySetWrite` carries `Conditions` and is not `Debug`,
+    // and a refusal test should not be the reason a public type grows a derive.
+    let refusal = match add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        harness.entry.puzzle_hash,
+        too_late,
+    ) {
+        Ok(_) => panic!("no Sync can bring this write inside its window, so it must be refused"),
+        Err(error) => error,
+    };
+
+    let RewardsError::EntrySetWriteWindowClosed {
+        last_update,
+        epoch_end: refused_epoch_end,
+        now_unix_seconds,
+    } = &refusal
+    else {
+        panic!("expected EntrySetWriteWindowClosed, got: {refusal}");
+    };
+    assert_eq!(*last_update, epoch_end);
+    assert_eq!(*refused_epoch_end, epoch_end);
+    assert_eq!(*now_unix_seconds, too_late);
+    assert!(
+        refusal
+            .to_string()
+            .contains("roll the distributor epoch first"),
+        "the refusal must name its remedy: {refusal}"
+    );
+
+    // The named remedy, spent. `NewEpoch` is permissionless, so the caller can do this itself.
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+    let second_reward_slot = reward_slots
+        .iter()
+        .find(|slot| slot.info.value.epoch_start == second_epoch_start)
+        .expect("a reward slot for the second epoch")
+        .clone();
+    let roll = start_next_distributor_epoch(ctx, &mut harness.distributor, second_reward_slot)?;
+    ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    // And the very same write now builds, which is what makes the remedy a fact rather than a
+    // sentence in an error message. The roll set `last_update` to the new epoch's start, so this
+    // write is once again past its window — a Sync rides along, and the chain has to actually be
+    // at that time for the Sync's own `ASSERT_SECONDS_ABSOLUTE` to hold.
+    harness.sim.set_next_timestamp(too_late)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        harness.entry.puzzle_hash,
+        too_late,
+    )?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (_, _) = spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        harness.distributor.info.state.active_shares, ENTRY_SHARES,
+        "after the roll the refused write lands"
     );
 
     Ok(())
