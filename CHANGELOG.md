@@ -29,6 +29,19 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   payout, remove entry and observe §6.4's settlement.
 
 ### Changed
+- **No chain reader ships in 0.2.0.** `state::read_distributor` is removed from the public surface.
+  It failed at its first hop for every distributor: it applied `from_parent_spend` to the eve coin's
+  spend, which carries the launch inner puzzle rather than the action-layer one, so the call
+  returned `None` and every read reported `Malformed`. The correct hop is upstream's
+  `from_eve_coin_spend`, which additionally needs the reserve CAT's `reserve_parent_id` and
+  `reserve_lineage_proof` — provenance a reader starting from a launcher id cannot currently
+  discover — so SPEC.md §12.1 clause 1 is deferred to
+  [#3267](https://github.com/DIG-Network/dig_ecosystem/issues/3267). A crates.io version is
+  immutable and a present-but-broken public function is a worse lie than an absent one: every
+  consumer who found it in the docs would write code against a function that cannot work. Re-adding
+  a public item later is purely additive, so nothing is foreclosed. `DistributorSlots`,
+  `DistributorSnapshot` and its accessors stay public — they work, and they are useful to any caller
+  holding a `RewardDistributor` obtained another way, including straight out of a launch.
 - `launch_dig_distributor` no longer takes a `funder_refund_puzzle_hash` parameter. The CAT change
   destination is now derived from `constants.fee_payout_puzzle_hash` through the single
   `funder_refund_puzzle_hash(constants)` accessor, so SPEC.md §15 clause 3's requirement that the

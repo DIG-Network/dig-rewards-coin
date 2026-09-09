@@ -29,7 +29,9 @@ use crate::RewardsError;
 
 /// Where a claim reads the entry slot from, freshly, once per claim.
 ///
-/// Implement this over a `ChainSource`-backed reader (see [`crate::state`]). The trait exists so
+/// Implement this over a `ChainSource`-backed reader. This crate publishes none in 0.2.0 — see
+/// [`crate::state`] and <https://github.com/DIG-Network/dig_ecosystem/issues/3267> — so the
+/// implementation is the caller's until then. The trait exists so
 /// that [`initiate_payout`] cannot be handed a slot value at all — a caller with a stale one in a
 /// variable has nowhere to put it.
 pub trait EntrySlotSource {

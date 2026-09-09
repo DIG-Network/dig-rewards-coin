@@ -23,7 +23,9 @@
 //!   (§0.1 clause 1);
 //! - performs no socket I/O, holds no keys, and never broadcasts. Chain reads arrive through the
 //!   caller-supplied `ChainSource` (`dig-chainsource-interface`); spend builders return unsigned
-//!   spends (§0.1 clause 2);
+//!   spends (§0.1 clause 2). **0.2.0 publishes no chain reader**: §12.1's `read_distributor` was
+//!   non-functional and is withheld rather than shipped broken — see [`state`] and
+//!   <https://github.com/DIG-Network/dig_ecosystem/issues/3267>;
 //! - contains neither the prover loop nor the claim loop. Those are `dig-node`
 //!   (<https://github.com/DIG-Network/dig_ecosystem/issues/3250>,
 //!   <https://github.com/DIG-Network/dig_ecosystem/issues/3251>); this crate supplies what they
@@ -80,4 +82,4 @@ pub use eligibility::{
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;
 pub use launch::{funder_refund_puzzle_hash, launch_dig_distributor, LaunchedDistributor};
-pub use state::{read_distributor, DistributorSlots, DistributorSnapshot};
+pub use state::{DistributorSlots, DistributorSnapshot};

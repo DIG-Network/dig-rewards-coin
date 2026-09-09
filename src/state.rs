@@ -1,41 +1,41 @@
-//! Reading a distributor off the chain, and the state a UI needs — `SPEC.md` §12.1 clause 1.
+//! The state a UI needs from a distributor, and the reader that is **not** in 0.2.0.
 //!
-//! Every read arrives through the caller's [`ChainSource`]. This module opens no socket, holds no
-//! key, broadcasts nothing, and returns no signed spend (§0.1 clause 2). What it returns is a
-//! reconstructed [`RewardDistributor`] plus the slots the walk observed.
+//! # The chain reader is withheld from this release — see [issue #3267]
 //!
-//! ## The walk
+//! `SPEC.md` §12.1 clause 1 specifies a `read_distributor` that walks a distributor's singleton
+//! generations from its launcher id. **This release does not publish one, deliberately.** The
+//! implementation that existed failed at its first hop for *every* distributor: it applied
+//! `RewardDistributor::from_parent_spend` to the eve coin's spend, which carries the launch inner
+//! puzzle rather than the action-layer one, so the call returned `None` and every read reported
+//! `Malformed`. The correct hop is upstream's `from_eve_coin_spend`, which additionally needs the
+//! reserve CAT's `reserve_parent_id` and `reserve_lineage_proof` — provenance a reader starting
+//! from a launcher id cannot currently discover. That is real design work, and it is tracked at
+//! [issue #3267].
 //!
-//! 1. `RewardDistributor::from_launcher_solution` on the launcher's spend gives the constants, the
-//!    initial state and the eve coin. That call also **re-derives** the constants from the launcher
-//!    id and rejects a launcher whose curried constants do not match, so a spoofed launcher fails
-//!    here rather than later.
-//! 2. From there, each singleton generation is resolved by reading the spend that spent the current
-//!    coin (`ChainSource::coin_spend`) and applying `RewardDistributor::from_parent_spend`. The last
-//!    unspent generation is the live distributor.
-//! 3. Slots are collected from each spend as it is walked, out of the `pending_spend`
-//!    `created_*_slots` / `spent_*_slots` accessors, and a created slot is retired when a later
-//!    spend consumes it.
+//! A crates.io version is immutable, so a present-but-broken public function is a worse lie than an
+//! absent one: every consumer who found it in the docs would write code against a function that
+//! cannot work, and the release could never be corrected in place. Re-adding a public item later is
+//! purely additive, so omitting it now forecloses nothing.
 //!
-//! Collecting slots from the walk rather than from a hint index is deliberate. It is the shape
-//! already in production behind `hub.dig.net`'s `/quest?tab=stake` surface, and a second
-//! slot-discovery path would be a second place for the entry set to be wrong.
+//! What this module does publish is the state shape itself — [`DistributorSlots`] and
+//! [`DistributorSnapshot`] with its accessors — which is useful to any caller that obtained a
+//! [`RewardDistributor`] by other means, including straight out of a launch.
 //!
-//! ## A failed read is never an empty answer
+//! # A failed read is never an empty answer
 //!
-//! Every `ChainSource` error becomes [`RewardsError::ChainUnavailable`]. A distributor whose read
-//! failed MUST NOT render as "no entries" or "nothing accrued": those are claims about money, and
-//! the honest answer is that the question went unanswered.
+//! The rule the missing reader will have to honour, recorded here because it is where the next
+//! reader arrives: every `ChainSource` error MUST become [`crate::RewardsError::ChainUnavailable`]. A
+//! distributor whose read failed MUST NOT render as "no entries" or "nothing accrued" — those are
+//! claims about money, and the honest answer is that the question went unanswered.
+//!
+//! [issue #3267]: https://github.com/DIG-Network/dig_ecosystem/issues/3267
 
-use chia_protocol::{Bytes32, CoinSpend};
-use chia_sdk_driver::{RewardDistributor, RewardDistributorConstants, SpendContext};
+use chia_protocol::Bytes32;
+use chia_sdk_driver::RewardDistributor;
 use chia_sdk_types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorEntrySlotValue,
     RewardDistributorRewardSlotValue,
 };
-use dig_chainsource_interface::ChainSource;
-
-use crate::RewardsError;
 
 /// The slots a distributor currently has outstanding, as observed by the walk.
 #[derive(Debug, Clone, Default)]
@@ -107,128 +107,4 @@ impl DistributorSnapshot {
             .map(|slot| slot.payout_puzzle_hash)
             .collect()
     }
-}
-
-/// How many singleton generations one read will walk before giving up.
-///
-/// A bound, not a policy: without one, a source that returns a cycle would spin forever. Hitting it
-/// is reported as [`RewardsError::ChainUnavailable`] — an unanswered question — and never as a
-/// snapshot of whatever had been walked so far, which would be a stale entry set presented as
-/// current.
-const MAX_GENERATIONS_PER_READ: usize = 100_000;
-
-/// Read a distributor from its launcher id.
-///
-/// # Errors
-///
-/// - [`RewardsError::ChainUnavailable`] if any read could not be answered, or if the walk exceeded
-///   its `MAX_GENERATIONS_PER_READ` bound. Named rather than linked, and not restated as a number:
-///   the constant is private, so an intra-doc link to it renders broken in the public docs.
-/// - [`RewardsError::Malformed`] if the launcher exists but is not a reward distributor launcher, or
-///   if a spend along the chain could not be interpreted as one.
-/// - [`RewardsError::Driver`] if the upstream parser rejected the launcher's curried constants.
-pub fn read_distributor(
-    ctx: &mut SpendContext,
-    source: &impl ChainSource,
-    launcher_id: Bytes32,
-) -> Result<DistributorSnapshot, RewardsError> {
-    let launcher_spend = require_spend(source, launcher_id, "launcher")?;
-    let launcher_solution = ctx.alloc(&launcher_spend.solution)?;
-
-    let Some((constants, _initial_state, eve_coin)) =
-        RewardDistributor::from_launcher_solution(ctx, launcher_spend.coin, launcher_solution)?
-    else {
-        return Err(RewardsError::Malformed(
-            "launcher solution is not a reward distributor launch".to_string(),
-        ));
-    };
-
-    let mut slots = DistributorSlots::default();
-    let mut current_coin_id = eve_coin.coin_id();
-    let mut distributor: Option<RewardDistributor> = None;
-
-    for _ in 0..MAX_GENERATIONS_PER_READ {
-        let Some(spend) = read_spend(source, current_coin_id)? else {
-            // The current coin is unspent, so the distributor we last reconstructed is live.
-            return match distributor {
-                Some(distributor) => Ok(DistributorSnapshot { distributor, slots }),
-                None => Err(RewardsError::Malformed(
-                    "the eve coin is unspent, so no distributor exists yet".to_string(),
-                )),
-            };
-        };
-
-        let Some(child) = RewardDistributor::from_parent_spend(ctx, &spend, constants)? else {
-            return Err(RewardsError::Malformed(format!(
-                "spend of {current_coin_id} is not a reward distributor spend"
-            )));
-        };
-
-        absorb_slot_changes(&spend, ctx, constants, &mut slots)?;
-
-        current_coin_id = child.coin.coin_id();
-        distributor = Some(child);
-    }
-
-    Err(RewardsError::ChainUnavailable(format!(
-        "distributor {launcher_id} did not resolve within {MAX_GENERATIONS_PER_READ} generations"
-    )))
-}
-
-/// Fold one spend's slot creations and consumptions into the running slot set.
-///
-/// A spent slot is removed before the created ones are added, because an action that replaces a
-/// slot spends and creates one with the same identity but a new `counter`.
-fn absorb_slot_changes(
-    spend: &CoinSpend,
-    ctx: &mut SpendContext,
-    constants: RewardDistributorConstants,
-    slots: &mut DistributorSlots,
-) -> Result<(), RewardsError> {
-    let Some(spent) =
-        RewardDistributor::from_spend(ctx, spend, None, constants, chia_bls::Signature::default())?
-    else {
-        return Ok(());
-    };
-
-    let pending = &spent.pending_spend;
-
-    slots
-        .entries
-        .retain(|entry| !pending.spent_entry_slots.contains(entry));
-    slots
-        .commitments
-        .retain(|commitment| !pending.spent_commitment_slots.contains(commitment));
-    slots
-        .rewards
-        .retain(|reward| !pending.spent_reward_slots.contains(reward));
-
-    slots.entries.extend(pending.created_entry_slots.iter());
-    slots
-        .commitments
-        .extend(pending.created_commitment_slots.iter());
-    slots.rewards.extend(pending.created_reward_slots.iter());
-
-    Ok(())
-}
-
-/// Read the spend that spent `coin_id`, mapping a source failure to `ChainUnavailable`.
-fn read_spend(
-    source: &impl ChainSource,
-    coin_id: Bytes32,
-) -> Result<Option<CoinSpend>, RewardsError> {
-    source.coin_spend(coin_id).map_err(|error| {
-        RewardsError::ChainUnavailable(format!("could not read the spend of {coin_id}: {error}"))
-    })
-}
-
-/// Read a spend that must exist, naming what was being resolved.
-fn require_spend(
-    source: &impl ChainSource,
-    coin_id: Bytes32,
-    what: &str,
-) -> Result<CoinSpend, RewardsError> {
-    read_spend(source, coin_id)?.ok_or_else(|| {
-        RewardsError::Malformed(format!("the {what} coin {coin_id} has not been spent"))
-    })
 }

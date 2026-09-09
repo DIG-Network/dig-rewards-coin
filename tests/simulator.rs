@@ -13,7 +13,7 @@
 //! That keeps the substitution visible instead of quietly forking the table, and it means no hex
 //! literal for the $DIG asset id appears anywhere here.
 
-use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
+use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_puzzle_types::singleton::{SingletonArgs, SingletonSolution};
 use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
@@ -31,7 +31,6 @@ use chia_sdk_types::puzzles::{
 use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
 use clvm_traits::{clvm_quote, ToClvm};
 use clvmr::NodePtr;
-use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_rewards_coin::clawback::{
     clawback_authority, commitment_distributor_epoch_start, withdraw_committed_incentives,
 };
@@ -47,7 +46,7 @@ use dig_rewards_coin::epoch::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
-use dig_rewards_coin::{read_distributor, RewardsError};
+use dig_rewards_coin::RewardsError;
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
 /// so a mainnet-shaped timestamp would mean passing decades of simulated time.
@@ -94,96 +93,6 @@ impl EntrySlotSource for EmptySlotSource {
         _payout_puzzle_hash: Bytes32,
     ) -> Result<Option<Slot<chia_sdk_types::puzzles::RewardDistributorEntrySlotValue>>, RewardsError>
     {
-        Ok(None)
-    }
-}
-
-/// A source that could not answer — a transport failure, not an absence.
-struct UnavailableChainSource;
-
-impl ChainSource for UnavailableChainSource {
-    type Error = String;
-
-    fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn coin_records_by_puzzle_hash(
-        &self,
-        _puzzle_hash: Bytes32,
-        _include_spent: bool,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn coin_records_by_parent(
-        &self,
-        _parent_coin_id: Bytes32,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn resolve_singleton_lineage(
-        &self,
-        _launcher_id: Bytes32,
-    ) -> Result<Option<SingletonLineage>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-
-    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
-        Err("the peer timed out".to_string())
-    }
-}
-
-/// A source that reliably answers "nothing here" — a genuine absence, not a failure.
-struct NothingSpentChainSource;
-
-impl ChainSource for NothingSpentChainSource {
-    type Error = String;
-
-    fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
-        Ok(None)
-    }
-
-    fn coin_records_by_puzzle_hash(
-        &self,
-        _puzzle_hash: Bytes32,
-        _include_spent: bool,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
-        Ok(Vec::new())
-    }
-
-    fn coin_records_by_parent(
-        &self,
-        _parent_coin_id: Bytes32,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
-        Ok(Vec::new())
-    }
-
-    fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
-        Ok(None)
-    }
-
-    fn resolve_singleton_lineage(
-        &self,
-        _launcher_id: Bytes32,
-    ) -> Result<Option<SingletonLineage>, Self::Error> {
-        Ok(None)
-    }
-
-    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
-        Ok(None)
-    }
-
-    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
         Ok(None)
     }
 }
@@ -1249,29 +1158,6 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
     );
 
     Ok(())
-}
-
-/// `SPEC.md` §0.1 clause 2 and §12.1: a read that could not be established fails closed.
-///
-/// The distinction is the whole point of the `ChainSource` contract. "The peer timed out" and
-/// "there is genuinely nothing there" are different answers, and neither may degrade into an empty
-/// distributor — "no entries" and "nothing accrued" are claims about money.
-#[test]
-fn a_chain_source_that_cannot_answer_never_reads_as_an_empty_distributor() {
-    let ctx = &mut SpendContext::new();
-    let launcher_id = Bytes32::new([0x5c; 32]);
-
-    let unanswered = read_distributor(ctx, &UnavailableChainSource, launcher_id);
-    assert!(
-        matches!(unanswered, Err(RewardsError::ChainUnavailable(_))),
-        "a source that could not answer is ChainUnavailable, never an empty snapshot"
-    );
-
-    let absent = read_distributor(ctx, &NothingSpentChainSource, launcher_id);
-    assert!(
-        matches!(absent, Err(RewardsError::Malformed(_))),
-        "an unspent launcher is not a distributor, and is refused rather than returned empty"
-    );
 }
 
 /// Pick the reward slot that covers `epoch_start`: an exact match if one exists, otherwise the
