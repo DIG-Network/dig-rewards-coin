@@ -83,4 +83,7 @@ pub use eligibility::{
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;
 pub use launch::{funder_refund_puzzle_hash, launch_dig_distributor, LaunchedDistributor};
-pub use state::{DistributorSlots, DistributorSnapshot};
+pub use state::{
+    read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot,
+    STALE_ENTRY_SET_SECONDS,
+};
