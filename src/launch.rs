@@ -48,7 +48,9 @@ pub struct LaunchedDistributor {
 
 /// Mint a DIG rewards distributor for one generation.
 ///
-/// `terms` carries the three launch-time-only choices. The funder's refund/change puzzle hash is
+/// The three launch-time-only choices reach this function split into two paths: two curried into
+/// `constants` — the manager singleton launcher id and `distributor_epoch_seconds` — and one
+/// (`first_epoch_start`) passed directly as a parameter. The funder's refund/change puzzle hash is
 /// **not** a parameter here: it is taken from `constants.fee_payout_puzzle_hash`, which the
 /// constants builder set from the one hash the funder supplied. `SPEC.md` §15 clause 3 requires the
 /// CAT change destination and the fee payout hash to be the same value, so this surface holds one

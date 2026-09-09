@@ -14,8 +14,8 @@
 //! [`DistributorLaunchTerms`], which deliberately has **no `Default` impl**: a creation surface
 //! can only offer a choice this API forces it to supply. `first_epoch_start` is the third
 //! launch-time-only choice and is a required parameter of [`launch_dig_distributor`](crate::launch::launch_dig_distributor).
-//! All three are explicit with no default. The DIG defaults for `epoch_seconds` and
-//! `first_epoch_start` are published as named constants below so a caller opts into them explicitly.
+//! All three are explicit with no default. The DIG default for `epoch_seconds` is published as a named constant below so a caller opts into it explicitly.
+//! For `first_epoch_start`, a recommended lead time is published so a caller knows how far ahead to place it.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{RewardDistributorConstants, RewardDistributorType};
