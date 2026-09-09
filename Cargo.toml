@@ -8,7 +8,7 @@
 # `dig-mirror-coin`.
 [package]
 name = "dig-rewards-coin"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Reward-distributor coin driver for the DIG Network on Chia (scaffolding — no driver logic yet)"

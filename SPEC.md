@@ -1594,17 +1594,108 @@ to a counterparty MUST be computed from the chain. A mirror deciding whether to 
 to chase a reward needs a signal the funder cannot flatter, and the operator's RPC (§2.6) is not that
 signal.
 
-### 12.5 A peer claiming after eviction
+### 12.5 An absent entry slot, including a peer claiming after eviction
 
 `RemoveEntry` spends the entry slot and settles the accrued amount (§6.4). After eviction there is no
 slot to claim against, so `InitiatePayout` cannot be built — correctly, and with nothing owed.
 
-1. A claim loop MUST treat "entry slot absent" as a **terminal, non-error** outcome for that
-   distributor: stop retrying, do not report a chain fault, do not report a lost payment.
+Eviction is not the only reason a claim loop reads no slot, and the read itself does not say which
+reason it is (clause 7). A peer holds no entry slot in a distributor it was **never admitted** to, in
+one it was **evicted** from, and in one whose `AddEntry` for it **has not landed yet** — and the third
+is the ordinary case rather than an edge: `first_epoch_start` defaults to `now + 600` (§8.5) while the
+first entry cannot exist for at least an hour (§6.3 clause 2's
+`ENTRY_WRITE_MIN_INTERVAL_SECONDS = 3_600`), so every distributor spends its first epoch with an empty
+entry set (§15 clause 9a) and every peer that discovers it inside that window reads an absence.
+
+1. A claim loop MUST treat "entry slot absent" as a **terminal, non-error** outcome for **that claim
+   attempt** — never for that distributor. In a cycle whose slot read comes back absent the loop MUST
+   build no `InitiatePayout`, MUST spend nothing, MUST NOT report a chain fault, and MUST NOT report a
+   lost payment. The last two are not leniency: §6.4 clause 1 already paid out everything the entry had
+   accrued at removal, including a remainder below `payout_threshold` that the peer could never have
+   claimed itself (§8.3 clause 4). Nothing is owed, so there is no fault to report and no payment to
+   mourn.
+1a. **The loop MUST keep observing that distributor**, on its ordinary cadence — §8.6's
+   `CLAIM_CADENCE_SECONDS = 86_400`, jittered by at least `CLAIM_JITTER_SECONDS = 3_600` — for as long
+   as it is a distributor this peer would claim from at all (§9.3). Reading an entry slot is a chain
+   **read**, not a spend: it costs no XCH mojos and no $DIG base units, so none of §6.3's four bounds
+   applies to it, and the only cost to weigh is one chain-source read per cadence period, which the
+   cadence already bounds. Both ways out of an absence arrive with no signal a loop could wait for
+   instead — clause 2's re-entry, and the not-yet-added case above — so a loop that stops reading is a
+   loop that cannot learn it is owed money again. §15 clause 8 states the prover-side form of this
+   asymmetry, that absence of evidence never evicts; this is its claim-side form: an absence is
+   evidence about **now**, never about the future.
 2. Re-entry requires passing the challenge again and waiting out `REENTRY_COOLDOWN_SECONDS` (§6.3).
 3. A claim loop MUST re-read the entry slot before every claim and MUST NOT cache a slot value across
    cycles: `counter` increments on each payout, so a cached value produces an invalid spend and a
    wasted fee.
+4. **Clause 3 and clause 1a are one requirement seen from two sides.** "Re-read the entry slot before
+   every claim, and never cache a slot value across cycles" already presumes there is a next claim to
+   re-read before, and an **absence MUST NOT be cached any more than a value is**: `absent` is a slot
+   read like any other, valid only for the cycle that took it.
+5. An implementation MUST NOT keep a permanent per-distributor **exclusion set** — process-lifetime or
+   persisted, keyed on launcher id or on anything else — populated from absent-slot reads, and MUST NOT
+   treat an absent slot as evidence that this peer will never hold an entry there. A bound on how often
+   the loop *reads* is not an exclusion set; a structure that removes a distributor from the loop's view
+   is one, whatever it is called.
+6. **The absence MUST be surfaced, not swallowed.** "I know this distributor and I hold no entry in it"
+   is a different fact from "I am claiming here" and from "I could not read the chain", and the operator
+   of the claiming node needs to tell the three apart. The claim loop MUST express it in the vocabulary
+   §2.3 and §2.4 already define rather than a second one of its own; this clause adds no named state, no
+   counter and no wire field:
+
+   - the loop's state stays `Running`. An absent slot is not `Idle`, not `ChainSourceUnavailable`, and
+     not a tenth named state — §2.3's set of nine is closed and MUST NOT be added to from here.
+   - `consecutive_cycle_failures` (§2.3) MUST NOT increment on an absent-slot read. The cycle
+     succeeded: it read a real answer.
+   - the absence MUST be dated by an `observed_at` (§2.3) and MUST NOT be presented as a bare zero. A
+     zero accrual with no observation time is §2.4 clause 2's reassuring zero in its claim-side form,
+     and §2.4 clause 1's rule against representing a fact by silence holds identically — a distributor
+     the loop is watching MUST NOT vanish from what the node reports because one slot read came back
+     absent.
+   - §2.4's ban carries: no `eligible`, `claiming`, `entitled`, `healthy`, `ok`, `up` or `running`
+     **boolean** for this, and no pre-computed staleness. The ban is on the boolean, not on §2.3's
+     named state `Running`, which is a different thing under a similar name (§0.2's discipline, applied
+     to a field name).
+
+   **What the shipped wire can and cannot carry.** `dig.listRewardDistributors` (§2.6) answers with
+   `ListRewardDistributorsResult { funded, claimable }` over `RewardDistributorRef { launcher_id,
+   store_id, root }` — three fields and no more (`dig-rpc-protocol` v0.11.0 `src/types.rs:1581-1588`
+   and `:1596-1601`). List membership is therefore the only representation of a watched distributor
+   that wire has, and a reader MUST NOT conclude from a distributor's presence in `claimable` that this
+   peer currently holds an entry slot in it, that anything is accruing to it, or that a claim would
+   succeed. Carrying the dated absence itself to an operator needs a field that wire does not have;
+   adding one is a `dig-rpc-protocol` minor and is **not specified here** — it is named, to be ticketed
+   as hardening, rather than assumed, because §2.6's own history is a section that ordered a
+   presentation no shipped method could feed.
+7. An implementation MUST NOT try to distinguish "never admitted" from "evicted after settlement" from
+   the absent slot alone. It is not derivable — `RemoveEntry` spends the slot and leaves no marker
+   behind (§6.4) — and it does not need to be, because nothing is owed in either case (§6.4 clause 1).
+   A heuristic that guesses which one it was presents a guess as an accounting fact and MUST NOT be
+   built or displayed. A peer that wants its own claim history reads its own past `InitiatePayout`
+   spends, which are on chain and are evidence.
+
+**What clause 1 previously said, and why the correction is recorded.** Clause 1 read:
+
+> A claim loop MUST treat "entry slot absent" as a **terminal, non-error** outcome for that
+> distributor: stop retrying, do not report a chain fault, do not report a lost payment.
+
+Every guarantee after the colon is kept above and was right — no spend, no chain fault, no report of a
+lost payment. The defect is "for that distributor: stop retrying", which admits the reading *never read
+that distributor again*, and under that reading this section contradicted itself twice: clause 2's
+re-entry became unobservable, because a peer that is re-challenged, waits out
+`REENTRY_COOLDOWN_SECONDS` and is legitimately re-admitted then holds a valid entry that its own loop
+would never look at again; and clause 3 became vacuous, because "re-read before every claim" has no
+next claim left to precede.
+
+The correction is stated rather than applied silently because the literal reading was **implemented**.
+DIG-Network/dig-node#594 built a process-lifetime blacklist keyed by launcher id, and it produced two
+reachable states in which a peer earns nothing while reporting nothing wrong: the re-entry path above,
+and a peer blacklisted on its very first cycle for discovering a newly funded distributor before the
+funder's `AddEntry` landed — the ordinary case this section's opening now names. That implementation
+was corrected to re-read every cycle, which left correct code silently diverging from the contract's
+literal words; this amendment removes the divergence on the contract's side rather than leaving code
+and specification to disagree quietly. The contradiction surfaced in
+DIG-Network/dig_ecosystem#3251. §15.4 carries the amendment row.
 
 ### 12.6 Reserve exhausted
 
@@ -1870,6 +1961,7 @@ a later reader can tell a decision from an open item.
 | gap B | `PROVER_CYCLE_PERIOD_SECONDS` was never defined, yet §3.6 derived a time-to-eviction from it | **fixed** — §2.5 defines it at 3_600 and derives both dependent quantities from it; §12.4 also reallocated to the claim loop (§15.1) |
 | A1 | **§2.2 clause 1 contradicted §2.1 and its own clause 3** — "Rewards are distributed only while **this node's** prover runs" is the false half of §2's opening sentence restated as an instruction, and a stronger form of the phrasing §2.2's closing paragraph bans | **fixed** — clause 1 now states that the prover governs *who* is paid, not *whether* anyone is paid, with the withdrawn wording recorded in place; the closing ban widened to any paraphrase making payment conditional on this node; the lead-in count corrected to "all five". Clauses 2-5 unchanged; no constant, default or driver shape changed |
 | A2 | **§2.6 defined three methods, so §7.4 clauses 3 and 5 could not be fed** — clause 5 orders a per-epoch, per-slot clawback presentation and clause 3 orders a destination parsed from the chain's `clawback_ph`, while no §2.6 method returned a commitment slot and §2.3's record carries no slot field | **fixed** — §2.6 gains `dig.listRewardDistributorCommitments` at `Tier::Control`, matching the shipped `dig-rpc-protocol` **v0.11.0** wire field for field, with six normative clauses: the **responder** MUST compute `recoverable_base_units` as `rewards_base_units * withdrawal_share_bps / 10_000` in integer arithmetic in that order, truncated; the echoed `withdrawal_share_bps` and `epoch_seconds` MUST be used rather than compiled-in constants; the chain's `clawback_ph` and the wire's `clawback_puzzle_hash` are stated to be one value; the figure is share arithmetic, never entitlement; an empty list is legitimate. §15.1's `dig-rpc-protocol` line corrected from "the three §2.6 methods"; §14's §2 row and metrics row record the shipped wire; §15.2 records the one implemented exception. No constant, default or driver shape changed |
+| A3 | **§12.5 clause 1 contradicted its own clauses 2 and 3** — "a **terminal, non-error** outcome for that distributor: stop retrying" admits the reading *never read that distributor again*, which makes clause 2's re-entry unobservable and clause 3 vacuous. Implemented literally in DIG-Network/dig-node#594, as a process-lifetime blacklist keyed by launcher id, it produced two reachable states in which a peer earns nothing while reporting nothing wrong: a peer legitimately re-admitted after `REENTRY_COOLDOWN_SECONDS`, and a peer that discovers a newly funded distributor before the funder's `AddEntry` lands — which §15 clause 9a makes the **ordinary** case rather than an edge | **fixed** — clause 1 now scopes "terminal" to the claim **attempt** and keeps every guarantee it had (no spend, no chain fault, no report of a lost payment, because §6.4 clause 1 already settled everything accrued including a sub-threshold remainder); new clause **1a** requires continued observation on §8.6's cadence and states that a slot read is a chain read, not a spend, so §6.3's write bounds do not reach it; clause **4** reconciles this with clause 3 explicitly — an absence MUST NOT be cached any more than a value is; clause **5** bans a permanent per-distributor exclusion set; clause **6** requires the absence be surfaced in the vocabulary §2.3/§2.4 already define, and states what the shipped v0.11.0 `RewardDistributorRef` cannot carry instead of ordering a presentation no wire can feed; clause **7** forbids guessing "never admitted" apart from "evicted after settlement". The heading widened from "A peer claiming after eviction", which pointed a reader looking for the not-yet-added case at no section at all. Clauses 2 and 3 are unchanged, so §15.1's "§12.5 clause 3" allocation still resolves. No constant, default or driver shape changed |
 
 Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
 reason the gate conditions are: a reader must be able to tell a decision from a correction, and a
