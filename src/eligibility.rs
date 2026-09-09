@@ -203,6 +203,10 @@ mod tests {
     struct StubCoin {
         advertises: bool,
         declares_peer: bool,
+
+        /// The one mirror-collateral epoch this coin advertises. A real coin advertises a specific
+        /// ordinal, so asking it about any other must come back `false` rather than panicking.
+        advertised_epoch: u32,
     }
 
     impl StubCoin {
@@ -210,6 +214,7 @@ mod tests {
             Self {
                 advertises: true,
                 declares_peer: true,
+                advertised_epoch: MIRROR_COLLATERAL_EPOCH,
             }
         }
     }
@@ -223,8 +228,7 @@ mod tests {
         ) -> bool {
             assert_eq!(store_launcher_id, STORE);
             assert_eq!(root_hash, ROOT);
-            assert_eq!(mirror_collateral_epoch, MIRROR_COLLATERAL_EPOCH);
-            self.advertises
+            self.advertises && mirror_collateral_epoch == self.advertised_epoch
         }
 
         fn declares_peer(&self, peer_id: Bytes32) -> bool {
@@ -262,7 +266,7 @@ mod tests {
     fn eligibility_advertises_failing_alone_is_ineligible() {
         let coin = StubCoin {
             advertises: false,
-            declares_peer: true,
+            ..StubCoin::all_passing()
         };
         let verdict = judge_candidate(question(), PEER, Some(&coin)).unwrap();
         assert_eq!(verdict, Err(Ineligible::DoesNotAdvertiseGeneration));
@@ -271,8 +275,8 @@ mod tests {
     #[test]
     fn eligibility_declares_peer_failing_alone_is_ineligible() {
         let coin = StubCoin {
-            advertises: true,
             declares_peer: false,
+            ..StubCoin::all_passing()
         };
         let verdict = judge_candidate(question(), PEER, Some(&coin)).unwrap();
         assert_eq!(verdict, Err(Ineligible::DoesNotDeclarePeer));
@@ -280,11 +284,31 @@ mod tests {
 
     #[test]
     fn eligibility_a_different_mirror_collateral_epoch_is_a_different_question() {
-        // The epoch ordinal is part of the question, so the stub's assertion catches a caller that
-        // judged against the wrong census.
-        let mut asked = question();
-        asked.mirror_collateral_epoch = MIRROR_COLLATERAL_EPOCH;
-        assert_eq!(asked, question());
+        // §4.3 clause 1: the mirror-collateral epoch term is free, and its author can solve for a
+        // hint collision, so the ordinal must reach the coin unaltered and decide the verdict. The
+        // stub advertises exactly `MIRROR_COLLATERAL_EPOCH`.
+        let coin = StubCoin::all_passing();
+
+        // Asked about the census the coin does not advertise, a candidate that passes every other
+        // check must still fail closed. Nothing else in the question changes.
+        let wrong_census = EligibilityQuestion {
+            mirror_collateral_epoch: MIRROR_COLLATERAL_EPOCH + 1,
+            ..question()
+        };
+        assert_eq!(
+            judge_candidate(wrong_census, PEER, Some(&coin)).unwrap(),
+            Err(Ineligible::DoesNotAdvertiseGeneration),
+            "a wrong-census question must be ineligible, not eligible on the coin's own answer"
+        );
+
+        // And the refusal is the epoch's doing rather than a blanket one: the same coin, the same
+        // peer and the advertised ordinal is eligible. The pair together is only satisfiable if
+        // `question.mirror_collateral_epoch` is what reaches `advertises`.
+        assert_eq!(
+            judge_candidate(question(), PEER, Some(&coin)).unwrap(),
+            Ok(OWNER_PH),
+            "the advertised census must still be eligible, or the refusal above proves nothing"
+        );
     }
 
     #[test]
