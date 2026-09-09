@@ -13,7 +13,7 @@
 //! That keeps the substitution visible instead of quietly forking the table, and it means no hex
 //! literal for the $DIG asset id appears anywhere here.
 
-use chia_protocol::{Bytes32, Coin, SpendBundle};
+use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_puzzle_types::singleton::{SingletonArgs, SingletonSolution};
 use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
@@ -24,21 +24,30 @@ use chia_sdk_driver::{
     SpendWithConditions, StandardLayer,
 };
 use chia_sdk_test::Simulator;
-use chia_sdk_types::puzzles::{RewardDistributorRewardSlotValue, RewardDistributorSlotNonce};
+use chia_sdk_types::puzzles::{
+    RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
+    RewardDistributorSlotNonce,
+};
 use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
 use clvm_traits::{clvm_quote, ToClvm};
 use clvmr::NodePtr;
+use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
+use dig_rewards_coin::clawback::{
+    clawback_authority, commitment_distributor_epoch_start, withdraw_committed_incentives,
+};
 use dig_rewards_coin::comment::LaunchComment;
 use dig_rewards_coin::constants::{
     dig_distributor_constants, DistributorLaunchTerms, ENTRY_SHARES, MAX_SECONDS_OFFSET,
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
 };
 use dig_rewards_coin::entries::{add_entry, remove_entry, ManagerAuthority};
-use dig_rewards_coin::epoch::{start_next_distributor_epoch, sync_distributor};
+use dig_rewards_coin::epoch::{
+    current_distributor_epoch_end, last_update, start_next_distributor_epoch, sync_distributor,
+};
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
-use dig_rewards_coin::RewardsError;
+use dig_rewards_coin::{read_distributor, RewardsError};
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
 /// so a mainnet-shaped timestamp would mean passing decades of simulated time.
@@ -85,6 +94,96 @@ impl EntrySlotSource for EmptySlotSource {
         _payout_puzzle_hash: Bytes32,
     ) -> Result<Option<Slot<chia_sdk_types::puzzles::RewardDistributorEntrySlotValue>>, RewardsError>
     {
+        Ok(None)
+    }
+}
+
+/// A source that could not answer — a transport failure, not an absence.
+struct UnavailableChainSource;
+
+impl ChainSource for UnavailableChainSource {
+    type Error = String;
+
+    fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        _puzzle_hash: Bytes32,
+        _include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        _parent_coin_id: Bytes32,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        _launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+
+    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+        Err("the peer timed out".to_string())
+    }
+}
+
+/// A source that reliably answers "nothing here" — a genuine absence, not a failure.
+struct NothingSpentChainSource;
+
+impl ChainSource for NothingSpentChainSource {
+    type Error = String;
+
+    fn coin_record(&self, _coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        Ok(None)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        _puzzle_hash: Bytes32,
+        _include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        _parent_coin_id: Bytes32,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        Ok(None)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        _launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        Ok(None)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        Ok(None)
+    }
+
+    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
         Ok(None)
     }
 }
@@ -219,6 +318,12 @@ struct Harness {
     funder: chia_sdk_test::BlsPairWithCoin,
     manager: TestSingleton,
     entry: chia_sdk_test::BlsPairWithCoin,
+
+    /// The commitment slot the most recent [`commit_to_epoch`] created.
+    ///
+    /// Captured by the helper because it can only be derived from the distributor coin being
+    /// spent: re-deriving it later would name a slot coin that never existed.
+    last_commitment_slot: Option<Slot<RewardDistributorCommitmentSlotValue>>,
 }
 
 /// Mint $DIG, launch a manager singleton, build the launch offer, and launch the distributor.
@@ -358,6 +463,7 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         funder,
         manager,
         entry,
+        last_commitment_slot: None,
     })
 }
 
@@ -399,6 +505,18 @@ fn commit_to_epoch(
                 .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
         })
         .collect::<Vec<_>>();
+
+    harness.last_commitment_slot = harness
+        .distributor
+        .pending_spend
+        .created_commitment_slots
+        .first()
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::COMMITMENT)
+        });
 
     harness.distributor = harness
         .distributor
@@ -883,6 +1001,16 @@ fn launch_funded_and_inside_the_first_epoch(
         harness.distributor.info.state.round_time_info.last_update, FIRST_EPOCH_START,
         "the roll set last_update to the epoch it started"
     );
+    assert_eq!(
+        last_update(&harness.distributor),
+        FIRST_EPOCH_START,
+        "the public accessor agrees with the state field it reads"
+    );
+    assert_eq!(
+        current_distributor_epoch_end(&harness.distributor),
+        FIRST_EPOCH_START + TEST_EPOCH_SECONDS,
+        "and the epoch runs one epoch_seconds from its start"
+    );
 
     Ok((harness, reward_slots))
 }
@@ -1035,6 +1163,109 @@ fn the_entry_set_write_window_closes_at_the_end_of_an_epoch() -> anyhow::Result<
     );
 
     Ok(())
+}
+
+/// `SPEC.md` §7.4 clauses 3-5 and §7.5: a clawback is authorized by the commitment slot's own
+/// recorded hash and by nothing else.
+///
+/// Not the manager singleton, not the launcher, not the distributor's operator. The refusal is
+/// made here rather than on chain because the operator pays the network fee for a spend the puzzle
+/// then rejects.
+#[test]
+fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+
+    // Commit to the SECOND epoch: a commitment is withdrawable while its epoch is still in the
+    // future.
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        second_epoch_start,
+        COMMITTED_BASE_UNITS,
+    )?;
+    let commitment_slot = harness
+        .last_commitment_slot
+        .clone()
+        .expect("committing created a commitment slot");
+
+    assert_eq!(
+        clawback_authority(&commitment_slot),
+        harness.funder.puzzle_hash,
+        "the recorded authority is the funder that committed"
+    );
+    assert_eq!(
+        commitment_distributor_epoch_start(&commitment_slot),
+        second_epoch_start,
+        "and the commitment is for the epoch it was committed to"
+    );
+
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    // A stranger is refused before any spend is built.
+    let stranger = Bytes32::new([0x7e; 32]);
+    assert_ne!(stranger, harness.funder.puzzle_hash);
+    let refusal = match withdraw_committed_incentives(
+        ctx,
+        &mut harness.distributor,
+        commitment_slot.clone(),
+        reward_slot.clone(),
+        stranger,
+    ) {
+        Ok(_) => panic!("a stranger must not be able to withdraw the funder's commitment"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(refusal, RewardsError::NotTheClawbackAuthority),
+        "a wrong authority is NotTheClawbackAuthority, got: {refusal}"
+    );
+
+    // The recorded authority succeeds, and the figure returned is the puzzle's own.
+    let clawback = withdraw_committed_incentives(
+        ctx,
+        &mut harness.distributor,
+        commitment_slot,
+        reward_slot,
+        harness.funder.puzzle_hash,
+    )?;
+    assert_eq!(
+        clawback.recovered_base_units,
+        COMMITTED_BASE_UNITS * WITHDRAWAL_SHARE_BPS / 10_000,
+        "§7.5: the funder recovers withdrawal_share_bps of the commitment, and the rest stays \
+         in the reserve"
+    );
+    assert!(
+        clawback.recovered_base_units < COMMITTED_BASE_UNITS,
+        "a clawback is never the whole commitment: the forfeit is the deterrent"
+    );
+
+    Ok(())
+}
+
+/// `SPEC.md` §0.1 clause 2 and §12.1: a read that could not be established fails closed.
+///
+/// The distinction is the whole point of the `ChainSource` contract. "The peer timed out" and
+/// "there is genuinely nothing there" are different answers, and neither may degrade into an empty
+/// distributor — "no entries" and "nothing accrued" are claims about money.
+#[test]
+fn a_chain_source_that_cannot_answer_never_reads_as_an_empty_distributor() {
+    let ctx = &mut SpendContext::new();
+    let launcher_id = Bytes32::new([0x5c; 32]);
+
+    let unanswered = read_distributor(ctx, &UnavailableChainSource, launcher_id);
+    assert!(
+        matches!(unanswered, Err(RewardsError::ChainUnavailable(_))),
+        "a source that could not answer is ChainUnavailable, never an empty snapshot"
+    );
+
+    let absent = read_distributor(ctx, &NothingSpentChainSource, launcher_id);
+    assert!(
+        matches!(absent, Err(RewardsError::Malformed(_))),
+        "an unspent launcher is not a distributor, and is refused rather than returned empty"
+    );
 }
 
 /// Pick the reward slot that covers `epoch_start`: an exact match if one exists, otherwise the
