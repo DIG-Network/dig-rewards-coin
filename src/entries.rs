@@ -5,13 +5,20 @@
 //! rather than by a comment: [`ManagerAuthority`] is a required argument of exactly these two
 //! builders, and no builder outside this module takes one.
 //!
-//! ## An entry-set write cannot be built without its sync
+//! ## An entry-set write cannot be built outside its validity window
 //!
 //! §8.2 clause 1 is a puzzle-level fact: an entry-set write asserts
-//! `ASSERT_BEFORE_SECONDS_ABSOLUTE(last_update + max_second_offset)`, so it is invalid unless the
-//! distributor's `last_update` is fresh. Both builders here therefore emit a `Sync` in the **same
-//! bundle** and return its conditions alongside the manager's. There is no way to use this module
-//! to assemble a bundle the chain will reject and the operator will pay for.
+//! `ASSERT_BEFORE_SECONDS_ABSOLUTE(last_update + max_seconds_offset)`, so it is invalid unless the
+//! distributor's `last_update` is fresh. Both builders here take the caller's current time and
+//! settle that themselves: inside the window the write goes on its own; past the window a `Sync`
+//! rides in the **same bundle** and its conditions come back beside the manager's; and when no
+//! `Sync` could fix it the write is refused with
+//! [`RewardsError::EntrySetWriteWindowClosed`], which names the remedy.
+//!
+//! A `Sync` must move the clock **strictly forward**, so emitting one unconditionally would make a
+//! perfectly valid write impossible. That is why the decision is computed rather than hard-coded.
+//! Either way there is no path through this module that assembles a bundle the chain will reject
+//! and the operator will pay for.
 //!
 //! ## What an entry is keyed by
 //!
@@ -74,14 +81,17 @@ impl ManagerAuthority {
 /// An entry-set write, ready to be delivered.
 ///
 /// Both condition sets belong in the **same** bundle. `manager_conditions` are delivered by the
-/// manager singleton's spend; `sync_conditions` must be asserted by some coin in the bundle, which
-/// is what keeps `last_update` inside `max_second_offset` and the write valid.
+/// manager singleton's spend; `sync_conditions`, when present, must be asserted by some coin in
+/// the bundle, which is what keeps `last_update` inside `max_seconds_offset` and the write valid.
 pub struct EntrySetWrite {
     /// Conditions the manager singleton's spend must carry.
     pub manager_conditions: Conditions,
 
-    /// Conditions from the `Sync` that rides in the same bundle.
-    pub sync_conditions: Conditions,
+    /// Conditions from the `Sync` that rides in the same bundle, when one was needed.
+    ///
+    /// `None` means the write was already inside its validity window, so no `Sync` was emitted and
+    /// none is required.
+    pub sync_conditions: Option<Conditions>,
 }
 
 /// A removal, which also settles what the entry had accrued.
@@ -102,20 +112,22 @@ pub struct EntryRemoval {
 /// Add one eligible mirror to the entry set.
 ///
 /// `payout_puzzle_hash` must be the value [`crate::eligibility::judge_candidate`] returned.
-/// `sync_time_unix_seconds` is the time the accompanying `Sync` asserts.
+/// `now_unix_seconds` is the caller's current time, from which the validity window is settled.
 ///
 /// # Errors
 ///
 /// - [`RewardsError::EntrySetFull`] if the distributor already holds
 ///   [`MAX_ENTRIES_PER_DISTRIBUTOR`] entries. A named refusal, never a silent stop (§15 clause 7).
 /// - [`RewardsError::InvalidLaunchTerms`] if `payout_puzzle_hash` is the zero hash.
+/// - [`RewardsError::EntrySetWriteWindowClosed`] if no `Sync` could bring the write inside its
+///   window, because the distributor's epoch has ended.
 /// - [`RewardsError::Driver`] if either upstream action could not be built.
 pub fn add_entry(
     ctx: &mut SpendContext,
     distributor: &mut RewardDistributor,
     authority: ManagerAuthority,
     payout_puzzle_hash: Bytes32,
-    sync_time_unix_seconds: u64,
+    now_unix_seconds: u64,
 ) -> Result<EntrySetWrite, RewardsError> {
     if payout_puzzle_hash == Bytes32::default() {
         return Err(RewardsError::InvalidLaunchTerms(
@@ -130,9 +142,9 @@ pub fn add_entry(
         });
     }
 
-    // The sync goes first so that the entry-set write it protects is built against the state the
-    // sync just established.
-    let sync_conditions = sync_in_same_bundle(ctx, distributor, sync_time_unix_seconds)?;
+    // The sync, when one is needed, goes first so that the entry-set write it protects is built
+    // against the state the sync just established.
+    let sync_conditions = sync_if_the_window_needs_it(ctx, distributor, now_unix_seconds)?;
 
     let manager_conditions = distributor
         .new_action::<RewardDistributorAddEntryAction>()
@@ -157,15 +169,17 @@ pub fn add_entry(
 ///
 /// # Errors
 ///
-/// [`RewardsError::Driver`] if either upstream action could not be built.
+/// - [`RewardsError::EntrySetWriteWindowClosed`] if no `Sync` could bring the write inside its
+///   window.
+/// - [`RewardsError::Driver`] if either upstream action could not be built.
 pub fn remove_entry(
     ctx: &mut SpendContext,
     distributor: &mut RewardDistributor,
     authority: ManagerAuthority,
     entry_slot: Slot<RewardDistributorEntrySlotValue>,
-    sync_time_unix_seconds: u64,
+    now_unix_seconds: u64,
 ) -> Result<EntryRemoval, RewardsError> {
-    let sync_conditions = sync_in_same_bundle(ctx, distributor, sync_time_unix_seconds)?;
+    let sync_conditions = sync_if_the_window_needs_it(ctx, distributor, now_unix_seconds)?;
 
     let (manager_conditions, settled_base_units) = distributor
         .new_action::<RewardDistributorRemoveEntryAction>()
@@ -190,17 +204,43 @@ pub fn entry_count(distributor: &RewardDistributor) -> u64 {
     distributor.pending_spend.latest_state.1.active_shares / ENTRY_SHARES
 }
 
-/// Emit the `Sync` that an entry-set write is invalid without.
-fn sync_in_same_bundle(
+/// Emit a `Sync` only if the entry-set write would otherwise fall outside its validity window.
+///
+/// The window closes at `last_update + max_seconds_offset`, because the write asserts
+/// `ASSERT_BEFORE_SECONDS_ABSOLUTE` of that moment. A `Sync` can only move `last_update` strictly
+/// forward and never past the current epoch's end, so once `last_update` has reached `epoch_end`
+/// there is no sync to emit and the epoch has to be rolled first.
+fn sync_if_the_window_needs_it(
     ctx: &mut SpendContext,
     distributor: &mut RewardDistributor,
-    sync_time_unix_seconds: u64,
-) -> Result<Conditions, RewardsError> {
+    now_unix_seconds: u64,
+) -> Result<Option<Conditions>, RewardsError> {
+    let state = distributor.pending_spend.latest_state.1;
+    let last_update = state.round_time_info.last_update;
+    let epoch_end = state.round_time_info.epoch_end;
+    let window_closes_at =
+        last_update.saturating_add(distributor.info.constants.max_seconds_offset);
+
+    if now_unix_seconds < window_closes_at {
+        return Ok(None);
+    }
+
+    // Sync as far as the caller's clock allows, but never past the epoch the puzzle is in.
+    let sync_to = now_unix_seconds.min(epoch_end);
+
+    if sync_to <= last_update {
+        return Err(RewardsError::EntrySetWriteWindowClosed {
+            last_update,
+            epoch_end,
+            now_unix_seconds,
+        });
+    }
+
     let conditions = distributor
         .new_action::<RewardDistributorSyncAction>()
-        .spend(ctx, distributor, sync_time_unix_seconds)?;
+        .spend(ctx, distributor, sync_to)?;
 
-    Ok(conditions)
+    Ok(Some(conditions))
 }
 
 #[cfg(test)]

@@ -121,7 +121,8 @@ const MAX_GENERATIONS_PER_READ: usize = 100_000;
 /// # Errors
 ///
 /// - [`RewardsError::ChainUnavailable`] if any read could not be answered, or if the walk exceeded
-///   [`MAX_GENERATIONS_PER_READ`] generations.
+///   its `MAX_GENERATIONS_PER_READ` bound. Named rather than linked, and not restated as a number:
+///   the constant is private, so an intra-doc link to it renders broken in the public docs.
 /// - [`RewardsError::Malformed`] if the launcher exists but is not a reward distributor launcher, or
 ///   if a spend along the chain could not be interpreted as one.
 /// - [`RewardsError::Driver`] if the upstream parser rejected the launcher's curried constants.

@@ -58,6 +58,15 @@ pub struct LaunchedDistributor {
 ///   future. A distributor whose first epoch has already begun cannot have that epoch started, so
 ///   its reserve accrues to nobody.
 /// - [`RewardsError::Driver`] if the upstream launch spend could not be built.
+//
+// Eight arguments, one over clippy's default. Every one is load-bearing and distinctly typed, so
+// the count is not the readability problem the lint is aimed at. It is suppressed rather than
+// worked around because the honest fix is a shape change this crate should make deliberately:
+// `funder_refund_puzzle_hash` is redundant with `constants.fee_payout_puzzle_hash` (SPEC.md §15
+// clause 3 requires them to be the same value, and nothing here enforces the agreement), so
+// dropping it would take this to seven AND remove a two-sources-of-truth hazard about where the
+// change CAT goes. That is a public-API decision, not a lint fix.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_dig_distributor(
     ctx: &mut SpendContext,
     offer: &Offer,
