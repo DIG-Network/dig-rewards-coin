@@ -46,7 +46,7 @@ use dig_rewards_coin::epoch::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
-use dig_rewards_coin::RewardsError;
+use dig_rewards_coin::{DistributorSlots, DistributorSnapshot, RewardsError};
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
 /// so a mainnet-shaped timestamp would mean passing decades of simulated time.
@@ -542,6 +542,51 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
     harness.manager.proof = next_manager_proof;
 
     assert_eq!(harness.distributor.info.state.active_shares, ENTRY_SHARES);
+
+    // The state shape 0.2.0 does publish, exercised on a real distributor. `read_distributor` is
+    // withheld pending #3267, so a caller assembles the snapshot from what it already holds —
+    // which is exactly what this does, and the accessors have to work under that use.
+    let snapshot = DistributorSnapshot {
+        distributor: harness.distributor.clone(),
+        slots: DistributorSlots {
+            entries: vec![entry_slot_value],
+            commitments: vec![],
+            // Deliberately out of order, so the accessor's sort is what produces the ordering
+            // asserted below rather than the order they were pushed in.
+            rewards: vec![
+                RewardDistributorRewardSlotValue {
+                    counter: 0,
+                    epoch_start: FIRST_EPOCH_START + TEST_EPOCH_SECONDS,
+                    next_epoch_initialized: false,
+                    rewards: 17,
+                },
+                harness.first_epoch_slot.info.value,
+            ],
+        },
+    };
+
+    assert_eq!(snapshot.entry_count(), 1);
+    assert_eq!(
+        snapshot.payout_puzzle_hashes(),
+        vec![harness.entry.puzzle_hash],
+        "the entry set is reported as payout puzzle hashes, never peer identities (§10.2)"
+    );
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "the reserve figure is the puzzle's own balance, not a recomputation"
+    );
+    assert_eq!(
+        snapshot.rewards_per_distributor_epoch(),
+        vec![
+            (
+                harness.first_epoch_slot.info.value.epoch_start,
+                harness.first_epoch_slot.info.value.rewards
+            ),
+            (FIRST_EPOCH_START + TEST_EPOCH_SECONDS, 17),
+        ],
+        "sorted by epoch start, with the figures taken from the reward slots unchanged"
+    );
 
     // Roll into the first epoch, which is what makes the commitment start accruing.
     harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
