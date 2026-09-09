@@ -512,7 +512,6 @@ fn the_test_table_differs_only_in_the_asset_id() {
     let terms = DistributorLaunchTerms {
         manager_singleton_launcher_id: manager,
         distributor_epoch_seconds: TEST_EPOCH_SECONDS,
-        first_epoch_start: FIRST_EPOCH_START,
     };
     let dig = dig_distributor_constants(terms, refund).expect("valid terms");
     let simulated = test_constants(manager, refund, simulated_asset);

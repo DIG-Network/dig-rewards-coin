@@ -7,13 +7,15 @@
 //! puzzle hashes are *derived* from the launcher id and the asset id, so setting either by hand
 //! produces a distributor whose reserve nobody can spend.
 //!
-//! ## The three launch-time-only choices live in the type
+//! ## The three launch-time-only choices live in the type and function
 //!
-//! `epoch_seconds`, `first_epoch_start` and the manager singleton are curried into the action
-//! puzzles at launch and are immutable for the distributor's whole life (§8.1). They are therefore
-//! required fields of [`DistributorLaunchTerms`], which deliberately has **no `Default` impl**: a
-//! creation surface can only offer a choice this API forces it to supply. The DIG defaults are
-//! published as the named constants below so a caller opts into them explicitly.
+//! `epoch_seconds` and the manager singleton are curried into the action puzzles at launch and are
+//! immutable for the distributor's whole life (§8.1). They are therefore required fields of
+//! [`DistributorLaunchTerms`], which deliberately has **no `Default` impl**: a creation surface
+//! can only offer a choice this API forces it to supply. `first_epoch_start` is the third
+//! launch-time-only choice and is a required parameter of [`launch_dig_distributor`](crate::launch::launch_dig_distributor).
+//! All three are explicit with no default. The DIG defaults for `epoch_seconds` and
+//! `first_epoch_start` are published as named constants below so a caller opts into them explicitly.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{RewardDistributorConstants, RewardDistributorType};
@@ -72,11 +74,12 @@ const ACCUMULATOR_PRECISION: u64 = u64::MAX;
 /// The largest representable basis-point denominator; the puzzle divides by it itself.
 const BPS_DENOMINATOR: u64 = 10_000;
 
-/// The three choices that can only ever be made at launch, because they are curried into the action
-/// puzzles and immutable afterwards (`SPEC.md` §8.1, §15 clause 3a).
+/// Two of the three launch-time-only choices, because they are curried into the action puzzles and
+/// immutable afterwards (`SPEC.md` §8.1, §15 clause 3a). The third choice, `first_epoch_start`, is
+/// a required parameter of [`launch_dig_distributor`](crate::launch::launch_dig_distributor).
 ///
 /// There is intentionally no `Default` impl. A creation surface can only offer a choice this type
-/// forces it to supply, and each of these three is a decision no library should make silently on a
+/// forces it to supply, and each of these choices is a decision no library should make silently on a
 /// funder's behalf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistributorLaunchTerms {
@@ -91,10 +94,6 @@ pub struct DistributorLaunchTerms {
     /// value; it MUST NOT be derived from the mirror-collateral calendar or from `dig-epoch`
     /// (§0.3).
     pub distributor_epoch_seconds: u64,
-
-    /// Unix seconds at which the first distributor epoch begins. Must be in the future at launch
-    /// (§8.5 clause 1); [`FIRST_EPOCH_START_LEAD_SECONDS`] is a reasonable lead.
-    pub first_epoch_start: u64,
 }
 
 /// The DIG constants table for a rewards distributor, with a zero epoch fee.
@@ -234,7 +233,6 @@ mod tests {
         DistributorLaunchTerms {
             manager_singleton_launcher_id: Bytes32::new([7; 32]),
             distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
-            first_epoch_start: 1_800_000_000,
         }
     }
 

@@ -166,7 +166,6 @@ mod tests {
             DistributorLaunchTerms {
                 manager_singleton_launcher_id: Bytes32::new([7; 32]),
                 distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
-                first_epoch_start: 1_800_000_000,
             },
             refund_hash,
         )

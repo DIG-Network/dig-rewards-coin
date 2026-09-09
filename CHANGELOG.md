@@ -52,12 +52,13 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   `DistributorSnapshot` and its accessors stay public — they work, and they are useful to any caller
   holding a `RewardDistributor` obtained another way, including straight out of a launch.
 - `launch_dig_distributor` takes `first_epoch_start: u64` rather than a whole
-  `DistributorLaunchTerms`. Two of the terms — the manager singleton launcher id and
-  `distributor_epoch_seconds` — are already curried into `constants`, which is what the launch
-  spend reads, so the `terms` argument carried a second copy that was silently ignored and a caller
-  could pass terms disagreeing with the constants. `DistributorLaunchTerms` is unchanged as the
-  required-fields input to `dig_distributor_constants`, where the three launch-time choices are
-  made once. `first_epoch_start` is the one launch value the constants table does not hold.
+  `DistributorLaunchTerms`. Two of the launch-time-only choices — the manager singleton launcher id and
+  `distributor_epoch_seconds` — are required fields of `DistributorLaunchTerms` and curried into
+  `constants` via `dig_distributor_constants`; the third, `first_epoch_start`, is a required parameter
+  of `launch_dig_distributor`. All three are explicit with no `Default` impl. An earlier design passed
+  the `terms` argument to the launch function too, which carried a second copy of the two already in
+  `constants`, the launch spend silently ignored both, and a caller could pass terms disagreeing with
+  the constants. `first_epoch_start` is the one launch value the constants table does not and should not hold.
 - `launch_dig_distributor` no longer takes a `funder_refund_puzzle_hash` parameter. The CAT change
   destination is now derived from `constants.fee_payout_puzzle_hash` through the single
   `funder_refund_puzzle_hash(constants)` accessor, so SPEC.md §15 clause 3's requirement that the
