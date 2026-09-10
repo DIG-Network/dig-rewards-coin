@@ -294,6 +294,16 @@ fn commit_then_clawback(
 
     Ok(clawback.recovered_base_units)
 }
+/// The largest commitment upstream can pay a share of at all: one more base unit and
+/// `rewards * 9_000` (`withdraw_incentives.rs:105`) no longer fits in a `u64`.
+///
+/// Spelled as a literal rather than computed, so this fixture cannot agree with
+/// [`recoverable_base_units`] by sharing its arithmetic; the premise is checked below instead.
+const LARGEST_PAYABLE_COMMITMENT: u64 = 2_049_638_230_412_172;
+
+/// Funding headroom above the commitment, so the funder's CAT has a non-zero change output.
+const FUNDING_HEADROOM: u64 = 1_000;
+
 /// One in-range case: commit `rewards_base_units`, claw it back, and require both that the puzzle
 /// paid `expected_paid` and that [`recoverable_base_units`] returns the same figure.
 fn assert_matches_a_real_clawback(
@@ -302,7 +312,7 @@ fn assert_matches_a_real_clawback(
 ) -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
     let (mut sim, distributor, first_epoch_slot, source_cat, funder) =
-        launch_harness(ctx, 1_000_000)?;
+        launch_harness(ctx, rewards_base_units + FUNDING_HEADROOM)?;
 
     let paid = commit_then_clawback(
         ctx,
@@ -330,11 +340,19 @@ fn assert_matches_a_real_clawback(
     Ok(())
 }
 
-/// Equality with the real paid amount, for amounts inside the range where upstream is defined.
+/// Equality with the real paid amount, across the range where upstream is defined — including its
+/// last base unit.
 ///
-/// Both cases truncate — `1_001 @ 9_000 bps` is `900.9` and `7_777 @ 9_000 bps` is `6_999.3` — so
-/// neither would pass under a rounding bug, and neither would pass if the restatement divided
-/// before it multiplied (`1_001 / 10_000` is `0`).
+/// Every case truncates — `1_001 @ 9_000 bps` is `900.9`, `7_777` is `6_999.3` and the bound case
+/// is `…954.8` — so none would pass under a rounding bug, and none would pass if the restatement
+/// divided before it multiplied (`1_001 / 10_000` is `0`).
+///
+/// The third case sits exactly at [`LARGEST_PAYABLE_COMMITMENT`], the bound
+/// `src/clawback.rs` documents. A documented boundary that no test touches is a claim rather than
+/// a proof, so this pins it: equality holds at the very last amount a real clawback can pay on,
+/// and one base unit further up
+/// (`recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would`) upstream stops
+/// having an answer at all.
 #[test]
 fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Result<()> {
     assert_eq!(
@@ -342,8 +360,18 @@ fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Re
         "the fixture assumes the crate's own launch bps"
     );
 
+    // The bound's premise, checked rather than assumed: this is the last commitment whose
+    // `rewards * 9_000` fits in a u64, and the next one is not.
+    assert!(LARGEST_PAYABLE_COMMITMENT
+        .checked_mul(WITHDRAWAL_SHARE_BPS)
+        .is_some());
+    assert!((LARGEST_PAYABLE_COMMITMENT + 1)
+        .checked_mul(WITHDRAWAL_SHARE_BPS)
+        .is_none());
+
     assert_matches_a_real_clawback(1_001, 900)?;
     assert_matches_a_real_clawback(7_777, 6_999)?;
+    assert_matches_a_real_clawback(LARGEST_PAYABLE_COMMITMENT, 1_844_674_407_370_954)?;
 
     Ok(())
 }

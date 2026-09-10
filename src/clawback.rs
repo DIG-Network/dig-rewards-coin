@@ -79,9 +79,10 @@ pub fn commitment_distributor_epoch_start(
 /// # Where this equals what the puzzle pays — and where nothing does
 ///
 /// The simulator equality proof holds for
-/// `rewards_base_units <= u64::MAX / withdrawal_share_bps`: about `2.05e15` base units at this
-/// crate's own 9_000 bps. That bound is not a test limitation, it is the whole range in which
-/// upstream is defined. Its `rewards * withdrawal_share_bps` (`withdraw_incentives.rs:105-107`)
+/// `rewards_base_units <= u64::MAX / withdrawal_share_bps`: `2_049_638_230_412_172` base units at
+/// this crate's own 9_000 bps, and a simulator case sits on exactly that last base unit, so the
+/// bound is pinned rather than merely asserted here. It is not a test limitation, it is the whole
+/// range in which upstream is defined. Its `rewards * withdrawal_share_bps` (`withdraw_incentives.rs:105-107`)
 /// is a plain `u64` multiply, so above the bound a real clawback panics under overflow checks and
 /// silently wraps without them. There is no amount it *should* have paid for this function to be
 /// equal to, which is why the overflow-scale test asserts arithmetic only and claims nothing
