@@ -22,13 +22,17 @@ use chia_sdk_driver::{
     SpendWithConditions, StandardLayer,
 };
 use chia_sdk_test::Simulator;
-use chia_sdk_types::puzzles::{RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue};
+use chia_sdk_types::puzzles::{
+    RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
+};
 use chia_sdk_types::{Conditions, TESTNET11_CONSTANTS};
 use clvm_traits::{clvm_quote, ToClvm};
 use clvmr::NodePtr;
 use dig_rewards_coin::clawback::withdraw_committed_incentives;
 use dig_rewards_coin::comment::LaunchComment;
-use dig_rewards_coin::constants::{MAX_SECONDS_OFFSET, PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS};
+use dig_rewards_coin::constants::{
+    MAX_SECONDS_OFFSET, PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
+};
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::recoverable_base_units;
@@ -44,7 +48,10 @@ struct TestSingleton {
     launcher_id: Bytes32,
 }
 
-fn launch_test_singleton(ctx: &mut SpendContext, sim: &mut Simulator) -> anyhow::Result<TestSingleton> {
+fn launch_test_singleton(
+    ctx: &mut SpendContext,
+    sim: &mut Simulator,
+) -> anyhow::Result<TestSingleton> {
     let launcher_coin = sim.new_coin(SINGLETON_LAUNCHER_HASH.into(), 1);
     let launcher = Launcher::new(launcher_coin.parent_coin_info, 1);
     let launcher_id = launcher.coin().coin_id();
@@ -176,7 +183,11 @@ fn launch_harness(
         },
     )?;
 
-    let constants = test_constants(manager.launcher_id, funder.puzzle_hash, source_cat.info.asset_id);
+    let constants = test_constants(
+        manager.launcher_id,
+        funder.puzzle_hash,
+        source_cat.info.asset_id,
+    );
     let launched = launch_dig_distributor(
         ctx,
         &offer,
@@ -239,7 +250,12 @@ fn commit_then_clawback(
         .pending_spend
         .created_reward_slots
         .iter()
-        .map(|value| distributor.created_slot_value_to_slot(*value, chia_sdk_types::puzzles::RewardDistributorSlotNonce::REWARD))
+        .map(|value| {
+            distributor.created_slot_value_to_slot(
+                *value,
+                chia_sdk_types::puzzles::RewardDistributorSlotNonce::REWARD,
+            )
+        })
         .collect();
 
     let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = distributor
@@ -247,7 +263,12 @@ fn commit_then_clawback(
         .created_commitment_slots
         .first()
         .copied()
-        .map(|value| distributor.created_slot_value_to_slot(value, chia_sdk_types::puzzles::RewardDistributorSlotNonce::COMMITMENT))
+        .map(|value| {
+            distributor.created_slot_value_to_slot(
+                value,
+                chia_sdk_types::puzzles::RewardDistributorSlotNonce::COMMITMENT,
+            )
+        })
         .expect("committing created a commitment slot");
 
     let (distributor, _) = distributor.finish_spend(ctx, vec![source_cat_spend])?;
@@ -275,10 +296,14 @@ fn commit_then_clawback(
 #[test]
 fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
-    let (mut sim, distributor, first_epoch_slot, source_cat, funder) = launch_harness(ctx, 1_000_000)?;
+    let (mut sim, distributor, first_epoch_slot, source_cat, funder) =
+        launch_harness(ctx, 1_000_000)?;
 
     const REWARDS: u64 = 1_001;
-    assert_eq!(WITHDRAWAL_SHARE_BPS, 9_000, "the fixture assumes the crate's own launch bps");
+    assert_eq!(
+        WITHDRAWAL_SHARE_BPS, 9_000,
+        "the fixture assumes the crate's own launch bps"
+    );
 
     let paid = commit_then_clawback(
         ctx,
@@ -290,7 +315,10 @@ fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::
         REWARDS,
     )?;
 
-    assert_eq!(paid, 900, "the puzzle truncates 1_001 * 9_000 / 10_000 = 900.9 down to 900");
+    assert_eq!(
+        paid, 900,
+        "the puzzle truncates 1_001 * 9_000 / 10_000 = 900.9 down to 900"
+    );
     assert_eq!(
         recoverable_base_units(REWARDS, u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()),
         paid,
@@ -300,34 +328,30 @@ fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::
     Ok(())
 }
 
-/// A commitment large enough that `rewards_base_units * withdrawal_share_bps` overflows a u64
+/// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain u64
 /// multiply (`2_000_000_000_000_000_000 * 9_000` is roughly `1.8e22`, far past `u64::MAX`'s
 /// `~1.8e19`), proving the u128 intermediate in `recoverable_base_units` is load-bearing and not
 /// merely defensive.
+///
+/// This is deliberately **not** driven through a real clawback spend: at this scale the puzzle's
+/// own `withdrawal_share` line (`withdraw_incentives.rs:105`) panics on the same u64 overflow —
+/// verified by first running this case through `commit_then_clawback` and watching it panic
+/// exactly there (see the mutation-probe report). That panic is itself the proof the u128
+/// intermediate matters: production code calling the real SDK at this scale would already be
+/// broken, and `recoverable_base_units` must not import that ceiling into a function whose caller
+/// (`dig.listRewardDistributorCommitments`) has no such bound of its own.
 #[test]
-fn recoverable_base_units_matches_a_real_clawback_at_overflow_scale() -> anyhow::Result<()> {
+fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
     const REWARDS: u64 = 2_000_000_000_000_000_000;
+    const BPS: u16 = 9_000;
 
-    let ctx = &mut SpendContext::new();
-    let (mut sim, distributor, first_epoch_slot, source_cat, funder) = launch_harness(ctx, REWARDS)?;
+    // The expected value, computed independently in u128 so this assertion does not simply
+    // restate the function under test.
+    let expected = u64::try_from(u128::from(REWARDS) * u128::from(BPS) / 10_000)
+        .expect("fits back in u64: the quotient never exceeds rewards_base_units");
 
-    assert_eq!(WITHDRAWAL_SHARE_BPS, 9_000, "the fixture assumes the crate's own launch bps");
+    assert_eq!(recoverable_base_units(REWARDS, BPS), expected);
 
-    let paid = commit_then_clawback(
-        ctx,
-        &mut sim,
-        distributor,
-        first_epoch_slot,
-        source_cat,
-        &funder,
-        REWARDS,
-    )?;
-
-    assert_eq!(
-        recoverable_base_units(REWARDS, u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()),
-        paid,
-        "a u64-multiply implementation would have wrapped instead of matching the puzzle here"
-    );
-
-    Ok(())
+    // Sanity check the overflow premise: `REWARDS * (BPS as u64)` alone cannot fit in a u64.
+    assert!(REWARDS.checked_mul(u64::from(BPS)).is_none());
 }
