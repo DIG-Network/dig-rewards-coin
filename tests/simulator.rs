@@ -1651,6 +1651,108 @@ fn a_snapshot_from_before_a_write_is_not_current() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The `MockChainSource` fixtures above only ever answer with coins the test enumerated, so the
+// eve-reserve selector's decoy-rejection and ambiguity branches (`state.rs`'s
+// `find_eve_reserve_provenance`) are never exercised by a round trip alone. These two tests inject
+// synthetic candidates directly at the real `reserve_full_puzzle_hash`, on top of a genuine launch,
+// to drive those branches deliberately.
+#[test]
+fn a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_selector(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    // A decoy sitting at the SAME puzzle hash, funded (amount != 0), so it is never a candidate --
+    // an attacker cannot buy their way into the selection by parking a paid coin at this hash.
+    let decoy = Coin::new(Bytes32::new([0x77; 32]), reserve_full_puzzle_hash, 999);
+    let chain = chain.with_coin(
+        decoy.coin_id(),
+        dig_chainsource_interface::CoinRecord {
+            coin: decoy,
+            confirmed_height: Some(0),
+            spent_height: None,
+            timestamp: None,
+            coinbase: false,
+        },
+    );
+
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "a funded decoy at the reserve puzzle hash must never be picked -- the real, zero-amount \
+         eve-era candidate must still be the one authenticated"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyhow::Result<()> {
+    use dig_chainsource_interface::ChainSource;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    let real_candidate = chain
+        .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
+        .expect("mock reads never fail")
+        .into_iter()
+        .find(|record| record.coin.amount == 0)
+        .expect("the genuine eve-era reserve candidate is loaded");
+
+    // A second, distinct coin at the identical puzzle hash, also zero-amount, confirmed at the
+    // identical height -- the selector has no principled way to prefer one over the other, so it
+    // must refuse rather than pick arbitrarily.
+    let twin = Coin::new(Bytes32::new([0x88; 32]), reserve_full_puzzle_hash, 0);
+    let chain = chain.with_coin(
+        twin.coin_id(),
+        dig_chainsource_interface::CoinRecord {
+            coin: twin,
+            confirmed_height: real_candidate.confirmed_height,
+            spent_height: None,
+            timestamp: None,
+            coinbase: false,
+        },
+    );
+
+    let result = read_distributor(&chain, launcher_id);
+    assert!(
+        matches!(result, Err(RewardsError::Malformed(_))),
+        "two zero-amount candidates at the same lowest height must never be resolved by picking \
+         either one; got {result:?}"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // `read_distributor` error paths, over a bare `MockChainSource` -- no simulator, since these
 // are about what `read_distributor` does with an incomplete or hostile answer, not about
