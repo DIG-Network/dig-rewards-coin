@@ -1393,7 +1393,6 @@ fn merge_reward_slots(
     merged
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // `read_distributor` (#3267) -- rebuilding a snapshot from the chain alone.
 //
@@ -1417,7 +1416,23 @@ fn mock_chain_source(
 
     let mut source = dig_chainsource_interface::MockChainSource::new();
 
-    for &id in singleton_members.iter().chain(extra_coin_ids) {
+    // The eve coin itself is never `harness.distributor.coin` at any point the test observes --
+    // by the time `launch_harness` returns, the launch bundle has already spent it to produce
+    // the first post-eve generation. `read_distributor` needs the SPEND that consumed it (what
+    // `from_eve_coin_spend` parses), so it must be loaded even though no `singleton_members`
+    // entry names it.
+    let eve_coin_id = sim
+        .children(launcher_id)
+        .first()
+        .map(|state| state.coin.coin_id());
+
+    let ids = singleton_members
+        .iter()
+        .copied()
+        .chain(extra_coin_ids.iter().copied())
+        .chain(eve_coin_id);
+
+    for id in ids {
         if let Some(state) = sim.coin_state(id) {
             source = source.with_coin(
                 id,

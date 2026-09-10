@@ -44,11 +44,16 @@ fn locked_versions(lock: &str) -> HashMap<&str, Vec<&str>> {
 
     for line in lock.lines() {
         let line = line.trim();
-        if let Some(name) = line.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')) {
+        if let Some(name) = line
+            .strip_prefix("name = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
             current_name = Some(name);
             continue;
         }
-        if let Some(version) = line.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"'))
+        if let Some(version) = line
+            .strip_prefix("version = \"")
+            .and_then(|s| s.strip_suffix('"'))
         {
             if let Some(name) = current_name.take() {
                 versions.entry(name).or_default().push(version);

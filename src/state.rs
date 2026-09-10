@@ -178,11 +178,7 @@ impl DistributorSnapshot {
         };
 
         self.reserve_base_units() > 0
-            && self
-                .observed
-                .peak_timestamp
-                .saturating_sub(last_write)
-                >= STALE_ENTRY_SET_SECONDS
+            && self.observed.peak_timestamp.saturating_sub(last_write) >= STALE_ENTRY_SET_SECONDS
     }
 
     /// Whether the entry set is frozen for this distributor's LIFE: the `Managed` manager
@@ -266,10 +262,7 @@ pub fn read_distributor(
         return Ok(None);
     }
 
-    let Some(launcher_spend) = source
-        .coin_spend(launcher_id)
-        .map_err(chain_unavailable)?
-    else {
+    let Some(launcher_spend) = source.coin_spend(launcher_id).map_err(chain_unavailable)? else {
         return Err(malformed(
             "launcher coin is recorded but has no recorded spend",
         ));
@@ -349,7 +342,9 @@ pub fn read_distributor(
         )
         .map_err(RewardsError::from)?
         else {
-            return Err(malformed("a spend mid-walk did not parse as this distributor"));
+            return Err(malformed(
+                "a spend mid-walk did not parse as this distributor",
+            ));
         };
 
         let entry_write_happened = !reconstructed.pending_spend.created_entry_slots.is_empty()
@@ -470,9 +465,13 @@ fn find_eve_reserve_provenance(
         ));
     };
 
-    let parent_puzzle_ptr = ctx.alloc(&parent_spend.puzzle_reveal).map_err(RewardsError::from)?;
+    let parent_puzzle_ptr = ctx
+        .alloc(&parent_spend.puzzle_reveal)
+        .map_err(RewardsError::from)?;
     let parent_puzzle = chia_sdk_driver::Puzzle::parse(ctx, parent_puzzle_ptr);
-    let parent_solution_ptr = ctx.alloc(&parent_spend.solution).map_err(RewardsError::from)?;
+    let parent_solution_ptr = ctx
+        .alloc(&parent_spend.solution)
+        .map_err(RewardsError::from)?;
 
     let children = chia_sdk_driver::Cat::parse_children(
         ctx,
@@ -481,9 +480,7 @@ fn find_eve_reserve_provenance(
         parent_solution_ptr,
     )
     .map_err(RewardsError::from)?
-    .ok_or_else(|| {
-        malformed("eve-era reserve candidate's parent spend is not a CAT spend")
-    })?;
+    .ok_or_else(|| malformed("eve-era reserve candidate's parent spend is not a CAT spend"))?;
 
     let authenticated = children
         .into_iter()
