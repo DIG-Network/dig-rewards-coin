@@ -304,8 +304,10 @@ const LARGEST_PAYABLE_COMMITMENT: u64 = 2_049_638_230_412_172;
 /// Funding headroom above the commitment, so the funder's CAT has a non-zero change output.
 const FUNDING_HEADROOM: u64 = 1_000;
 
-/// One in-range case: commit `rewards_base_units`, claw it back, and require both that the puzzle
-/// paid `expected_paid` and that [`recoverable_base_units`] returns the same figure.
+/// One in-range case: commit `rewards_base_units`, claw it back, build the clawback spend (but do not
+/// submit it), and require both that the driver's figure `expected_paid` and [`recoverable_base_units`]
+/// return the same value. The clawback is built but never executed on-chain, so the equality holds against
+/// the driver's computed figure rather than an observed puzzle output.
 fn assert_matches_a_real_clawback(
     rewards_base_units: u64,
     expected_paid: u64,
@@ -334,7 +336,7 @@ fn assert_matches_a_real_clawback(
             u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
         ),
         Some(paid),
-        "recoverable_base_units must equal what the puzzle actually paid"
+        "recoverable_base_units must equal the driver's returned figure"
     );
 
     Ok(())

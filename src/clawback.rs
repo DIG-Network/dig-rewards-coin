@@ -18,8 +18,8 @@
 //! (`withdraw_incentives.rs:105-107`) by a simulator equality test, so a future upstream drift
 //! arrives as a red build rather than a silent mismatch. §0.1 clause 1 forbids an *untested* copy
 //! scattered into a consumer that can drift unnoticed; a single tested restatement, kept here in
-//! the crate that owns the domain and proven equal to what the puzzle actually pays for every
-//! amount the puzzle can pay on, is not that drift — it is the fix for it. [`withdraw_committed_incentives`]
+//! the crate that owns the domain and proven equal to `chia-sdk-driver` 0.36.0's returned figure
+//! at `withdraw_incentives.rs:105-107` for every amount the driver can pay on, is not that drift — it is the fix for it. [`withdraw_committed_incentives`]
 //! itself still returns the puzzle's own figure, never a recomputation:
 //! [`recoverable_base_units`] exists so a caller (such as `dig.listRewardDistributorCommitments`)
 //! can preview the amount *before* paying for a spend.
