@@ -1698,6 +1698,22 @@ fn a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_select
          eve-era candidate must still be the one authenticated"
     );
 
+    // `harness.distributor.coin` is still unspent at this point (no generation past eve has been
+    // driven), so `snapshot.distributor.reserve.proof` is the eve authentication's OWN proof,
+    // un-healed by any later `.child()` call -- this is the one place in the walk where a landmine
+    // at steps 4-5 (skipping `find_eve_reserve_provenance`'s authentication) would actually surface
+    // in the returned snapshot, rather than being masked by a subsequent generation's re-derivation.
+    let zero_lineage_proof = chia_puzzle_types::LineageProof {
+        parent_parent_coin_info: Bytes32::default(),
+        parent_inner_puzzle_hash: Bytes32::default(),
+        parent_amount: 0,
+    };
+    assert_ne!(
+        snapshot.distributor.reserve.proof, zero_lineage_proof,
+        "REVERT-PROOF: an unauthenticated (zero) eve-reserve proof must never reach a snapshot \
+         that has driven no generation past eve"
+    );
+
     Ok(())
 }
 
