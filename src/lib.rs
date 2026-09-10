@@ -19,8 +19,8 @@
 //! 0.36 (`chia-sdk-driver` + `chia-sdk-types`). This crate therefore:
 //!
 //! - never reimplements or restates puzzle arithmetic — the per-share accrual, the payout division,
-//!   the epoch fee and the withdrawal share belong to the puzzle, and a restated formula drifts
-//!   (§0.1 clause 1);
+//!   the epoch fee and the withdrawal share belong to the puzzle, except for [`recoverable_base_units`]
+//!   which is tested equal to the paying code (§0.1 clause 1);
 //! - performs no socket I/O, holds no keys, and never broadcasts; spend builders return unsigned
 //!   spends (§0.1 clause 2). **0.2.0 publishes no chain reader at all**: §12.1's
 //!   `read_distributor` was non-functional and is withheld rather than shipped broken, so this

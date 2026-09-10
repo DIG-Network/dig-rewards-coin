@@ -22,6 +22,17 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    the per-share accrual, the payout division, the epoch fee, and the withdrawal share are the
    puzzle's, and this document names the function that performs each rather than repeating a formula
    that would then drift.
+
+   **Exception:** This crate may carry **exactly one** authoritative restatement of puzzle arithmetic
+   when it is **bound to the paying code by a test that fails if the two diverge**. The
+   `recoverable_base_units` function restates the withdrawal share arithmetic and is proven equal
+   to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by a simulator
+   equality test. An untested copy scattered in a consumer drifts **silently**; a tested copy here
+   fails **loudly**. That asymmetry is the justification. The equality proof holds at or below
+   `u64::MAX / withdrawal_share_bps`. Above that bound, the **`chia-sdk-driver` 0.36.0 Rust driver**
+   cannot construct the spend (dig_ecosystem#3286 — a driver limitation), while the on-chain puzzle
+   still pays correctly because **CLVM arithmetic is bignum**. That is a driver defect, not a
+   property of the reward system.
 2. This crate MUST perform no socket I/O, MUST hold no keys, and MUST NOT broadcast. Chain reads
    arrive through a caller-supplied chain source (`dig-chainsource-interface`); spend builders return
    unsigned coin spends. This is the same rule the sibling `dig-mirror-coin` states as its invariant
