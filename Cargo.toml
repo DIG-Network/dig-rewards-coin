@@ -8,7 +8,7 @@
 # same-level crate such as `chia-query` or `dig-mirror-coin`.
 [package]
 name = "dig-rewards-coin"
-version = "0.4.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Reward-distributor coin driver for the DIG Network on Chia"
@@ -41,10 +41,10 @@ chia-bls = "0.36.1"
 # `ConsensusConstants` is a required argument of the upstream launch call, and it lives here.
 chia-consensus = "0.36.1"
 chia-protocol = "0.36.1"
-chia-puzzle-types = "0.36.1"
+chia-puzzle-types = "=0.36.1"
 # `action-layer` is what exposes the reward distributor at all; without it the crate cannot see it.
-chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
-chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 hex = "0.4.3"
 thiserror = "2.0.20"
 
