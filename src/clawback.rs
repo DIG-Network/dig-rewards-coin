@@ -13,9 +13,15 @@
 //!    "distributor balance" to withdraw from; each commitment is its own object with its own
 //!    authority and its own epoch.
 //!
-//! This module computes no share. The `withdrawal_share_bps` division belongs to the puzzle
-//! (`withdraw_incentives.rs:105-107`), and [`withdraw_committed_incentives`] returns the amount the
-//! puzzle arrived at. A restated formula here would drift (§0.1 clause 1).
+//! This module carries exactly **one** authoritative restatement of the puzzle's share
+//! arithmetic — [`recoverable_base_units`] — bound to the paying code
+//! (`withdraw_incentives.rs:105-107`) by a simulator equality test, so a future upstream drift
+//! arrives as a red build rather than a silent mismatch. §0.1 clause 1 forbids an *untested* copy
+//! scattered into a consumer that can drift unnoticed; a single tested restatement, kept here in
+//! the crate that owns the domain and proven equal to what the puzzle actually pays, is not that
+//! drift — it is the fix for it. [`withdraw_committed_incentives`] itself still returns the
+//! puzzle's own figure, never a recomputation: [`recoverable_base_units`] exists so a caller (such
+//! as `dig.listRewardDistributorCommitments`) can preview the amount *before* paying for a spend.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{
@@ -58,6 +64,33 @@ pub fn commitment_distributor_epoch_start(
     commitment_slot: &Slot<RewardDistributorCommitmentSlotValue>,
 ) -> u64 {
     commitment_slot.info.value.epoch_start
+}
+
+/// The share of a commitment the puzzle pays out on clawback, mirroring
+/// `chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs:105-107`
+/// byte-for-byte: multiply then divide, truncating, never rounded or saturated.
+///
+/// This is the **one** authoritative restatement this crate carries (see the module doc). A
+/// simulator equality test binds it to the real paid amount, so an upstream change to that
+/// arithmetic arrives here as a red test rather than a silent mismatch.
+///
+/// The multiply runs in a `u128` intermediate: upstream's own `u64 * u64` can overflow for a
+/// large enough commitment, and upstream gets away with it only because it runs inside a spend
+/// that chain-level amount limits already bound. This function has no such bound on its caller,
+/// so it must not inherit upstream's overflow.
+///
+/// `withdrawal_share_bps` is deliberately `u16`, narrower than the puzzle constant's own `u64`.
+/// That narrowing is the point: a caller reading `withdrawal_share_bps` off a chain constant must
+/// face the cast rather than have it silently wrap into a plausible-looking small share. Rejecting
+/// or clamping a constant above `u16::MAX` is the **caller's** responsibility, not this
+/// function's — it must never be widened to make that check disappear.
+#[must_use]
+pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> u64 {
+    let share = u128::from(rewards_base_units) * u128::from(withdrawal_share_bps) / 10_000;
+
+    // `withdrawal_share_bps` is at most `u16::MAX` (65_535) and the divisor is 10_000, so the
+    // quotient can never exceed `rewards_base_units` and always fits back in a u64.
+    u64::try_from(share).expect("share of a u64 amount by a bps fraction fits in u64")
 }
 
 /// Withdraw one commitment, recovering the puzzle's withdrawal share of it.

@@ -69,6 +69,7 @@ pub mod launch;
 pub mod payout;
 pub mod state;
 
+pub use clawback::recoverable_base_units;
 pub use comment::LaunchComment;
 pub use constants::{
     dig_distributor_constants, dig_distributor_constants_with_funder_self_skim,
