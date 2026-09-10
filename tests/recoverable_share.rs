@@ -16,9 +16,8 @@
 //! This is a separate file from `tests/simulator.rs` rather than an addition to it, so this ticket
 //! does not collide with the concurrent #3267 work landing in that file.
 
-use chia_protocol::{Bytes32, Coin, SpendBundle};
-use chia_puzzle_types::singleton::SingletonArgs;
-use chia_puzzle_types::{CoinProof, EveProof, LineageProof, Memos, Proof};
+use chia_protocol::{Bytes32, SpendBundle};
+use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_sdk_driver::{
     sign_standard_transaction, Cat, CatSpend, Launcher, Offer, RewardDistributor,
@@ -62,7 +61,8 @@ fn launch_test_singleton(
 
     let inner_puzzle = ctx.alloc(&1)?;
     let inner_puzzle_hash = ctx.tree_hash(inner_puzzle);
-    launcher.spend(ctx, inner_puzzle_hash.into(), ())?;
+    // The launcher's own conditions are not needed: nothing else in this fixture asserts them.
+    let (_conditions, _eve_coin) = launcher.spend(ctx, inner_puzzle_hash.into(), ())?;
 
     Ok(TestSingleton { launcher_id })
 }
