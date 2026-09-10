@@ -154,7 +154,6 @@ impl ChainObservation {
     /// `None` is a positive fact, not missing information: the walk covers every generation from
     /// the eve coin to the tip or it fails, so `None` means no entry-set write has ever happened
     /// since launch.
-    #[must_use]
     pub fn last_entry_write_unix(&self) -> Option<u64> {
         self.last_entry_write_unix
     }
@@ -192,7 +191,6 @@ impl DistributorSnapshot {
     ///
     /// The contents are `Clone`: see the type's own docs for why a copy taken from here must not be
     /// trusted as current.
-    #[must_use]
     pub fn distributor(&self) -> &RewardDistributor {
         &self.distributor
     }
