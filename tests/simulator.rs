@@ -50,7 +50,7 @@ use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
 use dig_rewards_coin::{
-    read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot, RewardsError,
+    read_distributor, DistributorSnapshot, RewardsError, STALE_ENTRY_SET_SECONDS,
 };
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
@@ -600,58 +600,6 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
     harness.manager.proof = next_manager_proof;
 
     assert_eq!(harness.distributor.info.state.active_shares, ENTRY_SHARES);
-
-    // These accessors are exercised directly against an assembled snapshot here (rather than one
-    // read_distributor (#3267) produced) precisely because they must work no matter how the
-    // snapshot was built -- `observed` is a synthetic-but-well-formed value since nothing in this
-    // test is about chain provenance.
-    let snapshot = DistributorSnapshot {
-        distributor: harness.distributor.clone(),
-        slots: DistributorSlots {
-            entries: vec![entry_slot_value],
-            commitments: vec![],
-            // Deliberately out of order, so the accessor's sort is what produces the ordering
-            // asserted below rather than the order they were pushed in.
-            rewards: vec![
-                RewardDistributorRewardSlotValue {
-                    counter: 0,
-                    epoch_start: FIRST_EPOCH_START + TEST_EPOCH_SECONDS,
-                    next_epoch_initialized: false,
-                    rewards: 17,
-                },
-                harness.first_epoch_slot.info.value,
-            ],
-        },
-        observed: ChainObservation {
-            peak_height: 1,
-            peak_timestamp: FIRST_EPOCH_START,
-            tip_coin_id: harness.distributor.coin.coin_id(),
-            last_entry_write_unix: None,
-        },
-    };
-
-    assert_eq!(snapshot.entry_count(), 1);
-    assert_eq!(
-        snapshot.payout_puzzle_hashes(),
-        vec![harness.entry.puzzle_hash],
-        "the entry set is reported as payout puzzle hashes, never peer identities (§10.2)"
-    );
-    assert_eq!(
-        snapshot.reserve_base_units(),
-        harness.distributor.info.state.total_reserves,
-        "the reserve figure is the puzzle's own balance, not a recomputation"
-    );
-    assert_eq!(
-        snapshot.rewards_per_distributor_epoch(),
-        vec![
-            (
-                harness.first_epoch_slot.info.value.epoch_start,
-                harness.first_epoch_slot.info.value.rewards
-            ),
-            (FIRST_EPOCH_START + TEST_EPOCH_SECONDS, 17),
-        ],
-        "sorted by epoch start, with the figures taken from the reward slots unchanged"
-    );
 
     // Roll into the first epoch, which is what makes the commitment start accruing.
     harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
@@ -1453,9 +1401,86 @@ fn mock_chain_source(
     // Synthetic but monotonic: nothing here asserts these equal any real chain clock, only that
     // every height read_distributor asks about resolves to SOME timestamp.
     for height in 0..=peak {
-        source = source.with_timestamp(height, u64::from(height) * 1_000 + 1);
+        source = source.with_timestamp(height, mock_timestamp(height));
     }
     source.with_peak(peak)
+}
+
+/// The timestamp [`mock_chain_source`] assigns to `height`. Named so a test that needs to reason
+/// about elapsed chain time can compute it instead of re-deriving the formula.
+fn mock_timestamp(height: u32) -> u64 {
+    u64::from(height) * 1_000 + 1
+}
+
+/// The all-zero `LineageProof` `RewardDistributor::from_parent_spend` fabricates for the reserve.
+/// A genuine read never produces one; asserting against it is the landmine's revert-proof.
+fn zero_lineage_proof() -> LineageProof {
+    LineageProof {
+        parent_parent_coin_info: Bytes32::default(),
+        parent_inner_puzzle_hash: Bytes32::default(),
+        parent_amount: 0,
+    }
+}
+
+/// Asserts a read failed as `Malformed` **with the specific reason** -- never merely "some error",
+/// which is satisfied by a failure elsewhere in the recipe.
+fn assert_malformed_because(
+    result: Result<Option<DistributorSnapshot>, RewardsError>,
+    reason: &str,
+) {
+    match result {
+        Err(RewardsError::Malformed(message)) => assert!(
+            message.contains(reason),
+            "Malformed, but for the wrong reason: expected {reason:?}, got {message:?}"
+        ),
+        other => panic!("expected Malformed({reason:?}), got {other:?}"),
+    }
+}
+
+/// Launch, then commit to the first distributor epoch.
+///
+/// Two things this establishes that a bare launch does not: the reserve holds value, and the tip
+/// reserve coin is no longer the eve-era one. Both are what the step-11 money cross-check is about.
+fn launch_and_commit(
+    ctx: &mut SpendContext,
+) -> anyhow::Result<(Harness, Vec<Bytes32>, Vec<Bytes32>)> {
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        COMMITTED_BASE_UNITS,
+    )?;
+    members.push(harness.distributor.coin.coin_id());
+
+    let extras = vec![
+        reserve_launch_id,
+        reserve_parent_id,
+        harness.distributor.reserve.coin.coin_id(),
+    ];
+    Ok((harness, members, extras))
+}
+
+/// A `CoinRecord` for `coin`, confirmed at `confirmed_height` and spent at `spent_height`.
+fn record(
+    coin: Coin,
+    confirmed_height: u32,
+    spent_height: Option<u32>,
+) -> dig_chainsource_interface::CoinRecord {
+    dig_chainsource_interface::CoinRecord {
+        coin,
+        confirmed_height: Some(confirmed_height),
+        spent_height,
+        timestamp: None,
+        coinbase: false,
+    }
 }
 
 #[test]
@@ -1559,18 +1584,13 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
         "the entry set rebuilt from the chain must match the one entry actually added"
     );
     assert_eq!(
-        snapshot.observed.tip_coin_id,
+        snapshot.observed().tip_coin_id(),
         harness.distributor.coin.coin_id(),
         "the observed tip must be the real tip"
     );
-    let zero_lineage_proof = chia_puzzle_types::LineageProof {
-        parent_parent_coin_info: Bytes32::default(),
-        parent_inner_puzzle_hash: Bytes32::default(),
-        parent_amount: 0,
-    };
     assert_ne!(
-        snapshot.distributor.reserve.child_lineage_proof(),
-        zero_lineage_proof,
+        snapshot.distributor().reserve.proof,
+        zero_lineage_proof(),
         "REVERT-PROOF: from_parent_spend fabricates an all-zero LineageProof for the reserve; a genuine read must never produce one"
     );
 
@@ -1635,17 +1655,26 @@ fn a_snapshot_from_before_a_write_is_not_current() -> anyhow::Result<()> {
     );
     let s2 = read_distributor(&chain_s2, launcher_id)?.expect("still launched");
 
+    // A new block arrives and the distributor is not spent in it: the state S2 read is still the
+    // current state, but the peak has moved. This is the case mainnet is ALWAYS in within seconds
+    // of any read, and a frozen-peak fixture cannot express it (S2 findings, notes 6d/A3).
+    let later_peak = harness.sim.height() + 1;
+    let chain_after_a_block = chain_s2
+        .clone()
+        .with_peak(later_peak)
+        .with_timestamp(later_peak, mock_timestamp(later_peak));
+
     assert_ne!(
-        s1.observed.tip_coin_id, s2.observed.tip_coin_id,
+        s1.observed().tip_coin_id(), s2.observed().tip_coin_id(),
         "a write must move the observed tip -- this is what is_current relies on"
     );
     assert!(
-        !s1.is_current(&chain_s2)?,
+        !s1.is_current(&chain_after_a_block)?,
         "S1 was read before the removal; against the post-removal chain it must be stale"
     );
     assert!(
-        s2.is_current(&chain_s2)?,
-        "S2 was read after the removal; against the same chain it must still be current"
+        s2.is_current(&chain_after_a_block)?,
+        "S2 is the current state and a bare new block does not change that -- is_current must          answer 'is this still the current state', not 'has any block arrived since'"
     );
 
     Ok(())
@@ -1699,17 +1728,13 @@ fn a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_select
     );
 
     // `harness.distributor.coin` is still unspent at this point (no generation past eve has been
-    // driven), so `snapshot.distributor.reserve.proof` is the eve authentication's OWN proof,
+    // driven), so `snapshot.distributor().reserve.proof` is the eve authentication's OWN proof,
     // un-healed by any later `.child()` call -- this is the one place in the walk where a landmine
     // at steps 4-5 (skipping `find_eve_reserve_provenance`'s authentication) would actually surface
     // in the returned snapshot, rather than being masked by a subsequent generation's re-derivation.
-    let zero_lineage_proof = chia_puzzle_types::LineageProof {
-        parent_parent_coin_info: Bytes32::default(),
-        parent_inner_puzzle_hash: Bytes32::default(),
-        parent_amount: 0,
-    };
     assert_ne!(
-        snapshot.distributor.reserve.proof, zero_lineage_proof,
+        snapshot.distributor().reserve.proof,
+        zero_lineage_proof(),
         "REVERT-PROOF: an unauthenticated (zero) eve-reserve proof must never reach a snapshot \
          that has driven no generation past eve"
     );
@@ -1794,4 +1819,124 @@ fn an_unspent_launcher_reads_as_never_launched() {
         result.unwrap().is_none(),
         "no coin record for the launcher id -- Ok(None) is the ONLY case this reserves"
     );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// The launch-created reward slot (F2), the step-11 money cross-check (F3) and the fail-closed
+// rule (F4) -- every one of these was invisible to a fully green suite.
+// ---------------------------------------------------------------------------------------------
+
+/// A prover rebuilt from the chain must be able to roll the FIRST distributor epoch, which means
+/// the reward slot the launch created has to reach the snapshot. An in-process launcher gets it as
+/// `LaunchedDistributor::first_distributor_epoch_slot`; SPEC §12.1 clause 1 exists so that a
+/// reader with nothing but the launcher id gets the same thing.
+#[test]
+fn the_launch_created_reward_slot_reaches_a_chain_rebuilt_snapshot() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    let snapshot = read_distributor(&chain, launcher_id)?.expect("launched");
+    let launch_slot = harness.first_epoch_slot.info.value;
+
+    assert_eq!(
+        snapshot.slots().rewards,
+        vec![launch_slot],
+        "the reward slot the launch created is the only outstanding one, and a chain-rebuilt \
+         prover cannot roll the first epoch without it"
+    );
+    assert_eq!(
+        snapshot.rewards_per_distributor_epoch(),
+        vec![(launch_slot.epoch_start, launch_slot.rewards)],
+        "rewards_per_distributor_epoch under-reports whenever a reward slot is dropped"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn a_tip_reserve_absent_from_the_chain_is_refused() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (harness, members, extras) = launch_and_commit(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let tip_reserve_id = harness.distributor.reserve.coin.coin_id();
+
+    // Everything the reader needs EXCEPT the tip reserve coin's own record.
+    let extras: Vec<Bytes32> = extras
+        .into_iter()
+        .filter(|id| *id != tip_reserve_id)
+        .collect();
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "tip reserve coin is not present on chain",
+    );
+    Ok(())
+}
+
+#[test]
+fn an_already_spent_tip_reserve_is_refused() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (harness, members, extras) = launch_and_commit(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let tip_reserve = harness.distributor.reserve.coin;
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras).with_coin(
+        tip_reserve.coin_id(),
+        record(tip_reserve, 0, Some(harness.sim.height())),
+    );
+
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "tip reserve coin is already spent",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tip_reserve_amount_disagreeing_with_total_reserves_is_refused() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (harness, members, extras) = launch_and_commit(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let tip_reserve = harness.distributor.reserve.coin;
+
+    // The same coin id carrying a different amount: what a wrong eve-reserve selection produces,
+    // and the reason the cross-check compares the amount rather than mere existence.
+    let lying = Coin::new(
+        tip_reserve.parent_coin_info,
+        tip_reserve.puzzle_hash,
+        tip_reserve.amount + 1,
+    );
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras)
+        .with_coin(tip_reserve.coin_id(), record(lying, 0, None));
+
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "tip reserve amount does not match",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_chain_source_that_errors_never_renders_as_an_empty_distributor() {
+    let chain = dig_chainsource_interface::MockChainSource::new()
+        .fail_with(dig_chainsource_interface::ChainSourceError::Timeout);
+    let result = read_distributor(&chain, Bytes32::new([0x42; 32]));
+
+    match result {
+        Err(RewardsError::ChainUnavailable(_)) => {}
+        other => panic!(
+            "a source that cannot answer must be ChainUnavailable -- never Ok(None), which would \
+             render a failed read as 'no distributor was ever launched'; got {other:?}"
+        ),
+    }
 }

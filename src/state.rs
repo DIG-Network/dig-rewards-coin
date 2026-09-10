@@ -89,39 +89,100 @@ fn remove_one_each<T: PartialEq + Copy>(set: &mut Vec<T>, spent: &[T]) {
 
 /// The chain view a snapshot was taken against. Every field mandatory: a snapshot without
 /// provenance is the stale-read hazard itself.
+///
+/// Read-only by construction: the fields are private, there is no public constructor, and no
+/// setter. Only [`read_distributor`] can mint one, so an observation always describes a read that
+/// actually happened. That is what makes the pairing inside a [`DistributorSnapshot`] unforgeable
+/// — a caller cannot attach a fresh observation to stale data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainObservation {
+    peak_height: u32,
+    peak_timestamp: u64,
+    tip_coin_id: Bytes32,
+    last_entry_write_unix: Option<u64>,
+}
+
+impl ChainObservation {
     /// The fully-synced block height as of the read.
-    pub peak_height: u32,
+    #[must_use]
+    pub fn peak_height(&self) -> u32 {
+        self.peak_height
+    }
+
     /// `block_timestamp(peak_height)` — chain-derived "now", never the wall clock.
-    pub peak_timestamp: u64,
+    #[must_use]
+    pub fn peak_timestamp(&self) -> u64 {
+        self.peak_timestamp
+    }
+
     /// The tip coin id AT THE TIME OF THE READ. `peak_height` alone is insufficient: two different
     /// states can share a height. This is what makes "is this the same state I read?" checkable.
-    pub tip_coin_id: Bytes32,
-    /// The Unix time of the most recent entry-set write this walk observed, if any (`SPEC.md`
-    /// §12.4). `None` means the entry set has never been written since launch.
-    pub last_entry_write_unix: Option<u64>,
+    #[must_use]
+    pub fn tip_coin_id(&self) -> Bytes32 {
+        self.tip_coin_id
+    }
+
+    /// The Unix time of the most recent entry-set WRITE (`AddEntry` / `RemoveEntry`) this walk
+    /// observed, if any (`SPEC.md` §12.4).
+    ///
+    /// `None` is a positive fact, not missing information: the walk covers every generation from
+    /// the eve coin to the tip or it fails, so `None` means no entry-set write has ever happened
+    /// since launch.
+    #[must_use]
+    pub fn last_entry_write_unix(&self) -> Option<u64> {
+        self.last_entry_write_unix
+    }
 }
 
 /// A distributor as it stands on chain, with everything a UI needs to answer "is anyone being
 /// paid?".
 ///
-/// Deliberately `#[derive(Debug)]` only — no `Clone`, no `Copy`, no serde — so a snapshot cannot be
-/// cheaply duplicated and stored past the read that produced it. Re-derive with
-/// [`read_distributor`] instead of holding on to one.
+/// # What this type guarantees, and what it does not
+///
+/// The fields are private and there is no public constructor, so the pairing of chain data with
+/// the [`ChainObservation`] it was read under is **unforgeable**: only [`read_distributor`] can
+/// produce a snapshot, and it always pairs the data with the observation of that same read. A
+/// caller therefore cannot present stale data under a fresh observation, which is the one
+/// guarantee this type needs to make [`Self::is_current`] mean anything.
+///
+/// It does NOT prevent a caller keeping a copy of the CONTENTS. `RewardDistributor` and
+/// [`DistributorSlots`] are `Clone` upstream, so anything reachable through [`Self::distributor`]
+/// or [`Self::slots`] can be copied out and held indefinitely — and once copied out it carries no
+/// observation at all. `#[derive(Debug)]`-only makes the aggregate awkward to duplicate wholesale
+/// and nothing more.
+///
+/// So: **a caller about to spend MUST re-read**, either with [`read_distributor`] or by asking
+/// [`Self::is_current`], rather than trusting a snapshot it has been holding. A type documented as
+/// stronger than it is would be worse than this residual.
 #[derive(Debug)]
 pub struct DistributorSnapshot {
-    /// The live singleton, ready for its next action.
-    pub distributor: RewardDistributor,
-
-    /// The outstanding slots.
-    pub slots: DistributorSlots,
-
-    /// The chain view this snapshot was read against.
-    pub observed: ChainObservation,
+    distributor: RewardDistributor,
+    slots: DistributorSlots,
+    observed: ChainObservation,
 }
 
 impl DistributorSnapshot {
+    /// The live singleton, ready for its next action.
+    ///
+    /// The contents are `Clone`: see the type's own docs for why a copy taken from here must not be
+    /// trusted as current.
+    #[must_use]
+    pub fn distributor(&self) -> &RewardDistributor {
+        &self.distributor
+    }
+
+    /// The outstanding slots.
+    #[must_use]
+    pub fn slots(&self) -> &DistributorSlots {
+        &self.slots
+    }
+
+    /// The chain view this snapshot was read against.
+    #[must_use]
+    pub fn observed(&self) -> &ChainObservation {
+        &self.observed
+    }
+
     /// How many entries the set holds.
     #[must_use]
     pub fn entry_count(&self) -> usize {
@@ -194,9 +255,22 @@ impl DistributorSnapshot {
         )
     }
 
-    /// Re-reads the chain and reports whether this snapshot is still the current state: the
-    /// authenticated tip coin id and the peak height must both match. Turns staleness into
-    /// something ANSWERABLE rather than asserted.
+    /// Re-reads the chain and reports whether this snapshot is still the current state.
+    ///
+    /// Compares the authenticated tip coin id ALONE, which is the question a caller about to spend
+    /// actually has: *is the state I read still the state I would be spending against?* It
+    /// deliberately does not compare [`ChainObservation::peak_height`] — a block arriving without
+    /// spending the distributor changes the peak and changes nothing this caller depends on, and
+    /// conjoining the height would make every snapshot report `false` within seconds of any
+    /// mainnet read, which is a check consumers drop rather than obey.
+    ///
+    /// What it proves: the distributor singleton has not been spent since the read, so the entry
+    /// set, the reserve and the slot set in this snapshot are the chain's current ones. What it
+    /// does NOT prove: that the chain source is honest, that a spend is not already in the mempool,
+    /// or anything about wall-clock freshness — read [`ChainObservation::peak_height`] and
+    /// [`ChainObservation::peak_timestamp`] through [`Self::observed`] for those questions.
+    ///
+    /// `Ok(false)` also covers a launcher whose record has vanished from the source entirely.
     pub fn is_current(&self, source: &impl ChainSource) -> Result<bool, RewardsError> {
         let launcher_id = self.distributor.info.constants().launcher_id;
         let current = read_distributor(source, launcher_id)?;
@@ -204,8 +278,7 @@ impl DistributorSnapshot {
             return Ok(false);
         };
 
-        Ok(current.observed.tip_coin_id == self.observed.tip_coin_id
-            && current.observed.peak_height == self.observed.peak_height)
+        Ok(current.observed.tip_coin_id == self.observed.tip_coin_id)
     }
 }
 
