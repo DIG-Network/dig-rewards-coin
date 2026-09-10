@@ -31,7 +31,7 @@ to this crate).
 
 Pinned to the `chia-wallet-sdk` 0.36 ceiling, not to crates.io latest — `chia-sdk-driver` 0.36.0
 pins a `0.36.1` cohort across `chia-bls`/`chia-protocol`/`chia-puzzle-types`/`clvm-traits`/
-`clvm-utils`, `chia-puzzles` 0.20.3 and `clvmr` 0.16.2. Taking the primitives' newer 0.48.x
+`clvm-utils`, `chia-puzzles` 0.20.3 and `clvmr` 0.16.4. Taking the primitives' newer 0.48.x
 releases would link two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
 
 Only the crates the library itself names are `[dependencies]`. `chia-puzzles`, `clvm-traits`,

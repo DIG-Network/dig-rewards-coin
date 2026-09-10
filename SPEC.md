@@ -1656,6 +1656,20 @@ to a counterparty MUST be computed from the chain. A mirror deciding whether to 
 to chase a reward needs a signal the funder cannot flatter, and the operator's RPC (§2.6) is not that
 signal.
 
+1. "The entry set changed" means an **`AddEntry` or `RemoveEntry`** action, and nothing else. A
+   reader MUST derive the last entry-write time from the action log of each generation's spend, and
+   MUST NOT derive it from the created/spent entry-slot deltas. `InitiatePayout` spends the
+   claimer's entry slot and re-creates it, so a signal derived from those deltas is advanced by a
+   **claim** — an action the party being PAID performs. One holder claiming inside every 48 h window
+   would then report a distributor healthy forever while its prover was months dead and no other
+   peer could ever be admitted. A signal the payee can reset is not a chain-derived signal about the
+   operator, which is the whole subject of this clause.
+2. A reader that has walked from the eve coin to the tip and observed no `AddEntry`/`RemoveEntry` at
+   all MUST report `EntrySetStale` while the reserve is non-zero. That is not missing information:
+   the walk is complete or it fails (§12.1 clause 1), so "no write observed" is the positive fact
+   "never written since launch", and a funded distributor that has never had an entry set is exactly
+   what this clause warns a counterparty about.
+
 ### 12.5 An absent entry slot, including a peer claiming after eviction
 
 `RemoveEntry` spends the entry slot and settles the accrued amount (§6.4). After eviction there is no

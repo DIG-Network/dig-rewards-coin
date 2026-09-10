@@ -15,7 +15,9 @@
 //! for the recipe it uses instead (`SPEC.md` §12.1 clause 1, #3267).
 
 use chia_protocol::Bytes32;
-use chia_sdk_driver::{RewardDistributor, RewardDistributorType, SpendContext};
+use chia_sdk_driver::{
+    RewardDistributor, RewardDistributorActionLog, RewardDistributorType, SpendContext,
+};
 use chia_sdk_types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorEntrySlotValue,
     RewardDistributorRewardSlotValue,
@@ -57,6 +59,12 @@ impl DistributorSlots {
     /// Slot values are plain data (no coin id inside), so identity is by VALUE — which is exactly
     /// what the puzzle itself treats as the slot, and exactly why an entry is removed rather than
     /// decremented: there is no other handle to remove by.
+    ///
+    /// # Errors
+    ///
+    /// If a generation spends a slot this walk never saw created. That means the reader's model of
+    /// the chain disagrees with the chain, and per this module's own doctrine a diverged read is an
+    /// error rather than a silently smaller answer.
     fn apply_generation(
         &mut self,
         spent_entries: &[RewardDistributorEntrySlotValue],
@@ -65,26 +73,44 @@ impl DistributorSlots {
         created_commitments: &[RewardDistributorCommitmentSlotValue],
         spent_rewards: &[RewardDistributorRewardSlotValue],
         created_rewards: &[RewardDistributorRewardSlotValue],
-    ) {
-        remove_one_each(&mut self.entries, spent_entries);
+    ) -> Result<(), RewardsError> {
+        remove_one_each(&mut self.entries, spent_entries, "entry")?;
         self.entries.extend_from_slice(created_entries);
 
-        remove_one_each(&mut self.commitments, spent_commitments);
+        remove_one_each(&mut self.commitments, spent_commitments, "commitment")?;
         self.commitments.extend_from_slice(created_commitments);
 
-        remove_one_each(&mut self.rewards, spent_rewards);
+        remove_one_each(&mut self.rewards, spent_rewards, "reward")?;
         self.rewards.extend_from_slice(created_rewards);
+
+        Ok(())
     }
 }
 
 /// Removes, from `set`, one occurrence of each value in `spent` — never all occurrences, since two
 /// outstanding slots can be equal by value.
-fn remove_one_each<T: PartialEq + Copy>(set: &mut Vec<T>, spent: &[T]) {
+///
+/// # Errors
+///
+/// If a value in `spent` is not in `set`. The chain cannot spend a slot that was never created, so
+/// a spend the walk cannot account for means the walk's model is WRONG — and absorbing it would
+/// render a diverged read as a merely smaller one, which for a slot set is a claim about money.
+fn remove_one_each<T: PartialEq + Copy>(
+    set: &mut Vec<T>,
+    spent: &[T],
+    slot_kind: &str,
+) -> Result<(), RewardsError> {
     for value in spent {
-        if let Some(index) = set.iter().position(|existing| existing == value) {
-            set.remove(index);
-        }
+        let Some(index) = set.iter().position(|existing| existing == value) else {
+            return Err(malformed(format!(
+                "a generation spends a {slot_kind} slot this walk never saw created -- the \
+                 reader's model of the chain disagrees with the chain"
+            )));
+        };
+        set.remove(index);
     }
+
+    Ok(())
 }
 
 /// The chain view a snapshot was taken against. Every field mandatory: a snapshot without
@@ -189,7 +215,12 @@ impl DistributorSnapshot {
         self.slots.entries.len()
     }
 
-    /// The $DIG base units held in the reserve.
+    /// Base units of the distributor's own reserve CAT, as the puzzle itself records them.
+    ///
+    /// **Not necessarily $DIG.** This is a generic reward-distributor reader: `reserve_asset_id`
+    /// is whatever the launch curried, and nothing here checks it against
+    /// `dig_constants::DIG_ASSET_ID`. A caller that needs $DIG specifically MUST compare
+    /// `distributor().info.constants.reserve_asset_id` itself.
     ///
     /// A **balance**, and nothing more. It is not evidence anyone is being paid the right amount:
     /// who receives it depends on an entry set that only a live prover maintains (§0.4 clause 3).
@@ -229,30 +260,36 @@ impl DistributorSnapshot {
             .collect()
     }
 
-    /// Whether the entry set has gone stale (`SPEC.md` §12.4): unchanged for
-    /// [`STALE_ENTRY_SET_SECONDS`] while the reserve is non-zero. `false` while the reserve is
-    /// zero — nothing is at stake to go stale.
+    /// Whether the entry set has gone stale (`SPEC.md` §12.4): no entry-set WRITE for
+    /// [`STALE_ENTRY_SET_SECONDS`] of chain time while the reserve is non-zero.
+    ///
+    /// Three cases, all of them chain-derived, never a wall clock:
+    /// - reserve zero → `false`. Nothing is at stake, so nothing can go stale.
+    /// - reserve non-zero and a write observed → stale once
+    ///   `peak_timestamp - last_entry_write_unix` reaches the threshold.
+    /// - reserve non-zero and NO write ever observed → `true`. This is not an absence of
+    ///   information: the walk covers every generation from the eve coin to the tip or it fails,
+    ///   so `None` is the positive fact "the entry set has never been written since launch", and
+    ///   a funded distributor that has never had an entry set is exactly what §12.4 warns about.
     #[must_use]
     pub fn entry_set_stale(&self) -> bool {
-        let Some(last_write) = self.observed.last_entry_write_unix else {
-            return self.reserve_base_units() > 0;
-        };
-
-        self.reserve_base_units() > 0
-            && self.observed.peak_timestamp.saturating_sub(last_write) >= STALE_ENTRY_SET_SECONDS
+        entry_set_is_stale(
+            self.reserve_base_units(),
+            self.observed.peak_timestamp,
+            self.observed.last_entry_write_unix,
+        )
     }
 
-    /// Whether the entry set is frozen for this distributor's LIFE: the `Managed` manager
-    /// singleton's launcher id is the zero hash (`SPEC.md` §7.2 clause 3). A frozen entry set MUST
-    /// be an observable fact, not a silence.
+    /// Whether the entry set is frozen for this distributor's LIFE, because the authority that
+    /// would write it is the zero hash (`SPEC.md` §7.2 clause 3). A frozen entry set MUST be an
+    /// observable fact, not a silence.
+    ///
+    /// Checked for EVERY `RewardDistributorType`, not just `Managed`: each variant names the one
+    /// identity entries can ever come from, and a zero there is unreachable by construction, so no
+    /// entry can ever be added or removed again.
     #[must_use]
     pub fn entry_set_frozen(&self) -> bool {
-        matches!(
-            self.distributor.info.constants().reward_distributor_type,
-            RewardDistributorType::Managed {
-                manager_singleton_launcher_id
-            } if manager_singleton_launcher_id == Bytes32::default()
-        )
+        entry_set_is_frozen(self.distributor.info.constants().reward_distributor_type)
     }
 
     /// Re-reads the chain and reports whether this snapshot is still the current state.
@@ -293,6 +330,51 @@ impl ConstantsAccess for chia_sdk_driver::RewardDistributorInfo {
     fn constants(&self) -> chia_sdk_driver::RewardDistributorConstants {
         self.constants
     }
+}
+
+/// [`DistributorSnapshot::entry_set_stale`]'s decision, over plain inputs so every branch and its
+/// inversion can be tested directly.
+fn entry_set_is_stale(
+    reserve_base_units: u64,
+    peak_timestamp: u64,
+    last_entry_write_unix: Option<u64>,
+) -> bool {
+    if reserve_base_units == 0 {
+        return false;
+    }
+
+    let Some(last_write) = last_entry_write_unix else {
+        // The walk is complete or it errors, so this is "never written since launch" -- a funded
+        // distributor with no entry set is the §12.4 case, not missing information.
+        return true;
+    };
+
+    peak_timestamp.saturating_sub(last_write) >= STALE_ENTRY_SET_SECONDS
+}
+
+/// [`DistributorSnapshot::entry_set_frozen`]'s decision, over the type alone.
+///
+/// Every variant carries exactly one identity that entries can originate from. A zero there is an
+/// unset field that no spend can ever satisfy, so the entry set can never change again.
+fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
+    let identity = match kind {
+        // Only this singleton can authorize AddEntry / RemoveEntry.
+        RewardDistributorType::Managed {
+            manager_singleton_launcher_id,
+        } => manager_singleton_launcher_id,
+        // Entries come from NFTs of this collection.
+        RewardDistributorType::NftCollection {
+            collection_did_launcher_id,
+        } => collection_did_launcher_id,
+        // Entries come from the DL store this names.
+        RewardDistributorType::CuratedNft {
+            store_launcher_id, ..
+        } => store_launcher_id,
+        // Entries come from stakes of this CAT.
+        RewardDistributorType::Cat { asset_id, .. } => asset_id,
+    };
+
+    identity == Bytes32::default()
 }
 
 /// Rebuilds a distributor's full state from the chain, from its launcher id alone.
@@ -368,7 +450,7 @@ pub fn read_distributor(
     let (reserve_parent_id, reserve_lineage_proof) =
         find_eve_reserve_provenance(&mut ctx, source, &constants)?;
 
-    let Some((mut distributor, _reward_slot)) = RewardDistributor::from_eve_coin_spend(
+    let Some((mut distributor, launch_reward_slot)) = RewardDistributor::from_eve_coin_spend(
         &mut ctx,
         constants,
         initial_state,
@@ -386,7 +468,14 @@ pub fn read_distributor(
         .map_err(chain_unavailable)?
         .ok_or_else(|| malformed("launcher has no resolvable singleton lineage"))?;
 
-    let mut slots = DistributorSlots::default();
+    // The launch creates the first distributor epoch's reward slot, and no later generation
+    // reports it as created -- so a walk that starts from the eve spend must seed it here or a
+    // chain-rebuilt prover cannot roll the first epoch (an in-process launcher gets the same
+    // handle as `LaunchedDistributor::first_distributor_epoch_slot`).
+    let mut slots = DistributorSlots {
+        rewards: vec![launch_reward_slot.info.value],
+        ..DistributorSlots::default()
+    };
     let mut last_entry_write_unix: Option<u64> = None;
 
     loop {
@@ -420,8 +509,18 @@ pub fn read_distributor(
             ));
         };
 
-        let entry_write_happened = !reconstructed.pending_spend.created_entry_slots.is_empty()
-            || !reconstructed.pending_spend.spent_entry_slots.is_empty();
+        // §12.4 is a signal a counterparty judges the OPERATOR by, so it must count only actions
+        // the operator can take. `InitiatePayout` spends an entry slot and re-creates it
+        // (upstream `action_log.rs:140,171`), so deriving this from created/spent entry slots let
+        // one holder claiming every 47 h report a distributor healthy forever while its prover was
+        // dead. The action log distinguishes them; nothing else in the pending spend does.
+        let entry_write_happened = reconstructed.pending_spend.logs.iter().any(|log| {
+            matches!(
+                log,
+                RewardDistributorActionLog::AddEntry(_)
+                    | RewardDistributorActionLog::RemoveEntry(_)
+            )
+        });
 
         slots.apply_generation(
             &reconstructed.pending_spend.spent_entry_slots,
@@ -430,7 +529,7 @@ pub fn read_distributor(
             &reconstructed.pending_spend.created_commitment_slots,
             &reconstructed.pending_spend.spent_reward_slots,
             &reconstructed.pending_spend.created_reward_slots,
-        );
+        )?;
 
         let next_state = reconstructed.pending_spend.latest_state.1;
         distributor = reconstructed.child(next_state);
@@ -576,4 +675,129 @@ fn find_eve_reserve_provenance(
         .ok_or_else(|| malformed("authenticated eve-era reserve candidate has no lineage proof"))?;
 
     Ok((candidate.coin.parent_coin_info, reserve_lineage_proof))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A non-zero identity, so a test asserting `false` is asserting something.
+    fn some_identity() -> Bytes32 {
+        Bytes32::new([7; 32])
+    }
+
+    #[test]
+    fn a_slot_spent_without_a_matching_creation_is_a_diverged_read() {
+        let mut slots = DistributorSlots::default();
+        let never_created = RewardDistributorRewardSlotValue {
+            counter: 0,
+            epoch_start: 1_234,
+            next_epoch_initialized: false,
+            rewards: 5,
+        };
+
+        let result = slots.apply_generation(&[], &[], &[], &[], &[never_created], &[]);
+
+        match result {
+            Err(RewardsError::Malformed(message)) => assert!(
+                message.contains("never saw created"),
+                "wrong reason: {message}"
+            ),
+            other => panic!("a spend the walk cannot account for must be an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_slot_spent_after_it_was_created_is_removed_exactly_once() {
+        let value = RewardDistributorRewardSlotValue {
+            counter: 0,
+            epoch_start: 1_234,
+            next_epoch_initialized: false,
+            rewards: 5,
+        };
+        let mut slots = DistributorSlots::default();
+
+        slots
+            .apply_generation(&[], &[], &[], &[], &[], &[value, value])
+            .expect("creations alone never diverge");
+        slots
+            .apply_generation(&[], &[], &[], &[], &[value], &[])
+            .expect("one of the two outstanding copies is spent");
+
+        assert_eq!(
+            slots.rewards,
+            vec![value],
+            "two outstanding slots can be equal by value; spending one must not remove both"
+        );
+    }
+
+    #[test]
+    fn a_zero_reserve_is_never_stale_and_a_funded_never_written_set_always_is() {
+        assert!(
+            !entry_set_is_stale(0, u64::MAX, None),
+            "nothing is at stake, so nothing can go stale"
+        );
+        assert!(
+            entry_set_is_stale(1, 0, None),
+            "a funded distributor whose entry set has never been written is the §12.4 case"
+        );
+    }
+
+    #[test]
+    fn staleness_turns_over_exactly_at_the_threshold_in_both_directions() {
+        let last_write = 1_000_000;
+
+        assert!(
+            !entry_set_is_stale(
+                1,
+                last_write + STALE_ENTRY_SET_SECONDS - 1,
+                Some(last_write)
+            ),
+            "one second short of the threshold is not stale"
+        );
+        assert!(
+            entry_set_is_stale(1, last_write + STALE_ENTRY_SET_SECONDS, Some(last_write)),
+            "the threshold itself is stale (§12.4 says `>=`)"
+        );
+    }
+
+    #[test]
+    fn a_zero_identity_freezes_the_entry_set_for_every_distributor_type() {
+        let zero = Bytes32::default();
+
+        assert!(entry_set_is_frozen(RewardDistributorType::Managed {
+            manager_singleton_launcher_id: zero
+        }));
+        assert!(entry_set_is_frozen(RewardDistributorType::NftCollection {
+            collection_did_launcher_id: zero
+        }));
+        assert!(entry_set_is_frozen(RewardDistributorType::CuratedNft {
+            store_launcher_id: zero,
+            refreshable: true
+        }));
+        assert!(entry_set_is_frozen(RewardDistributorType::Cat {
+            asset_id: zero,
+            hidden_puzzle_hash: None
+        }));
+    }
+
+    #[test]
+    fn a_real_identity_leaves_the_entry_set_writable_for_every_distributor_type() {
+        // The inversion of the test above: flip the `==` in `entry_set_is_frozen` and one of these
+        // four fails, which is what makes the guard's direction tested rather than merely present.
+        assert!(!entry_set_is_frozen(RewardDistributorType::Managed {
+            manager_singleton_launcher_id: some_identity()
+        }));
+        assert!(!entry_set_is_frozen(RewardDistributorType::NftCollection {
+            collection_did_launcher_id: some_identity()
+        }));
+        assert!(!entry_set_is_frozen(RewardDistributorType::CuratedNft {
+            store_launcher_id: some_identity(),
+            refreshable: false
+        }));
+        assert!(!entry_set_is_frozen(RewardDistributorType::Cat {
+            asset_id: some_identity(),
+            hidden_puzzle_hash: None
+        }));
+    }
 }

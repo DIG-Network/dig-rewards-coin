@@ -1505,6 +1505,9 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
     singleton_members.push(harness.distributor.coin.coin_id());
 
     let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    // The generation whose spend carries the AddEntry action: the ONE entry-set write in this
+    // drive, and the timestamp §12.4's staleness signal must report (F1, asserted below).
+    let entry_write_generation = harness.distributor.coin.coin_id();
     let write = add_entry(
         ctx,
         &mut harness.distributor,
@@ -1594,6 +1597,46 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
         "REVERT-PROOF: from_parent_spend fabricates an all-zero LineageProof for the reserve; a genuine read must never produce one"
     );
 
+    // ---- §12.4, and why the signal cannot be the slot deltas (F1) ----------------------------
+    // The LAST generation driven above is a payout, which spends the claimer's entry slot and
+    // re-creates it. So a signal derived from created/spent entry slots reports the PAYOUT's
+    // timestamp -- a value the party being paid controls -- and a distributor whose prover died
+    // reads healthy forever as long as one holder keeps claiming. The signal must name the
+    // AddEntry above, which is the only write the operator performed.
+    let entry_write_height = harness
+        .sim
+        .coin_state(entry_write_generation)
+        .expect("the entry-writing generation is a real coin")
+        .spent_height
+        .expect("it was spent by the AddEntry bundle");
+    assert_eq!(
+        snapshot.observed().last_entry_write_unix(),
+        Some(mock_timestamp(entry_write_height)),
+        "the liveness signal must name the AddEntry generation, never the later payout"
+    );
+
+    // And therefore: threshold-and-more of chain time after that write, with a payout in between,
+    // the entry set reports STALE. A payee cannot reset it.
+    let stale_peak = harness.sim.height() + 1;
+    let much_later = chain.clone().with_peak(stale_peak).with_timestamp(
+        stale_peak,
+        mock_timestamp(entry_write_height) + STALE_ENTRY_SET_SECONDS,
+    );
+    let stale = read_distributor(&much_later, launcher_id)?.expect("still launched");
+    assert!(
+        stale.reserve_base_units() > 0,
+        "the §12.4 signal is only meaningful while value is at stake"
+    );
+    assert!(
+        stale.entry_set_stale(),
+        "a claim is not an entry-set write: §12.4 must report stale once the threshold has passed \
+         since the last AddEntry/RemoveEntry, however recently someone was paid"
+    );
+    assert!(
+        !stale.entry_set_frozen(),
+        "this distributor has a real manager singleton, so its entry set is not frozen"
+    );
+
     Ok(())
 }
 
@@ -1665,7 +1708,8 @@ fn a_snapshot_from_before_a_write_is_not_current() -> anyhow::Result<()> {
         .with_timestamp(later_peak, mock_timestamp(later_peak));
 
     assert_ne!(
-        s1.observed().tip_coin_id(), s2.observed().tip_coin_id(),
+        s1.observed().tip_coin_id(),
+        s2.observed().tip_coin_id(),
         "a write must move the observed tip -- this is what is_current relies on"
     );
     assert!(
@@ -1784,11 +1828,11 @@ fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyho
         },
     );
 
-    let result = read_distributor(&chain, launcher_id);
-    assert!(
-        matches!(result, Err(RewardsError::Malformed(_))),
-        "two zero-amount candidates at the same lowest height must never be resolved by picking \
-         either one; got {result:?}"
+    // The specific reason matters: `Malformed(_)` alone is satisfied by the orderings where
+    // `pop()` happens to return the twin and the read then fails somewhere later in the recipe.
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "ambiguous eve-era reserve candidates at the lowest confirmed height",
     );
 
     Ok(())
@@ -1820,7 +1864,6 @@ fn an_unspent_launcher_reads_as_never_launched() {
         "no coin record for the launcher id -- Ok(None) is the ONLY case this reserves"
     );
 }
-
 
 // ---------------------------------------------------------------------------------------------
 // The launch-created reward slot (F2), the step-11 money cross-check (F3) and the fail-closed
