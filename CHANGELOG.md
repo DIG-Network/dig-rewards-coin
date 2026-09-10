@@ -9,7 +9,10 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Features
 - `clawback::recoverable_base_units` — the one authoritative, tested restatement of the puzzle's
   withdrawal-share arithmetic, bound to `withdraw_incentives.rs:105-107` by a simulator equality
-  test (#3269)
+  test for every amount a real clawback can pay on, i.e. up to
+  `u64::MAX / withdrawal_share_bps`. Above that bound upstream's own `u64` multiply overflows and
+  there is nothing to be equal to, so the `u128` intermediate is proven there arithmetically
+  instead (#3269)
 
 ## [0.2.0] - 2026-09-09
 
