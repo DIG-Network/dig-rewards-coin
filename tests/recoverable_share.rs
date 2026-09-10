@@ -1,4 +1,5 @@
-//! `recoverable_base_units` proved equal to what a real clawback actually pays.
+//! `recoverable_base_units` proved equal to what a real clawback actually pays, for the amounts a
+//! real clawback can pay on at all.
 //!
 //! This binds `src/clawback.rs`'s one authoritative restatement of the withdrawal-share
 //! arithmetic to the paying puzzle code
@@ -6,8 +7,11 @@
 //! if a future upstream bump changes that arithmetic, [`Clawback::recovered_base_units`] and
 //! [`recoverable_base_units`] diverge and this test goes red. A simulator test proving equality on
 //! a round number would pass under a rounding bug (round numbers do not exercise truncation) and
-//! under a lost precision bug (small numbers never overflow), so neither case here is round or
-//! small.
+//! under a lost precision bug (small numbers never overflow), so no case here is round.
+//!
+//! The equality proof stops where upstream stops being defined —
+//! `rewards <= u64::MAX / withdrawal_share_bps` — and the overflow-scale case above that bound is
+//! deliberately arithmetic-only. See that test's own doc comment for why.
 //!
 //! This is a separate file from `tests/simulator.rs` rather than an addition to it, so this ticket
 //! does not collide with the concurrent #3267 work landing in that file.
@@ -290,20 +294,15 @@ fn commit_then_clawback(
 
     Ok(clawback.recovered_base_units)
 }
-
-/// `1_001 @ 9_000 bps` is `900.9` truncated to `900` — a round number would pass under a rounding
-/// bug, so this is deliberately not one.
-#[test]
-fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::Result<()> {
+/// One in-range case: commit `rewards_base_units`, claw it back, and require both that the puzzle
+/// paid `expected_paid` and that [`recoverable_base_units`] returns the same figure.
+fn assert_matches_a_real_clawback(
+    rewards_base_units: u64,
+    expected_paid: u64,
+) -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
     let (mut sim, distributor, first_epoch_slot, source_cat, funder) =
         launch_harness(ctx, 1_000_000)?;
-
-    const REWARDS: u64 = 1_001;
-    assert_eq!(
-        WITHDRAWAL_SHARE_BPS, 9_000,
-        "the fixture assumes the crate's own launch bps"
-    );
 
     let paid = commit_then_clawback(
         ctx,
@@ -312,15 +311,18 @@ fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::
         first_epoch_slot,
         source_cat,
         &funder,
-        REWARDS,
+        rewards_base_units,
     )?;
 
     assert_eq!(
-        paid, 900,
-        "the puzzle truncates 1_001 * 9_000 / 10_000 = 900.9 down to 900"
+        paid, expected_paid,
+        "the puzzle truncates {rewards_base_units} * 9_000 / 10_000 down to {expected_paid}"
     );
     assert_eq!(
-        recoverable_base_units(REWARDS, u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()),
+        recoverable_base_units(
+            rewards_base_units,
+            u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
+        ),
         paid,
         "recoverable_base_units must equal what the puzzle actually paid"
     );
@@ -328,18 +330,39 @@ fn recoverable_base_units_matches_a_real_clawback_at_an_odd_amount() -> anyhow::
     Ok(())
 }
 
-/// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain u64
-/// multiply (`2_000_000_000_000_000_000 * 9_000` is roughly `1.8e22`, far past `u64::MAX`'s
-/// `~1.8e19`), proving the u128 intermediate in `recoverable_base_units` is load-bearing and not
-/// merely defensive.
+/// Equality with the real paid amount, for amounts inside the range where upstream is defined.
 ///
-/// This is deliberately **not** driven through a real clawback spend: at this scale the puzzle's
-/// own `withdrawal_share` line (`withdraw_incentives.rs:105`) panics on the same u64 overflow —
-/// verified by first running this case through `commit_then_clawback` and watching it panic
-/// exactly there (see the mutation-probe report). That panic is itself the proof the u128
-/// intermediate matters: production code calling the real SDK at this scale would already be
-/// broken, and `recoverable_base_units` must not import that ceiling into a function whose caller
-/// (`dig.listRewardDistributorCommitments`) has no such bound of its own.
+/// Both cases truncate — `1_001 @ 9_000 bps` is `900.9` and `7_777 @ 9_000 bps` is `6_999.3` — so
+/// neither would pass under a rounding bug, and neither would pass if the restatement divided
+/// before it multiplied (`1_001 / 10_000` is `0`).
+#[test]
+fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Result<()> {
+    assert_eq!(
+        WITHDRAWAL_SHARE_BPS, 9_000,
+        "the fixture assumes the crate's own launch bps"
+    );
+
+    assert_matches_a_real_clawback(1_001, 900)?;
+    assert_matches_a_real_clawback(7_777, 6_999)?;
+
+    Ok(())
+}
+
+/// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain `u64`
+/// multiply (`2_000_000_000_000_000_000 * 9_000` is roughly `1.8e22`, far past `u64::MAX`'s
+/// `~1.8e19`), proving the `u128` intermediate in `recoverable_base_units` is load-bearing rather
+/// than decorative: drop the intermediate and this test panics or returns a wrapped value.
+///
+/// **This case deliberately asserts nothing about what a real clawback pays, and a future reader
+/// must not "helpfully" add that comparison back.** At this scale a real clawback pays nothing at
+/// all: upstream's own withdrawal share
+/// (`chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs:105-107`)
+/// is a plain `u64` multiply of `rewards` by `withdrawal_share_bps`, so it panics under overflow
+/// checks — which is exactly how this case first failed in CI — and wraps silently without them.
+/// An equality assertion here would be unsatisfiable by construction, because there is no correct
+/// amount for our figure to be equal to. The bound is `u64::MAX / withdrawal_share_bps`, about
+/// `2.05e15` base units at 9_000 bps; equality above it is tested by
+/// `recoverable_base_units_matches_a_real_clawback_at_odd_amounts`, below it.
 #[test]
 fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
     const REWARDS: u64 = 2_000_000_000_000_000_000;
