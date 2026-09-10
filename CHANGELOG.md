@@ -10,9 +10,16 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 - `clawback::recoverable_base_units` — the one authoritative, tested restatement of the puzzle's
   withdrawal-share arithmetic, bound to `withdraw_incentives.rs:105-107` by a simulator equality
   test for every amount a real clawback can pay on, i.e. up to
-  `u64::MAX / withdrawal_share_bps`. Above that bound upstream's own `u64` multiply overflows and
-  there is nothing to be equal to, so the `u128` intermediate is proven there arithmetically
+  `u64::MAX / withdrawal_share_bps`. Above that bound the `chia-sdk-driver` 0.36.0 Rust driver's
+  own `u64` multiply overflows and cannot build the spend (#3286) — the on-chain puzzle itself
+  still pays correctly at any scale — so the `u128` intermediate is proven there arithmetically
   instead (#3269)
+
+### Fixes
+- `recoverable_base_units` now returns `Option<u64>`, `None` for `withdrawal_share_bps > 10_000`:
+  the prior `.expect()` panicked reachably on an attacker-controlled bps constant above 10_000
+  (e.g. `u64::MAX` rewards at `65_535` bps), and its safety comment's claim that the quotient could
+  never exceed `rewards_base_units` was false above 10_000 bps (#3269)
 
 ## [0.2.0] - 2026-09-09
 

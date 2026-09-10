@@ -19,11 +19,16 @@
 //! arrives as a red build rather than a silent mismatch. §0.1 clause 1 forbids an *untested* copy
 //! scattered into a consumer that can drift unnoticed; a single tested restatement, kept here in
 //! the crate that owns the domain and proven equal to what the puzzle actually pays for every
-//! amount the puzzle can pay on, is not that drift — it is the fix for it. That qualifier is
-//! load-bearing: see [`recoverable_base_units`] for the bound, and for why nothing is equal to
-//! the puzzle above it. [`withdraw_committed_incentives`] itself still returns the
-//! puzzle's own figure, never a recomputation: [`recoverable_base_units`] exists so a caller (such
-//! as `dig.listRewardDistributorCommitments`) can preview the amount *before* paying for a spend.
+//! amount the puzzle can pay on, is not that drift — it is the fix for it. [`withdraw_committed_incentives`]
+//! itself still returns the puzzle's own figure, never a recomputation:
+//! [`recoverable_base_units`] exists so a caller (such as `dig.listRewardDistributorCommitments`)
+//! can preview the amount *before* paying for a spend.
+//!
+//! The puzzle itself pays the correct share at **any** scale — CLVM arithmetic is bignum, so there
+//! is no on-chain overflow. What fails above `u64::MAX / withdrawal_share_bps` is the
+//! `chia-sdk-driver` 0.36.0 Rust driver, whose own multiply is a plain `u64` (`withdraw_incentives.rs:105-107`)
+//! and cannot build the spend at that scale — a driver bug tracked as #3286, not a property of the
+//! reward system. See [`recoverable_base_units`] for the `bps` domain rule and that bound.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{
@@ -81,32 +86,49 @@ pub fn commitment_distributor_epoch_start(
 /// The simulator equality proof holds for
 /// `rewards_base_units <= u64::MAX / withdrawal_share_bps`: `2_049_638_230_412_172` base units at
 /// this crate's own 9_000 bps, and a simulator case sits on exactly that last base unit, so the
-/// bound is pinned rather than merely asserted here. It is not a test limitation, it is the whole
-/// range in which upstream is defined. Its `rewards * withdrawal_share_bps` (`withdraw_incentives.rs:105-107`)
-/// is a plain `u64` multiply, so above the bound a real clawback panics under overflow checks and
-/// silently wraps without them. There is no amount it *should* have paid for this function to be
-/// equal to, which is why the overflow-scale test asserts arithmetic only and claims nothing
-/// about upstream.
+/// bound is pinned rather than merely asserted here. That bound is **not** where the puzzle stops
+/// being able to pay — CLVM arithmetic is bignum, so the on-chain puzzle pays the correct share at
+/// any scale. It is where the `chia-sdk-driver` 0.36.0 Rust driver stops being able to build the
+/// spend at all: its own `rewards * withdrawal_share_bps` (`withdraw_incentives.rs:105-107`) is a
+/// plain `u64` multiply, so above the bound it panics under overflow checks and silently wraps
+/// without them — a driver bug tracked as #3286, not a property of the reward system. There is no
+/// amount the *driver* would have produced for this function to be equal to above that bound,
+/// which is why the overflow-scale test asserts arithmetic only and claims nothing about the
+/// driver's output there.
 ///
 /// Above the bound this function still returns the mathematically correct share, because the
 /// multiply runs in a `u128` intermediate. That is deliberate rather than defensive: callers here
 /// (such as `dig.listRewardDistributorCommitments` previewing a commitment) carry no chain-level
 /// amount limit of their own, and a preview that wrapped into a plausible-looking small number
 /// would be worse than one that refused. It remains a preview of the arithmetic, never a promise
-/// that a clawback spend at that scale would succeed — it would not.
+/// that a clawback spend at that scale would succeed with today's driver — it would not, until
+/// #3286 lands.
 ///
 /// `withdrawal_share_bps` is deliberately `u16`, narrower than the puzzle constant's own `u64`.
 /// That narrowing is the point: a caller reading `withdrawal_share_bps` off a chain constant must
-/// face the cast rather than have it silently wrap into a plausible-looking small share. Rejecting
-/// or clamping a constant above `u16::MAX` is the **caller's** responsibility, not this
-/// function's — it must never be widened to make that check disappear.
+/// face the cast rather than have it silently wrap into a plausible-looking small share.
+///
+/// The legitimate domain is `0..=10_000`: above 10_000 bps there is no honest share to quote — a
+/// distributor cannot pay back more than it holds — so this returns [`None`] rather than a
+/// confident number for a constant that is already nonsense. It does not clamp: clamping would
+/// report a plausible figure for a distributor whose real constant is hostile or corrupt, which is
+/// worse than refusing. A `u16` can carry values up to `65_535`, and that range is reachable — a
+/// caller such as `dig.listRewardDistributorCommitments` reads `withdrawal_share_bps` off the
+/// chain, and an attacker who launches a distributor with a hostile bps constant reaches this
+/// function with it.
 #[must_use]
-pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> u64 {
+pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> Option<u64> {
+    if withdrawal_share_bps > 10_000 {
+        return None;
+    }
+
     let share = u128::from(rewards_base_units) * u128::from(withdrawal_share_bps) / 10_000;
 
-    // `withdrawal_share_bps` is at most `u16::MAX` (65_535) and the divisor is 10_000, so the
-    // quotient can never exceed `rewards_base_units` and always fits back in a u64.
-    u64::try_from(share).expect("share of a u64 amount by a bps fraction fits in u64")
+    // `withdrawal_share_bps` is now bounded to `0..=10_000` (checked above) and the divisor is
+    // 10_000, so the quotient can never exceed `rewards_base_units` and always fits back in a u64.
+    // This is what the pre-guard comment claimed of the full `u16` range, which is false above
+    // 10_000 bps — `u64::MAX * 65_535 / 10_000` does not fit in a u64.
+    Some(u64::try_from(share).expect("share bounded to 0..=10_000 bps fits in u64"))
 }
 
 /// Withdraw one commitment, recovering the puzzle's withdrawal share of it.

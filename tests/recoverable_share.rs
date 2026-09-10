@@ -333,7 +333,7 @@ fn assert_matches_a_real_clawback(
             rewards_base_units,
             u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
         ),
-        paid,
+        Some(paid),
         "recoverable_base_units must equal what the puzzle actually paid"
     );
 
@@ -381,16 +381,18 @@ fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Re
 /// `~1.8e19`), proving the `u128` intermediate in `recoverable_base_units` is load-bearing rather
 /// than decorative: drop the intermediate and this test panics or returns a wrapped value.
 ///
-/// **This case deliberately asserts nothing about what a real clawback pays, and a future reader
-/// must not "helpfully" add that comparison back.** At this scale a real clawback pays nothing at
-/// all: upstream's own withdrawal share
+/// **This case deliberately asserts nothing about what a real clawback pays through today's
+/// driver, and a future reader must not "helpfully" add that comparison back.** The on-chain
+/// puzzle itself pays the correct share at any scale — CLVM arithmetic is bignum — but the
+/// `chia-sdk-driver` 0.36.0 Rust driver's own withdrawal-share multiply
 /// (`chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs:105-107`)
 /// is a plain `u64` multiply of `rewards` by `withdrawal_share_bps`, so it panics under overflow
-/// checks — which is exactly how this case first failed in CI — and wraps silently without them.
-/// An equality assertion here would be unsatisfiable by construction, because there is no correct
+/// checks — which is exactly how this case first failed in CI — and wraps silently without them,
+/// meaning the driver cannot build a spend at this scale at all (#3286, a driver bug). An equality
+/// assertion here would be unsatisfiable by construction, because there is no driver-produced
 /// amount for our figure to be equal to. The bound is `u64::MAX / withdrawal_share_bps`, about
-/// `2.05e15` base units at 9_000 bps; equality above it is tested by
-/// `recoverable_base_units_matches_a_real_clawback_at_odd_amounts`, below it.
+/// `2.05e15` base units at 9_000 bps; equality below it is tested by
+/// `recoverable_base_units_matches_a_real_clawback_at_odd_amounts`.
 #[test]
 fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
     const REWARDS: u64 = 2_000_000_000_000_000_000;
@@ -401,8 +403,31 @@ fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
     let expected = u64::try_from(u128::from(REWARDS) * u128::from(BPS) / 10_000)
         .expect("fits back in u64: the quotient never exceeds rewards_base_units");
 
-    assert_eq!(recoverable_base_units(REWARDS, BPS), expected);
+    assert_eq!(recoverable_base_units(REWARDS, BPS), Some(expected));
 
     // Sanity check the overflow premise: `REWARDS * (BPS as u64)` alone cannot fit in a u64.
     assert!(REWARDS.checked_mul(u64::from(BPS)).is_none());
+}
+
+/// Red test for #3269 C1: `withdrawal_share_bps` above the legitimate `0..=10_000` range made the
+/// `u128 -> u64` narrowing fail, and the `.expect()` that assumed it never could panicked —
+/// confirmed against `53a73ff1`:
+/// `panicked at src\clawback.rs:109:26: share of a u64 amount by a bps fraction fits in u64:
+/// TryFromIntError(PosOverflow)`. `withdrawal_share_bps` is `u16`, so an attacker-controlled
+/// chain-read value up to `65_535` reaches this — not just theoretically past `u64::MAX / bps`.
+///
+/// `(1_001, 10_001)` pins the boundary one bps above the legitimate range, distinct from the
+/// `u64::MAX` case so this cannot pass merely by refusing anything huge.
+#[test]
+fn recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking() {
+    assert_eq!(recoverable_base_units(u64::MAX, 65_535), None);
+    assert_eq!(recoverable_base_units(1_001, 10_001), None);
+}
+
+/// Selectivity: exactly at the boundary (`10_000` bps, the top of the legitimate range) the guard
+/// must NOT reject — proving `recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking`
+/// added a selective guard rather than a blanket one.
+#[test]
+fn recoverable_base_units_accepts_bps_at_the_10_000_boundary() {
+    assert_eq!(recoverable_base_units(1_001, 10_000), Some(1_001));
 }
