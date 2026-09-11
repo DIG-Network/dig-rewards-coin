@@ -19,16 +19,24 @@
 //! arrives as a red build rather than a silent mismatch. §0.1 clause 1 forbids an *untested* copy
 //! scattered into a consumer that can drift unnoticed; a single tested restatement, kept here in
 //! the crate that owns the domain and proven equal to `chia-sdk-driver` 0.36.0's returned figure
-//! at `withdraw_incentives.rs:105-107` for every amount the driver can pay on, is not that drift — it is the fix for it. [`withdraw_committed_incentives`]
-//! itself still returns the puzzle's own figure, never a recomputation:
-//! [`recoverable_base_units`] exists so a caller (such as `dig.listRewardDistributorCommitments`)
-//! can preview the amount *before* paying for a spend.
+//! at `withdraw_incentives.rs:105-107` for every amount the driver can pay on, is not that drift — it is the fix for it.
+//!
+//! **[`withdraw_committed_incentives`] does not simply return the puzzle's own figure.** The
+//! driver's `(Conditions, u64)` return is a Rust **re-derivation** of the share — a second,
+//! independent `u64` multiply, never curried into the puzzle solution and never present in the
+//! returned conditions — so above `u64::MAX / withdrawal_share_bps` it disagrees with (or, without
+//! checked arithmetic, silently misreports) what the on-chain puzzle actually pays (#3286). This
+//! function therefore refuses BEFORE calling the upstream driver when the share cannot be
+//! represented at all, and cross-checks the driver's returned figure against
+//! [`recoverable_base_units`] afterwards, refusing rather than returning a tuple that may not
+//! describe the real spend.
 //!
 //! The puzzle itself pays the correct share at **any** scale — CLVM arithmetic is bignum, so there
-//! is no on-chain overflow. What fails above `u64::MAX / withdrawal_share_bps` is the
-//! `chia-sdk-driver` 0.36.0 Rust driver, whose own multiply is a plain `u64` (`withdraw_incentives.rs:105-107`)
-//! and cannot build the spend at that scale — a driver bug tracked as #3286, not a property of the
-//! reward system. See [`recoverable_base_units`] for the `bps` domain rule and that bound.
+//! is no on-chain overflow and it never "cannot build the spend at that scale". What fails above
+//! `u64::MAX / withdrawal_share_bps` is only the `chia-sdk-driver` 0.36.0 Rust driver's own plain
+//! `u64` multiply (`withdraw_incentives.rs:105-107`), which misreports rather than refuses — a
+//! driver bug tracked as #3286, not a property of the reward system. See
+//! [`recoverable_base_units`] for the `bps` domain rule and that bound.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{
@@ -42,15 +50,39 @@ use chia_sdk_types::Conditions;
 use crate::RewardsError;
 
 /// A completed clawback: the conditions to deliver, and what the puzzle returned.
+///
+/// Fields are private with accessors. `RewardsError` is `#[non_exhaustive]`, so a new failure
+/// variant is invisible to a consumer at compile time -- but a `pub conditions` /
+/// `pub recovered_base_units` pair lets a consumer construct `Clawback { .. }` with any number of
+/// their own choosing, which repeats the exact trap #3286 is: a figure nothing downstream can
+/// verify against the puzzle. Only [`withdraw_committed_incentives`] can produce one, so a
+/// `Clawback` always describes a spend this crate actually built and cross-checked.
 #[derive(Debug)]
 pub struct Clawback {
-    /// Conditions the clawbacker's own coin must assert in the same bundle.
-    pub conditions: Conditions,
+    conditions: Conditions,
+    recovered_base_units: u64,
+}
 
-    /// The amount, in **$DIG base units**, the puzzle paid to the slot's recorded `clawback_ph`.
-    ///
-    /// This is the puzzle's own figure, not a recomputation of it.
-    pub recovered_base_units: u64,
+impl Clawback {
+    /// Conditions the clawbacker's own coin must assert in the same bundle.
+    #[must_use]
+    pub fn conditions(&self) -> &Conditions {
+        &self.conditions
+    }
+
+    /// Consumes `self`, returning the conditions to deliver.
+    #[must_use]
+    pub fn into_conditions(self) -> Conditions {
+        self.conditions
+    }
+
+    /// The amount, in **$DIG base units**, this crate cross-checked against the puzzle's own
+    /// arithmetic before returning it. See the module doc for why this is a checked re-derivation
+    /// rather than a value read straight off the puzzle.
+    #[must_use]
+    pub fn recovered_base_units(&self) -> u64 {
+        self.recovered_base_units
+    }
 }
 
 /// Who — and only who — may withdraw this commitment.
@@ -116,6 +148,7 @@ pub fn commitment_distributor_epoch_start(
 /// caller such as `dig.listRewardDistributorCommitments` reads `withdrawal_share_bps` off the
 /// chain, and an attacker who launches a distributor with a hostile bps constant reaches this
 /// function with it.
+///
 #[must_use]
 pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> Option<u64> {
     if withdrawal_share_bps > 10_000 {
@@ -130,6 +163,14 @@ pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16
     // 10_000 bps — `u64::MAX * 65_535 / 10_000` does not fit in a u64.
     Some(u64::try_from(share).expect("share bounded to 0..=10_000 bps fits in u64"))
 }
+
+/// The largest reserve, in **$DIG base units**, [`crate::state::read_distributor`] will attempt to
+/// reconstruct a generation through: above this, `reserve_base_units * 10_000` -- the widest a
+/// `withdrawal_share_bps` reading can validly be, per [`RewardsError::UnreadableDistributorConstants`]'s
+/// own domain check -- could exceed `u64::MAX`, which is the scale at which `chia-sdk-driver`
+/// 0.36.0's plain `u64` share multiply can misreport (#3286). Derived, never spelled as a decimal
+/// literal, so the bound cannot silently drift from the domain rule it is paired with.
+pub const MAX_REPORTABLE_COMMITMENT_BASE_UNITS: u64 = u64::MAX / 10_000;
 
 /// Withdraw one commitment, recovering the puzzle's withdrawal share of it.
 ///
@@ -154,9 +195,39 @@ pub fn withdraw_committed_incentives(
         return Err(RewardsError::NotTheClawbackAuthority);
     }
 
+    let rewards_base_units = commitment_slot.info.value.rewards;
+    let withdrawal_share_bps = distributor.info.constants.withdrawal_share_bps;
+
+    // Pre-guard, BEFORE the upstream call: `chia-sdk-driver` 0.36.0's own share multiply
+    // (`withdraw_incentives.rs:105-107`) is a plain `u64` multiply and panics under checked
+    // arithmetic with no chance to return anything at all (#3286). A post-hoc check cannot run
+    // inside a call that never returns.
+    if rewards_base_units.checked_mul(withdrawal_share_bps).is_none() {
+        return Err(RewardsError::DriverShareNotRepresentable {
+            rewards_base_units,
+            withdrawal_share_bps,
+        });
+    }
+
     let (conditions, recovered_base_units) = distributor
         .new_action::<RewardDistributorWithdrawIncentivesAction>()
         .spend(ctx, distributor, commitment_slot, reward_slot)?;
+
+    // Cross-check the driver's returned figure against this crate's own restatement. A
+    // disagreement means the pre-guard above was not tight enough to catch every way the
+    // driver's arithmetic can misreport (for example `withdrawal_share_bps` too wide for the
+    // `u16` `recoverable_base_units` takes) -- and either way, a disagreement makes the whole
+    // returned tuple untrustworthy, not just the share.
+    let restated = u16::try_from(withdrawal_share_bps)
+        .ok()
+        .and_then(|bps| recoverable_base_units(rewards_base_units, bps));
+
+    if restated != Some(recovered_base_units) {
+        return Err(RewardsError::DriverShareDisagrees {
+            driver_reported: recovered_base_units,
+            restated: restated.unwrap_or(0),
+        });
+    }
 
     Ok(Clawback {
         conditions,

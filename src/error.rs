@@ -79,6 +79,76 @@ pub enum RewardsError {
     /// crate.
     #[error("chia driver error: {0}")]
     Driver(#[from] Box<DriverError>),
+
+    /// A withdrawal's share cannot be computed by `chia-sdk-driver` 0.36.0 at all: its own
+    /// `rewards * withdrawal_share_bps` (`withdraw_incentives.rs:105-107`) is a plain `u64`
+    /// multiply and this pair overflows it (#3286).
+    ///
+    /// Refused BEFORE the upstream call, because a checked-arithmetic build would otherwise panic
+    /// inside the driver with no chance to report anything at all.
+    #[error(
+        "the withdrawal share for {rewards_base_units} base units at {withdrawal_share_bps} bps \
+         cannot be represented by the chia-sdk-driver 0.36.0 multiply (tracked upstream as #3286); \
+         refusing rather than paying a network fee for a spend the driver cannot build"
+    )]
+    DriverShareNotRepresentable {
+        /// The full committed amount the share would be computed from.
+        rewards_base_units: u64,
+        /// The distributor's own withdrawal-share basis points.
+        withdrawal_share_bps: u64,
+    },
+
+    /// The driver's returned withdrawal share disagrees with this crate's own restatement
+    /// ([`crate::recoverable_base_units`]).
+    ///
+    /// A disagreement means the driver's plain `u64` multiply wrapped (#3286): the whole returned
+    /// tuple is untrustworthy, not just the share, so this refuses the completed spend rather than
+    /// return it.
+    #[error(
+        "the driver reported a withdrawal share of {driver_reported} base units but this \
+         crate's own restatement computes {restated} -- the driver's u64 multiply wrapped (#3286)"
+    )]
+    DriverShareDisagrees {
+        /// What `chia-sdk-driver` 0.36.0 returned.
+        driver_reported: u64,
+        /// What [`crate::recoverable_base_units`] computes independently.
+        restated: u64,
+    },
+
+    /// A distributor's own `withdrawal_share_bps` constant is outside the legitimate `0..=10_000`
+    /// domain, so no honest share can be quoted for it at all.
+    ///
+    /// [`crate::state::read_distributor`] is deliberately distributor-agnostic and reads a
+    /// launcher any caller could have created, so a hostile or corrupt constant reaches this
+    /// check from unauthenticated chain input rather than only from DIG's own launches.
+    #[error(
+        "distributor constants carry withdrawal_share_bps={withdrawal_share_bps}, outside the \
+         legitimate 0..=10_000 domain -- refusing to read rather than reporting a fabricated share"
+    )]
+    UnreadableDistributorConstants {
+        /// The out-of-domain basis points read off the distributor's own constants.
+        withdrawal_share_bps: u64,
+    },
+
+    /// A distributor's reserve has grown too large, at this generation, for
+    /// [`crate::state::read_distributor`] to safely reconstruct: `reserve_base_units *
+    /// withdrawal_share_bps` could exceed `u64::MAX` inside the upstream driver's plain `u64`
+    /// multiply (#3286) before this crate ever sees a returned value to check.
+    ///
+    /// Refused BEFORE `RewardDistributor::from_spend` is called for this generation, because that
+    /// call is where the driver's own multiply would panic (checked arithmetic) or silently wrap
+    /// (release) with no way for this crate to intervene afterwards.
+    #[error(
+        "distributor reserve of {reserve_base_units} base units exceeds the \
+         {max_readable_base_units} base units this reader can safely reconstruct at this \
+         generation -- refusing rather than risk the driver's u64 share multiply (#3286)"
+    )]
+    DistributorReserveTooLargeToRead {
+        /// The reserve coin's amount immediately before this generation's reconstruction.
+        reserve_base_units: u64,
+        /// The largest reserve this reader will attempt to reconstruct through.
+        max_readable_base_units: u64,
+    },
 }
 
 impl From<DriverError> for RewardsError {

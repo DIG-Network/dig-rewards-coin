@@ -399,6 +399,35 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// 8. A money cross-check: the tip reserve coin must be unspent and its amount must equal
 ///    `state.total_reserves`.
 /// 9. `peak_height` and `block_timestamp(peak_height)`, both mandatory.
+///
+/// # Two pre-guards against #3286, ahead of the withdraw path this walk can reconstruct
+///
+/// `chia-sdk-driver` 0.36.0's `WithdrawIncentives` action re-derives the withdrawal share with a
+/// plain `u64` multiply (`withdraw_incentives.rs:71,89`) and this walk calls into that code
+/// (`RewardDistributor::from_spend`, step 7) for every generation, so an unrepresentable share
+/// would panic (checked arithmetic) or silently corrupt `RewardDistributorRewardSlotValue::rewards`
+/// (release) with no chance for this function to intervene afterwards -- a post-hoc check cannot
+/// run inside a call that never returns. Both guards therefore run BEFORE the call they protect:
+///
+/// - **B1** (constants domain): refuses if the distributor's own `withdrawal_share_bps` is outside
+///   `0..=10_000`, immediately after `from_launcher_solution`.
+/// - **B2** (scale domain): refuses, immediately before each generation's `from_spend`, if the
+///   reserve amount as it stood BEFORE that generation exceeds [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`]
+///   (`u64::MAX / 10_000`).
+///
+/// **B2's premise is an open invariant, not a proven one.** The intended proof is: B1 ∧ B2 implies
+/// `committed_value * withdrawal_share_bps <= u64::MAX` for every withdraw action `from_spend`
+/// reconstructs, resting on *"a commitment slot's recorded `rewards` (its `committed_value`) never
+/// exceeds the reserve amount outstanding at the generation it is withdrawn"*. That premise was
+/// NOT established against the CLVM puzzle or an on-chain accounting proof in this pass -- it is
+/// architecturally plausible (`CommitIncentives` deposits `committed_value` into the reserve at
+/// commit time, and any real payout is bounded by the physical reserve coin's amount by CAT
+/// conservation) but this crate found no explicit upstream guarantee that the reserve is never
+/// drawn down, by some OTHER action, below a still-outstanding commitment's full `committed_value`
+/// before that commitment is withdrawn. If that can happen, B2 as written does not fully close
+/// #3286 for this reader, and the guard would need to bound `committed_value` more directly (for
+/// example by tracking outstanding commitment totals through the walk) rather than the reserve
+/// coin amount alone. Flagged for #3303/#3305 rather than assumed.
 pub fn read_distributor(
     source: &impl ChainSource,
     launcher_id: Bytes32,
@@ -437,6 +466,20 @@ pub fn read_distributor(
             "launcher solution is not a reward-distributor launch",
         ));
     };
+
+    // B1 (constants domain): the same 0..=10_000 domain rule `recoverable_base_units` already
+    // enforces, checked here against the distributor's OWN constants rather than DIG's -- this
+    // reader is deliberately distributor-agnostic (see this function's own docs), so an equality
+    // check against WITHDRAWAL_SHARE_BPS would wrongly refuse an honest self-skim variant. A
+    // hostile or corrupt launcher reaches this from unauthenticated chain input, and refusing here
+    // -- before B2, before any `from_spend` -- is the only chance to refuse at all: once inside
+    // the walk, `chia-sdk-driver` 0.36.0's own share multiply (#3286) has no domain check of its
+    // own.
+    if constants.withdrawal_share_bps > 10_000 {
+        return Err(RewardsError::UnreadableDistributorConstants {
+            withdrawal_share_bps: constants.withdrawal_share_bps,
+        });
+    }
 
     let Some(eve_spend) = source
         .coin_spend(eve_coin.coin_id())
@@ -491,6 +534,19 @@ pub fn read_distributor(
             // Unspent: this generation is the tip.
             break;
         };
+
+        // B2 (scale domain), composed with B1 above: refuse BEFORE `from_spend` reconstructs this
+        // generation, using the reserve amount as it stood immediately BEFORE this generation --
+        // never a figure read out of the reconstruction this guard exists to protect, which would
+        // let the panic win first. See this function's module-level doc for the open premise this
+        // rests on (B1 ^ B2 implies every withdraw action's `committed_value * withdrawal_share_bps`
+        // fits in a u64) and why it is flagged rather than assumed silently.
+        if distributor.reserve.coin.amount > crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS {
+            return Err(RewardsError::DistributorReserveTooLargeToRead {
+                reserve_base_units: distributor.reserve.coin.amount,
+                max_readable_base_units: crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+            });
+        }
 
         let reserve_lineage_proof = distributor.reserve.child_lineage_proof();
         let Some(reconstructed) = chia_sdk_driver::RewardDistributor::from_spend(
