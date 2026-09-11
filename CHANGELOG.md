@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.1] - 2026-09-11
+
+### Documentation
+- Uptime warning, version-claim fix, SPEC status-row correction (#9)
+
 ## [0.4.0] - 2026-09-11
 
 ### Features
