@@ -144,7 +144,10 @@ pub enum RewardsError {
          generation -- refusing rather than risk the driver's u64 share multiply (#3286)"
     )]
     DistributorReserveTooLargeToRead {
-        /// The reserve coin's amount immediately before this generation's reconstruction.
+        /// The **largest** reserve coin amount the walk observed at or before the generation
+        /// it refused. A commitment is deposited in its own generation and withdrawn in a
+        /// later one, so the high-water mark -- not the refused generation's own reserve --
+        /// is what bounds the `committed_value` a withdraw action can name.
         reserve_base_units: u64,
         /// The largest reserve this reader will attempt to reconstruct through.
         max_readable_base_units: u64,
