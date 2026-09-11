@@ -1275,7 +1275,7 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         "a wrong authority is NotTheClawbackAuthority, got: {refusal}"
     );
 
-    // The recorded authority succeeds, and the figure returned is the puzzle's own.
+    // The recorded authority succeeds, and the guards cross-check the figure returned.
     let clawback = withdraw_committed_incentives(
         ctx,
         &mut harness.distributor,
@@ -1284,13 +1284,13 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         harness.funder.puzzle_hash,
     )?;
     assert_eq!(
-        clawback.recovered_base_units,
+        clawback.recovered_base_units(),
         COMMITTED_BASE_UNITS * WITHDRAWAL_SHARE_BPS / 10_000,
         "§7.5: the funder recovers withdrawal_share_bps of the commitment, and the rest stays \
          in the reserve"
     );
     assert!(
-        clawback.recovered_base_units < COMMITTED_BASE_UNITS,
+        clawback.recovered_base_units() < COMMITTED_BASE_UNITS,
         "a clawback is never the whole commitment: the forfeit is the deterrent"
     );
 

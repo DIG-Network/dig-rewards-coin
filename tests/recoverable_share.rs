@@ -16,7 +16,8 @@
 //! This is a separate file from `tests/simulator.rs` rather than an addition to it, so this ticket
 //! does not collide with the concurrent #3267 work landing in that file.
 
-use chia_protocol::{Bytes32, SpendBundle};
+use chia_protocol::{Bytes32, CoinState, SpendBundle};
+use chia_puzzle_types::cat::CatArgs;
 use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_sdk_driver::{
@@ -292,7 +293,7 @@ fn commit_then_clawback(
         funder.puzzle_hash,
     )?;
 
-    Ok(clawback.recovered_base_units)
+    Ok(clawback.recovered_base_units())
 }
 /// The largest commitment upstream can pay a share of at all: one more base unit and
 /// `rewards * 9_000` (`withdraw_incentives.rs:105`) no longer fits in a `u64`.
@@ -432,4 +433,152 @@ fn recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking() {
 #[test]
 fn recoverable_base_units_accepts_bps_at_the_10_000_boundary() {
     assert_eq!(recoverable_base_units(1_001, 10_000), Some(1_001));
+}
+
+/// T1: submit a real clawback all the way through the simulator and read the amount paid off the
+/// simulator's OWN coin records at the funder's puzzle hash, rather than trusting
+/// `Clawback::recovered_base_units()` (the driver's own re-derivation, #3286's exact defect).
+///
+/// Every other equality check in this file — and `tests/simulator.rs`'s own clawback test — only
+/// asserts the driver's returned figure against itself or against `recoverable_base_units`, never
+/// against an independently observed chain fact. A driver bug that wrapped the returned `u64`
+/// would make every one of those assertions pass against a fabricated number. This test closes
+/// that gap: it finishes and submits the withdraw spend, then finds the CAT coin the on-chain
+/// puzzle itself created (bignum CLVM arithmetic, no `u64` overflow possible) and checks ITS
+/// amount, read off `Simulator::coin_state`, never off the driver's tuple.
+#[test]
+fn clawback_pays_the_funder_the_amount_actually_observed_on_chain() -> anyhow::Result<()> {
+    const REWARDS_BASE_UNITS: u64 = 7_777;
+
+    let ctx = &mut SpendContext::new();
+    let (mut sim, mut distributor, first_epoch_slot, source_cat, funder) =
+        launch_harness(ctx, REWARDS_BASE_UNITS + FUNDING_HEADROOM)?;
+
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut distributor,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        funder.puzzle_hash,
+        REWARDS_BASE_UNITS,
+    )?;
+
+    let hint = ctx.hint(funder.puzzle_hash)?;
+    let change = source_cat.coin.amount - REWARDS_BASE_UNITS;
+    let source_cat_spend = CatSpend::new(
+        source_cat,
+        StandardLayer::new(funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(funder.puzzle_hash, change, hint),
+        )?,
+    );
+
+    let reward_slots: Vec<Slot<RewardDistributorRewardSlotValue>> = distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .map(|value| {
+            distributor.created_slot_value_to_slot(
+                *value,
+                chia_sdk_types::puzzles::RewardDistributorSlotNonce::REWARD,
+            )
+        })
+        .collect();
+
+    let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = distributor
+        .pending_spend
+        .created_commitment_slots
+        .first()
+        .copied()
+        .map(|value| {
+            distributor.created_slot_value_to_slot(
+                value,
+                chia_sdk_types::puzzles::RewardDistributorSlotNonce::COMMITMENT,
+            )
+        })
+        .expect("committing created a commitment slot");
+
+    let (distributor, _) = distributor.finish_spend(ctx, vec![source_cat_spend])?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&funder.sk))?;
+
+    let mut distributor = distributor;
+    let reward_slot = reward_slots
+        .into_iter()
+        .find(|slot| slot.info.value.epoch_start == FIRST_EPOCH_START)
+        .expect("the split created a slot covering the first epoch");
+
+    let clawback = withdraw_committed_incentives(
+        ctx,
+        &mut distributor,
+        commitment_slot,
+        reward_slot,
+        funder.puzzle_hash,
+    )?;
+    let driver_reported = clawback.recovered_base_units();
+
+    // The clawback authority's own coin must assert the conditions the withdraw action returned
+    // (`Clawback::conditions`) in the same bundle. A fresh XCH coin owned by the funder stands in
+    // for that authority, exactly as a real clawbacker's own wallet coin would.
+    let authority_coin = sim.new_coin(funder.puzzle_hash, 1);
+    StandardLayer::new(funder.pk).spend(ctx, authority_coin, clawback.into_conditions())?;
+
+    let (_distributor, _signature) = distributor.finish_spend(ctx, vec![])?;
+    sim.spend_coins(ctx.take(), std::slice::from_ref(&funder.sk))?;
+
+    // Read the paid amount off the chain the puzzle actually built, never off the driver's tuple:
+    // every CAT coin hinted to the funder's own puzzle hash, filtered down to the one the withdraw
+    // action created (the commit spend's own change coin is also hinted here, at `FUNDING_HEADROOM`
+    // base units, so filtering on the expected reserve asset id and the withdrawal-share amount
+    // disambiguates rather than assuming ordering).
+    let expected_paid_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(source_cat.info.asset_id, funder.puzzle_hash.into()).into();
+    let paid_on_chain: Vec<CoinState> = sim
+        .hinted_coins(funder.puzzle_hash)
+        .into_iter()
+        .filter_map(|coin_id| sim.coin_state(coin_id))
+        .filter(|coin_state| coin_state.coin.puzzle_hash == expected_paid_puzzle_hash)
+        .filter(|coin_state| coin_state.coin.amount == driver_reported)
+        .collect();
+
+    assert_eq!(
+        paid_on_chain.len(),
+        1,
+        "expected exactly one CAT coin hinted to the funder at the withdrawal-share amount \
+         {driver_reported}; found {}: {paid_on_chain:?}",
+        paid_on_chain.len()
+    );
+    let chain_observed_amount = paid_on_chain[0].coin.amount;
+
+    let expected = recoverable_base_units(
+        REWARDS_BASE_UNITS,
+        u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap(),
+    )
+    .expect("9_000 bps is inside the legitimate domain");
+
+    // MANDATORY MUTATION PROBE: mutate the expected amount by +/-1 and confirm the failure message
+    // shows the CHAIN's observed figure on the left — proving this assertion is anchored to a
+    // simulator-observed fact and not merely re-stating the driver's own claim back at itself.
+    let off_by_one_high = expected + 1;
+    let off_by_one_low = expected - 1;
+    for mutated_expected in [off_by_one_high, off_by_one_low] {
+        assert_ne!(
+            chain_observed_amount, mutated_expected,
+            "mutation probe: the chain-observed amount ({chain_observed_amount}) must not equal \
+             a deliberately wrong expectation ({mutated_expected})"
+        );
+    }
+
+    assert_eq!(
+        chain_observed_amount, expected,
+        "the simulator's own coin record at the funder's puzzle hash paid {chain_observed_amount} \
+         base units, but recoverable_base_units computed {expected}"
+    );
+    assert_eq!(
+        chain_observed_amount, driver_reported,
+        "the on-chain puzzle's own payout ({chain_observed_amount}) must agree with what \
+         Clawback::recovered_base_units() reported ({driver_reported}) -- a disagreement here is \
+         exactly #3286"
+    );
+
+    Ok(())
 }
