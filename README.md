@@ -4,10 +4,31 @@ Reward-distributor coin driver for the DIG Network, on Chia.
 
 The driver ships: the DIG-shaped constants table, the launch comment, the launch / fund /
 clawback / entry-set / epoch / payout spend builders, the eligibility rule, the observable state,
-and — as of 0.3.0 — the chain reader (`state::read_distributor`,
+and — as of 0.4.0 — the chain reader (`state::read_distributor`,
 [#3267](https://github.com/DIG-Network/dig_ecosystem/issues/3267)) that rebuilds a distributor's
 state from its launcher id alone. `SPEC.md` at the repository root is normative. See the parent
 epic [#3246](https://github.com/DIG-Network/dig_ecosystem/issues/3246).
+
+## Uptime — what a stopped prover does and does not do (SPEC §2.2)
+
+This crate performs no I/O and runs no loop itself; the **prover loop** that reads `SPEC.md` §2.2
+against runs in `dig-node`. Anyone integrating that prover, or a funder deciding whether to launch
+a distributor, should hold these five facts (normative text: `SPEC.md` §2.2):
+
+1. The prover determines **who** is paid, not **whether** anyone is paid. Accrual and payouts are
+   permissionless and continue while the prover is stopped — they need no permission from anyone,
+   including from the funder's machine.
+2. Funds are not lost when the prover stops: they stay in the reserve, and future commitments
+   remain clawback-eligible (§7.4).
+3. While the prover is stopped, the entry set — the paid list — is frozen: peers that stopped
+   mirroring keep earning, and peers that started mirroring cannot be added.
+4. Losing the manager singleton key freezes the entry set **permanently** — unless the manager's
+   inner puzzle was chosen recovery-capable **at launch** (§7.2). That choice exists only on the
+   creation screen and is fixed for the life of the distributor once the launch spend is signed.
+5. The clause-3 loss is bounded by the funder's commitment depth, `COMMITMENT_DEPTH_EPOCHS = 2`
+   future epochs (§7.4) — the risk has a stated bound, not just an alarm.
+
+**Downtime does not pause payment. It hands payment to a list that has stopped being true.**
 
 ## Shape, copied from `dig-mirror-coin`
 
