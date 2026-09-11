@@ -1613,7 +1613,7 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
     assert_ne!(
         snapshot.distributor().reserve.proof,
         zero_lineage_proof(),
-        "REVERT-PROOF: from_parent_spend fabricates an all-zero LineageProof for the reserve; a genuine read must never produce one"
+        "the reserve proof reaching a snapshot must not be the all-zero one from_parent_spend          fabricates -- but NOTE: this assertion is NOT a revert-proof for that authentication.          This walk drives several generations past eve, and each `.child()` re-derives the proof          via `child_lineage_proof()`, so a landmine at steps 4-5 heals before the snapshot is          returned and this assertion still passes. The load-bearing one is in          `a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_selector`,          which reads with no generation driven past eve"
     );
 
     // ---- §12.4, and why the signal cannot be the slot deltas (F1) ----------------------------
@@ -1675,6 +1675,12 @@ fn an_entry_write_generation_with_no_resolvable_timestamp_is_refused() -> anyhow
 
     let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
 
+    // Captured BEFORE any further generation: `find_eve_reserve_provenance` authenticates the
+    // EVE-ERA reserve coin against its parent spend, so it is the launch-time reserve and its
+    // parent -- not the tip reserve -- that the chain source must be able to answer for.
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
     let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
     // The generation whose spend carries the AddEntry action -- the one entry-set write this
     // walk observes, and whose SPENT HEIGHT will be made timestamp-less below.
@@ -1702,8 +1708,6 @@ fn an_entry_write_generation_with_no_resolvable_timestamp_is_refused() -> anyhow
         .spent_height
         .expect("it was spent by the AddEntry bundle");
 
-    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
-    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
     let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
 
     let chain = mock_chain_source_missing_timestamps(

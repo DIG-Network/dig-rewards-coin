@@ -538,10 +538,24 @@ pub fn read_distributor(
                 .map_err(chain_unavailable)?
                 .and_then(|record| record.spent_height);
             if let Some(height) = spent_height {
-                last_entry_write_unix = source
-                    .block_timestamp(height)
-                    .map_err(chain_unavailable)?
-                    .or(last_entry_write_unix);
+                // Refuse rather than fall back. `block_timestamp`'s contract makes `Ok(None)`
+                // mean "no such block OR no timestamp index", which a pruning RPC answers for an
+                // old height while answering the peak fine -- so this is reachable in production.
+                // Keeping the previous value would report an OLDER write as the most recent one,
+                // and leaving `None` would assert the positive fact `ChainObservation::
+                // last_entry_write_unix` documents ("no entry-set write has ever happened") about
+                // a write this walk just observed. Both silently drop it; the peak timestamp
+                // below already takes this same posture.
+                last_entry_write_unix = Some(
+                    source
+                        .block_timestamp(height)
+                        .map_err(chain_unavailable)?
+                        .ok_or_else(|| {
+                            malformed(
+                                "an observed entry-set write has no resolvable chain timestamp",
+                            )
+                        })?,
+                );
             }
         }
     }
