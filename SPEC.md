@@ -1841,7 +1841,7 @@ clause quietly deleted to make the MVP look complete, are both the failure this 
 | §10 Identity binding | **ships** | it is §4's mechanism; there is nothing separate to build |
 | §11 Shares policy | **ships** | `shares = 1`, refused otherwise |
 | §12 Recovery | **ships** | §12.4's chain-derived `EntrySetStale` included; it is what a mirror reads instead of trusting an operator |
-| §13.1 On-chain discovery | **ships** | |
+| §13.1 On-chain discovery | **specified, NOT implemented at 0.4.0** | On-chain discovery by `storeId:root` is unimplemented as of 0.4.0: `LaunchComment` is encoded at launch and never decoded from a chain-observed spend. Implementation is tracked by dig_ecosystem#3249 |
 | §13.2 Off-chain discovery | **specified, deferred** | **#3252**. Safe to defer only because §13.2 clause 2 holds |
 | §13.3 `Refresh` | **specified, not used** | inapplicable in `Managed` mode; nothing to defer |
 | metrics presentation beyond the §2.3 counters | **specified, deferred** | **#3253** ships create-with-warning, refill, clawback (per epoch, fed by §2.6's `dig.listRewardDistributorCommitments`) and prover health; per-epoch payout history and charting follow |
