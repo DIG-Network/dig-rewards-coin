@@ -65,13 +65,13 @@ pub struct Clawback {
 
 impl Clawback {
     /// Conditions the clawbacker's own coin must assert in the same bundle.
-    #[must_use]
+    ///
+    /// `Conditions` is itself `#[must_use]`, so no attribute is needed here.
     pub fn conditions(&self) -> &Conditions {
         &self.conditions
     }
 
     /// Consumes `self`, returning the conditions to deliver.
-    #[must_use]
     pub fn into_conditions(self) -> Conditions {
         self.conditions
     }

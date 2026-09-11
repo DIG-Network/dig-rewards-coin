@@ -4,7 +4,7 @@
 //!
 //! Every `ChainSource` error MUST become [`crate::RewardsError::ChainUnavailable`]. A distributor
 //! whose read failed MUST NOT render as "no entries" or "nothing accrued" — those are claims about
-//! money, and the honest answer is that the question went unanswered. [`Ok(None)`] is reserved for
+//! money, and the honest answer is that the question went unanswered. `Ok(None)` is reserved for
 //! exactly one fact: the launcher id was never spent, i.e. no distributor was ever launched there.
 //!
 //! # The landmine this reader must never touch
