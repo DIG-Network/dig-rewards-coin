@@ -1358,6 +1358,21 @@ fn mock_chain_source(
     singleton_members: &[Bytes32],
     extra_coin_ids: &[Bytes32],
 ) -> dig_chainsource_interface::MockChainSource {
+    mock_chain_source_missing_timestamps(sim, launcher_id, singleton_members, extra_coin_ids, &[])
+}
+
+/// As [`mock_chain_source`], but answers `None` for every height in `missing_heights` rather than
+/// loading a timestamp for it -- what a pruning RPC that indexes only the peak looks like.
+/// `block_timestamp`'s own contract (`dig-chainsource-interface` 0.3.3, `source.rs:102-105`) makes
+/// `Ok(None)` mean "no such block OR no timestamp index", so this is a reachable production
+/// answer, not a hostile fixture (F5).
+fn mock_chain_source_missing_timestamps(
+    sim: &Simulator,
+    launcher_id: Bytes32,
+    singleton_members: &[Bytes32],
+    extra_coin_ids: &[Bytes32],
+    missing_heights: &[u32],
+) -> dig_chainsource_interface::MockChainSource {
     let tip = *singleton_members
         .last()
         .expect("a singleton chain always has at least the launcher");
@@ -1399,8 +1414,12 @@ fn mock_chain_source(
 
     let peak = sim.height();
     // Synthetic but monotonic: nothing here asserts these equal any real chain clock, only that
-    // every height read_distributor asks about resolves to SOME timestamp.
+    // every height read_distributor asks about resolves to SOME timestamp -- except a height
+    // named in `missing_heights`, which resolves to none at all.
     for height in 0..=peak {
+        if missing_heights.contains(&height) {
+            continue;
+        }
         source = source.with_timestamp(height, mock_timestamp(height));
     }
     source.with_peak(peak)
@@ -1635,6 +1654,69 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
     assert!(
         !stale.entry_set_frozen(),
         "this distributor has a real manager singleton, so its entry set is not frozen"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// F5: an observed entry-set write whose generation has no resolvable chain timestamp must refuse
+// the read, never report a snapshot with a stale/absent `last_entry_write_unix` -- a pruning RPC
+// answers `Some` for the peak and `None` for an old height, so this is a reachable production
+// answer (`block_timestamp`'s own contract, `dig-chainsource-interface` 0.3.3, source.rs:102-105),
+// not a hostile fixture.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_entry_write_generation_with_no_resolvable_timestamp_is_refused() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    // The generation whose spend carries the AddEntry action -- the one entry-set write this
+    // walk observes, and whose SPENT HEIGHT will be made timestamp-less below.
+    let entry_write_generation = harness.distributor.coin.coin_id();
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let entry_write_height = harness
+        .sim
+        .coin_state(entry_write_generation)
+        .expect("the entry-writing generation is a real coin")
+        .spent_height
+        .expect("it was spent by the AddEntry bundle");
+
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    let chain = mock_chain_source_missing_timestamps(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+        &[entry_write_height],
+    );
+
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "an observed entry-set write has no resolvable chain timestamp",
     );
 
     Ok(())
