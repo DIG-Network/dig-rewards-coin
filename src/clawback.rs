@@ -202,7 +202,10 @@ pub fn withdraw_committed_incentives(
     // (`withdraw_incentives.rs:105-107`) is a plain `u64` multiply and panics under checked
     // arithmetic with no chance to return anything at all (#3286). A post-hoc check cannot run
     // inside a call that never returns.
-    if rewards_base_units.checked_mul(withdrawal_share_bps).is_none() {
+    if rewards_base_units
+        .checked_mul(withdrawal_share_bps)
+        .is_none()
+    {
         return Err(RewardsError::DriverShareNotRepresentable {
             rewards_base_units,
             withdrawal_share_bps,
