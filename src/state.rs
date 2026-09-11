@@ -537,26 +537,35 @@ pub fn read_distributor(
                 .coin_record(spend.coin.coin_id())
                 .map_err(chain_unavailable)?
                 .and_then(|record| record.spent_height);
-            if let Some(height) = spent_height {
-                // Refuse rather than fall back. `block_timestamp`'s contract makes `Ok(None)`
-                // mean "no such block OR no timestamp index", which a pruning RPC answers for an
-                // old height while answering the peak fine -- so this is reachable in production.
-                // Keeping the previous value would report an OLDER write as the most recent one,
-                // and leaving `None` would assert the positive fact `ChainObservation::
-                // last_entry_write_unix` documents ("no entry-set write has ever happened") about
-                // a write this walk just observed. Both silently drop it; the peak timestamp
-                // below already takes this same posture.
-                last_entry_write_unix = Some(
-                    source
-                        .block_timestamp(height)
-                        .map_err(chain_unavailable)?
-                        .ok_or_else(|| {
-                            malformed(
-                                "an observed entry-set write has no resolvable chain timestamp",
-                            )
-                        })?,
-                );
-            }
+            // Refuse rather than silently drop the write. BOTH halves of the read above can be
+            // absent from a source that is not lying: `coin_record` answers `Ok(None)` for a
+            // pruned generation, and `spent_height` is documented as the height "if it has been
+            // spent and the source knows it" (`dig-chainsource-interface` 0.3.3,
+            // `record.rs:17`). Either collapses here, and leaving `None` would assert the
+            // positive fact `ChainObservation::last_entry_write_unix` documents ("no entry-set
+            // write has ever happened") about a write this walk just observed. It is also
+            // self-inconsistent source data: we are only in this branch because `coin_spend`
+            // returned this generation's spend, so the coin is known-spent -- the same
+            // contradiction step 8 above already refuses.
+            let height = spent_height.ok_or_else(|| {
+                malformed("an observed entry-set write's generation has no resolvable spent height")
+            })?;
+            // Refuse rather than fall back. `block_timestamp`'s contract makes `Ok(None)`
+            // mean "no such block OR no timestamp index", which a pruning RPC answers for an
+            // old height while answering the peak fine -- so this is reachable in production.
+            // Keeping the previous value would report an OLDER write as the most recent one,
+            // and leaving `None` would assert the positive fact `ChainObservation::
+            // last_entry_write_unix` documents ("no entry-set write has ever happened") about
+            // a write this walk just observed. Both silently drop it; the peak timestamp
+            // below already takes this same posture.
+            last_entry_write_unix = Some(
+                source
+                    .block_timestamp(height)
+                    .map_err(chain_unavailable)?
+                    .ok_or_else(|| {
+                        malformed("an observed entry-set write has no resolvable chain timestamp")
+                    })?,
+            );
         }
     }
 

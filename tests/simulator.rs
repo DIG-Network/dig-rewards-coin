@@ -1373,6 +1373,49 @@ fn mock_chain_source_missing_timestamps(
     extra_coin_ids: &[Bytes32],
     missing_heights: &[u32],
 ) -> dig_chainsource_interface::MockChainSource {
+    chain_source_with_gaps(
+        sim,
+        launcher_id,
+        singleton_members,
+        extra_coin_ids,
+        missing_heights,
+        &[],
+    )
+}
+
+/// As [`mock_chain_source`], but answers `Ok(None)` from `coin_record` for every id in
+/// `unrecorded_coin_ids` while still serving that coin's SPEND -- a source that knows a coin was
+/// spent but not at which height. `CoinRecord::spent_height` is documented as the spend height
+/// "if it has been spent AND THE SOURCE KNOWS IT" (`dig-chainsource-interface` 0.3.3,
+/// `record.rs:17`), and a pruning source answers this for an old generation, so it is a
+/// sanctioned production answer rather than a hostile fixture (F6).
+fn mock_chain_source_unrecorded_coins(
+    sim: &Simulator,
+    launcher_id: Bytes32,
+    singleton_members: &[Bytes32],
+    extra_coin_ids: &[Bytes32],
+    unrecorded_coin_ids: &[Bytes32],
+) -> dig_chainsource_interface::MockChainSource {
+    chain_source_with_gaps(
+        sim,
+        launcher_id,
+        singleton_members,
+        extra_coin_ids,
+        &[],
+        unrecorded_coin_ids,
+    )
+}
+
+/// The one builder both gap-injecting helpers above delegate to, so a fixture can only ever
+/// differ from [`mock_chain_source`] by the gaps it names.
+fn chain_source_with_gaps(
+    sim: &Simulator,
+    launcher_id: Bytes32,
+    singleton_members: &[Bytes32],
+    extra_coin_ids: &[Bytes32],
+    missing_heights: &[u32],
+    unrecorded_coin_ids: &[Bytes32],
+) -> dig_chainsource_interface::MockChainSource {
     let tip = *singleton_members
         .last()
         .expect("a singleton chain always has at least the launcher");
@@ -1396,11 +1439,16 @@ fn mock_chain_source_missing_timestamps(
         .chain(eve_coin_id);
 
     for id in ids {
-        if let Some(state) = sim.coin_state(id) {
-            source = source.with_coin(
-                id,
-                dig_chainsource_interface::CoinRecord::from_coin_state(state),
-            );
+        // The SPEND is always loaded; only the RECORD is withheld for an unrecorded id. That is
+        // what makes the resulting source self-inconsistent in the way F6 is about: it hands over
+        // the spend that proves the coin is spent, and no height for it.
+        if !unrecorded_coin_ids.contains(&id) {
+            if let Some(state) = sim.coin_state(id) {
+                source = source.with_coin(
+                    id,
+                    dig_chainsource_interface::CoinRecord::from_coin_state(state),
+                );
+            }
         }
         if let Some(spend) = sim.coin_spend(id) {
             source = source.with_spend(id, spend);
@@ -1721,6 +1769,75 @@ fn an_entry_write_generation_with_no_resolvable_timestamp_is_refused() -> anyhow
     assert_malformed_because(
         read_distributor(&chain, launcher_id),
         "an observed entry-set write has no resolvable chain timestamp",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// F6: the same walk, one branch earlier. `read_distributor` resolves an observed entry-set
+// write's timestamp from `coin_record(generation).spent_height`, and BOTH halves of that can be
+// absent from a source that is not lying: `spent_height` is documented as the height "if it has
+// been spent and the source knows it" (`dig-chainsource-interface` 0.3.3, `record.rs:17`), and a
+// pruning source answers `Ok(None)` for an old generation's record outright. Either way the walk
+// reaches the tip and reports `last_entry_write_unix: None` -- which
+// `ChainObservation::last_entry_write_unix` documents as the POSITIVE fact "no entry-set write
+// has ever happened since launch", about a write this very walk observed.
+//
+// The fixture drives the `coin_record(..) == Ok(None)` sub-path: the source serves the write
+// generation's SPEND (so the walk parses the AddEntry and the branch is entered) and withholds
+// only its record. That is the same contradiction step 8 already refuses -- a source that hands
+// over a spend it cannot place on a chain.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_entry_write_generation_with_no_resolvable_spent_height_is_refused() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+
+    // Captured BEFORE the write generation is driven: `find_eve_reserve_provenance`
+    // authenticates the EVE-ERA reserve against its parent spend, so capturing these after the
+    // write would make the read die on the eve-era reserve long before it reaches the branch
+    // under test, and the test would be red for the wrong reason.
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    // The generation whose spend carries the AddEntry action -- the one entry-set write this walk
+    // observes, and the one whose coin RECORD is withheld below.
+    let entry_write_generation = harness.distributor.coin.coin_id();
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    let chain = mock_chain_source_unrecorded_coins(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+        &[entry_write_generation],
+    );
+
+    assert_malformed_because(
+        read_distributor(&chain, launcher_id),
+        "an observed entry-set write's generation has no resolvable spent height",
     );
 
     Ok(())
