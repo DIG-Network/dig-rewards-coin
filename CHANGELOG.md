@@ -4,36 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.4.0] - 2026-09-10
+## [0.4.0] - 2026-09-11
 
 ### Features
-- Chain reader `state::read_distributor` — rebuilds a full `DistributorSnapshot` from a
-  distributor's launcher id alone, over a caller-supplied `ChainSource`; never calls
-  `RewardDistributor::from_parent_spend`, which fabricates a zero `LineageProof` for the reserve
-  (#3267)
-
-### Fixed
-- `state::read_distributor` — §12.4's staleness signal is derived from each generation's action log
-  and counts only `AddEntry`/`RemoveEntry`. It was derived from the created/spent entry-slot deltas,
-  which `InitiatePayout` also writes, so a single entry holder claiming inside every 48 h window
-  reset the signal for a distributor whose prover was dead (#3267)
-- `state::read_distributor` — the reward slot the launch creates is carried into the snapshot; it
-  was discarded, so a chain-rebuilt prover could not roll the first distributor epoch and
-  `rewards_per_distributor_epoch()` under-reported (#3267)
-- `state::read_distributor` — a generation that spends a slot the walk never saw created is now
-  `Malformed` rather than a silent no-op: a diverged read is an error, not a smaller answer (#3267)
-- `DistributorSnapshot` / `ChainObservation` — fields are private behind accessors with no public
-  constructor, so the pairing of chain data with the observation it was read under is unforgeable.
-  With `pub` fields a stale snapshot's observation could be overwritten with a fresh one's and
-  `is_current()` then returned `true` for a state generations old (#3267)
-- `DistributorSnapshot::is_current` compares the tip coin id alone. Conjoining `peak_height` made it
-  report `false` within seconds of every mainnet read even for a byte-identical state (#3267)
-- `DistributorSnapshot::entry_set_frozen` covers every `RewardDistributorType`, not only `Managed`
-  (#3267)
-- SPEC.md §0.5 clause 1 corrected: the exact-pin (`=`) requirement now names only the byte-bearing
-  cohort crates that curry puzzle hashes (`chia-puzzle-types`, `chia-sdk-driver`,
-  `chia-sdk-types`), with a version table and a `tests/cohort_lock_guard.rs` guard; `clvmr`'s
-  documented pin corrected `0.16.2` → `0.16.4` to match what actually resolves (#3272)
+- Chain reader + SPEC 0.5 cohort-pin correction (0.4.0) (#6)
 
 ## [0.3.0] - 2026-09-10
 
