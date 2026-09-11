@@ -45,6 +45,30 @@ jobs:
       - name: Check documentation
         run: cargo doc --no-deps
 
+  # The debug profile has overflow-checks ON and release has them OFF (there is no [profile]
+  # section in Cargo.toml), so the two profiles exercise DIFFERENT halves of #3286: debug proves
+  # upstream's unchecked u64 share multiply panics, release proves it wraps and misreports. A
+  # `cargo build --release` alone runs no test, so the release half was never measured. Both
+  # `#[cfg(debug_assertions)]` and `#[cfg(not(debug_assertions))]` tests exist, and neither profile
+  # alone runs them all.
+  release-tests:
+    name: Tests (release profile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests (release, overflow-checks off)
+        run: cargo test --release --all --locked
+
   coverage:
     name: Coverage (>=80% lines)
     runs-on: ubuntu-latest
