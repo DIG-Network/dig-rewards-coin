@@ -53,6 +53,10 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   spelled.
 - New CI job `Tests (release profile)`: `cargo build --release` ran no tests, so the wrap half of
   #3286 (overflow-checks off) was never measured.
+## [0.4.1] - 2026-09-11
+
+### Documentation
+- Uptime warning, version-claim fix, SPEC status-row correction (#9)
 
 ## [0.4.0] - 2026-09-11
 
