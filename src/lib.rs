@@ -22,10 +22,8 @@
 //!   the epoch fee and the withdrawal share belong to the puzzle, except for [`recoverable_base_units`]
 //!   which is tested equal to the paying code (§0.1 clause 1);
 //! - performs no socket I/O, holds no keys, and never broadcasts; spend builders return unsigned
-//!   spends (§0.1 clause 2). **0.2.0 publishes no chain reader at all**: §12.1's
-//!   `read_distributor` was non-functional and is withheld rather than shipped broken, so this
-//!   release takes no `ChainSource` dependency either. When the reader lands, chain reads will
-//!   arrive through the caller-supplied `ChainSource` (`dig-chainsource-interface`) — see
+//!   spends (§0.1 clause 2). Chain reads arrive through a caller-supplied `ChainSource`
+//!   (`dig-chainsource-interface`) passed by reference into [`state::read_distributor`] — see
 //!   [`state`] and <https://github.com/DIG-Network/dig_ecosystem/issues/3267>;
 //! - contains neither the prover loop nor the claim loop. Those are `dig-node`
 //!   (<https://github.com/DIG-Network/dig_ecosystem/issues/3250>,
@@ -85,4 +83,7 @@ pub use eligibility::{
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;
 pub use launch::{funder_refund_puzzle_hash, launch_dig_distributor, LaunchedDistributor};
-pub use state::{DistributorSlots, DistributorSnapshot};
+pub use state::{
+    read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot,
+    STALE_ENTRY_SET_SECONDS,
+};

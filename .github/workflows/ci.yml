@@ -74,6 +74,7 @@ jobs:
       - name: Run tests with coverage (nextest, retries 2, gate >=80% lines)
         run: >-
           cargo llvm-cov nextest --all
+          --locked
           --retries 2
           --fail-under-lines 80
           --lcov --output-path lcov.info

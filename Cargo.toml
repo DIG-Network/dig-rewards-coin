@@ -2,13 +2,13 @@
 #
 # Like its 10-primitives sibling `dig-mirror-coin`, it deliberately does NOT depend on
 # `datalayer-driver` and is not a re-export layer over anything. It performs no socket I/O: chain
-# reads will arrive through the canonical caller-supplied `ChainSource` trait
-# (dig-chainsource-interface, 00-foundation) when the withheld reader lands (#3267) — a
-# 10-primitives crate never pulls a network stack down into itself, and it may never depend on a
-# same-level crate such as `chia-query` or `dig-mirror-coin`.
+# reads arrive through the canonical caller-supplied `ChainSource` trait
+# (dig-chainsource-interface, 00-foundation) — the reader landed in #3267 — a 10-primitives crate
+# never pulls a network stack down into itself, and it may never depend on a same-level crate such
+# as `chia-query` or `dig-mirror-coin`.
 [package]
 name = "dig-rewards-coin"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Reward-distributor coin driver for the DIG Network on Chia"
@@ -25,11 +25,10 @@ categories = ["cryptography::cryptocurrencies"]
 exclude = [".claude", "AGENTS.md", "CLAUDE.md"]
 
 # A crates.io version is IMMUTABLE, so every line below is a permanent pin on every consumer of
-# 0.2.0. A crate the library does not compile against does not belong here: it constrains a
-# consumer's resolver for nothing. `dig-chainsource-interface` is absent for that reason — its only
-# consumer was the withheld `read_distributor`, so 0.2.0 has zero uses of it. It returns, purely
-# additively, when #3267 lands.
+# this release. `dig-chainsource-interface` is the trait the chain reader (#3267) reads through —
+# a pure, reads-only leaf that performs no I/O of its own and never depends on a same-level crate.
 [dependencies]
+dig-chainsource-interface = "0.3.3"
 dig-constants = "0.13.1"
 
 # The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
@@ -37,28 +36,43 @@ dig-constants = "0.13.1"
 # single version would either strand this crate below the SDK or move it past what the SDK can
 # link — chia-sdk-driver 0.36.0 pins the 0.36.1 cohort; the primitives publish 0.48.x but taking
 # that links two incompatible `chia-protocol` versions and `Bytes32` stops being one type.
+#
+# The three byte-bearing crates below are pinned EXACT (`=`), per SPEC.md §0.5 clause 1 (#3272):
+# their bytes are curried into the action puzzles, so a consumer that resolves a different member
+# of this trio computes a different hash and cannot reconstruct or spend an already-launched
+# distributor — a resolution FAILURE at build time, which is the loud break §0.5 wants, rather than
+# a silent one. `chia-protocol` / `chia-bls` / `chia-consensus` stay semver-compatible (`^`)
+# deliberately: they carry wire types only, move no puzzle byte, and a mismatch there is already a
+# compile error; pinning them would only make them contagious for a consumer such as `dig-node`
+# (#3250/#3251) that depends on `chia-protocol` directly.
 chia-bls = "0.36.1"
 # `ConsensusConstants` is a required argument of the upstream launch call, and it lives here.
 chia-consensus = "0.36.1"
 chia-protocol = "0.36.1"
-chia-puzzle-types = "0.36.1"
+chia-puzzle-types = "=0.36.1"
 # `action-layer` is what exposes the reward distributor at all; without it the crate cannot see it.
-chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
-chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 hex = "0.4.3"
 thiserror = "2.0.20"
 
 [dev-dependencies]
 anyhow = "1.0.100"
+# `testing` gates `MockChainSource` -- an in-memory `ChainSource` the tests assemble from real
+# simulator coin records/spends, so `read_distributor` (#3267) is exercised through its real
+# trait boundary rather than a bespoke test-only shortcut.
+dig-chainsource-interface = { version = "0.3.3", features = ["testing"] }
 # Cohort crates only the TESTS name. `chia-puzzles`, `clvm-traits`, `clvm-utils` and `clvmr` are all
 # reached transitively by the library through `chia-consensus`/`chia-sdk-driver`, so declaring them
 # under `[dependencies]` added no capability — it only pinned four extra versions, immutably, in
-# every consumer's resolution. Versions are unchanged: SPEC.md §0.5 pins the 0.36 cohort and a
-# hash-moving bump is a wire-breaking event for an already-launched distributor.
+# every consumer's resolution. Being dev-only, they are absent from the published requirement set
+# entirely (SPEC.md §0.5 clause 1, #3272), so pinning them here constrains nothing downstream; the
+# versions below are DESCRIPTIVE of this repo's own `Cargo.lock`, not a normative consumer
+# requirement, and are asserted by `tests/cohort_lock_guard.rs`.
 chia-puzzles = "0.20.3"
 clvm-traits = "0.36.1"
 clvm-utils = "0.36.1"
-clvmr = "0.16.2"
+clvmr = "0.16.4"
 # The simulator harness the acceptance tests run against — `Simulator`, `Benchmark` and
 # `BlsPairWithCoin` live here. Cohort-matched to `chia-sdk-driver` 0.36.0 on purpose: a test built
 # on different puzzle bytes than the library would prove nothing about the library.
