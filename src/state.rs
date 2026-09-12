@@ -411,33 +411,37 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 ///
 /// - **B1** (constants domain): refuses if the distributor's own `withdrawal_share_bps` is outside
 ///   `0..=10_000`, immediately after `from_launcher_solution`.
-/// - **B2** (scale domain): refuses, immediately before each generation's `from_spend`, if the
-///   **high-water mark** of the reserve coin's amount across every generation at or before that one
-///   exceeds [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] (`u64::MAX / 10_000`).
+/// - **B2** (scale domain): refuses, as soon as the generation that CREATES a commitment slot is
+///   reconstructed, if that slot's own recorded `rewards` exceeds
+///   [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] (`u64::MAX / 10_000`).
 ///
 /// Together they make `committed_value * withdrawal_share_bps <= u64::MAX` for every withdraw
 /// action `from_spend` reconstructs, and the subtraction at `withdraw_incentives.rs:89` safe with
-/// it. The step from B2 to that conclusion needs `committed_value <= high_water_reserve`, which
-/// holds because:
+/// it, because:
 ///
-/// 1. A commitment enters the reserve **in its own generation**: `CommitIncentives` is finalized by
-///    the reserve finalizer, which requires the committed CAT to be delivered into the reserve coin
-///    in the same bundle (this crate's [`crate::fund::commit_incentives_for_distributor_epoch`]
-///    returns exactly those secure conditions, and CAT conservation makes the reserve coin grow by
-///    the full `committed_value`). So the reserve amount immediately AFTER generation `g` -- which
-///    is the reserve amount immediately BEFORE generation `g + 1` -- is at least `committed_value`.
-/// 2. A withdraw is always in a **strictly later** generation: upstream's withdraw action asserts
-///    `assert_concurrent_puzzle(commitment_slot.coin.puzzle_hash)`
+/// 1. **B2 bounds the quantity itself, not a proxy for it.** An earlier version of this guard
+///    bounded a high-water mark of the reserve COIN's amount instead, on the premise that a
+///    commitment's value is always reflected in the reserve by the time it could be withdrawn.
+///    That premise is false: `chia-sdk-driver` 0.36.0's action layer can batch a `CommitIncentives`
+///    together with any number of other reserve-affecting actions into ONE distributor-coin spend
+///    (`reward_distributor.rs:699-747`), so the reserve coin's amount after a generation reflects
+///    only that generation's NET effect -- a large commitment netted against a same-generation
+///    outflow is never visible to a reader that only ever samples the reserve amount at generation
+///    boundaries. `CommitIncentives::get_log` performs no multiply at all, so the generation that
+///    creates a commitment slot parses safely at any scale and hands this walk the slot's `rewards`
+///    directly, with no risk of the panic B2 exists to avoid.
+/// 2. A withdraw is always in a **strictly later** generation than the slot it withdraws: upstream's
+///    withdraw action asserts `assert_concurrent_puzzle(commitment_slot.coin.puzzle_hash)`
 ///    (`withdraw_incentives.rs:120`), so the commitment slot must already exist on chain as a
 ///    spendable coin. A slot created in the same distributor spend does not, so commit and
-///    withdraw of one commitment can never share a generation.
+///    withdraw of one commitment can never share a generation -- meaning B2, checked at the
+///    creating generation, is always ahead of any generation that could reach the unchecked
+///    multiply for that slot.
 ///
-/// The high-water mark -- not the current generation's reserve -- is therefore the load-bearing
-/// quantity: a payout may draw the reserve down between (1) and (2), and a guard on the current
-/// amount alone would let a commitment deposited at a higher reserve be withdrawn under a lower
-/// one. Step 1 rests on the reserve finalizer's delta, which ships only as compiled puzzle bytes;
-/// `tests/recoverable_share.rs` pins it on chain instead, asserting that committing `X` grows both
-/// `state.total_reserves` and the reserve coin by exactly `X`.
+/// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
+/// the bound is checked against the slot bookkeeping this walk already reconstructs
+/// ([`DistributorSlots::apply_generation`]'s `created_commitments`), never against the reserve
+/// coin, so nothing about how many other actions share the generation changes what B2 sees.
 pub fn read_distributor(
     source: &impl ChainSource,
     launcher_id: Bytes32,
@@ -529,13 +533,6 @@ pub fn read_distributor(
     };
     let mut last_entry_write_unix: Option<u64> = None;
 
-    // B2's running bound (see this function's docs): the largest reserve amount this walk has
-    // observed at or before the generation about to be reconstructed, seeded from the eve
-    // generation. A commitment is deposited into the reserve in its OWN generation, so the
-    // high-water mark -- never the current generation's reserve alone -- is what bounds the
-    // `committed_value` a later withdraw action can name.
-    let mut high_water_reserve_base_units = distributor.reserve.coin.amount;
-
     loop {
         if !lineage.contains(distributor.coin.coin_id()) {
             return Err(malformed(
@@ -552,24 +549,6 @@ pub fn read_distributor(
             break;
         };
 
-        // B2 (scale domain), composed with B1 above: refuse BEFORE `from_spend` reconstructs this
-        // generation. Every figure here is read from the chain-authenticated reserve COIN as it
-        // stood at or before this generation -- never out of the reconstruction this guard exists
-        // to protect, which would let upstream's panic win first.
-        //
-        // The bound is the running high-water mark rather than this generation's reserve alone,
-        // because a reserve can be drawn down (a payout) between a commitment's deposit and its
-        // withdrawal. See this function's docs for the invariant that makes the high-water mark
-        // the right quantity.
-        high_water_reserve_base_units =
-            high_water_reserve_base_units.max(distributor.reserve.coin.amount);
-        if high_water_reserve_base_units > crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS {
-            return Err(RewardsError::DistributorReserveTooLargeToRead {
-                reserve_base_units: high_water_reserve_base_units,
-                max_readable_base_units: crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
-            });
-        }
-
         let reserve_lineage_proof = distributor.reserve.child_lineage_proof();
         let Some(reconstructed) = chia_sdk_driver::RewardDistributor::from_spend(
             &mut ctx,
@@ -584,6 +563,21 @@ pub fn read_distributor(
                 "a spend mid-walk did not parse as this distributor",
             ));
         };
+
+        // B2 (scale domain), composed with B1 above: refuse as soon as a commitment slot's own
+        // `rewards` is observed being created, rather than waiting for a later generation to name
+        // it in a withdraw -- the generation that WOULD reach the unchecked multiply is always
+        // strictly later (see this function's docs, point 2), so this refusal always lands first.
+        // `CommitIncentives::get_log` performs no multiply, so reading `rewards` here risks no
+        // panic of its own.
+        for created_commitment in &reconstructed.pending_spend.created_commitment_slots {
+            if created_commitment.rewards > crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS {
+                return Err(RewardsError::CommitmentRewardsTooLargeToRead {
+                    rewards_base_units: created_commitment.rewards,
+                    max_readable_base_units: crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+                });
+            }
+        }
 
         // §12.4 is a signal a counterparty judges the OPERATOR by, so it must count only actions
         // the operator can take. `InitiatePayout` spends an entry slot and re-creates it

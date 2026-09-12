@@ -99,20 +99,25 @@ pub enum RewardsError {
     },
 
     /// The driver's returned withdrawal share disagrees with this crate's own restatement
-    /// ([`crate::recoverable_base_units`]).
+    /// ([`crate::recoverable_base_units`]), or no restatement could even be computed.
     ///
-    /// A disagreement means the driver's plain `u64` multiply wrapped (#3286): the whole returned
-    /// tuple is untrustworthy, not just the share, so this refuses the completed spend rather than
-    /// return it.
+    /// `restated` is [`None`] rather than a defaulted `0` when `withdrawal_share_bps` itself is
+    /// out of the `u16` range [`crate::recoverable_base_units`] takes (reachable for any bps in
+    /// `10_001..=65_535`): a fabricated `0` would read as "this crate's own restatement computes
+    /// zero", which is a different -- and false -- claim from "no restatement exists". Either way
+    /// the driver's whole returned tuple is untrustworthy, not just the share, so this refuses the
+    /// completed spend rather than return it.
     #[error(
         "the driver reported a withdrawal share of {driver_reported} base units but this \
-         crate's own restatement computes {restated} -- the driver's u64 multiply wrapped (#3286)"
+         crate's own restatement computes {restated:?} -- the driver's u64 multiply wrapped, or \
+         withdrawal_share_bps is out of the u16 range restated (#3286)"
     )]
     DriverShareDisagrees {
         /// What `chia-sdk-driver` 0.36.0 returned.
         driver_reported: u64,
-        /// What [`crate::recoverable_base_units`] computes independently.
-        restated: u64,
+        /// What [`crate::recoverable_base_units`] computes independently, or [`None`] if
+        /// `withdrawal_share_bps` could not even be narrowed to a `u16` to compute one.
+        restated: Option<u64>,
     },
 
     /// A distributor's own `withdrawal_share_bps` constant is outside the legitimate `0..=10_000`
@@ -130,26 +135,33 @@ pub enum RewardsError {
         withdrawal_share_bps: u64,
     },
 
-    /// A distributor's reserve has grown too large, at this generation, for
-    /// [`crate::state::read_distributor`] to safely reconstruct: `reserve_base_units *
-    /// withdrawal_share_bps` could exceed `u64::MAX` inside the upstream driver's plain `u64`
-    /// multiply (#3286) before this crate ever sees a returned value to check.
+    /// A commitment slot's own recorded `rewards` value is too large for
+    /// [`crate::state::read_distributor`] to ever safely reconstruct a later generation that
+    /// withdraws it: `rewards * withdrawal_share_bps` could exceed `u64::MAX` inside the upstream
+    /// driver's plain `u64` multiply (#3286) before this crate ever sees a returned value to
+    /// check.
     ///
-    /// Refused BEFORE `RewardDistributor::from_spend` is called for this generation, because that
-    /// call is where the driver's own multiply would panic (checked arithmetic) or silently wrap
-    /// (release) with no way for this crate to intervene afterwards.
+    /// Refused as soon as the generation that CREATES the slot is reconstructed — before any
+    /// later generation could reach the unchecked multiply. This bounds the quantity a withdraw
+    /// can name directly, rather than a proxy for it (a reserve-coin high-water mark, this
+    /// error's predecessor): the action layer can batch a `CommitIncentives` with a
+    /// same-generation reserve outflow into one distributor-coin spend, so the reserve coin's
+    /// *amount* after any given generation reflects only the net of that generation's actions and
+    /// can never be trusted to have seen a transient peak. A commitment slot's own `rewards`
+    /// field has no such blind spot: `CommitIncentives::get_log` performs no multiply, so it
+    /// parses safely at any scale, and a slot cannot be created and withdrawn in the same
+    /// singleton spend (`assert_concurrent_puzzle` requires the slot coin to already exist), so
+    /// bounding it here is always ahead of the generation that could reach the unchecked
+    /// multiply.
     #[error(
-        "distributor reserve of {reserve_base_units} base units exceeds the \
-         {max_readable_base_units} base units this reader can safely reconstruct at this \
-         generation -- refusing rather than risk the driver's u64 share multiply (#3286)"
+        "commitment slot rewards of {rewards_base_units} base units exceeds the \
+         {max_readable_base_units} base units this reader can safely carry through to a later \
+         withdraw -- refusing rather than risk the driver's u64 share multiply (#3286)"
     )]
-    DistributorReserveTooLargeToRead {
-        /// The **largest** reserve coin amount the walk observed at or before the generation
-        /// it refused. A commitment is deposited in its own generation and withdrawn in a
-        /// later one, so the high-water mark -- not the refused generation's own reserve --
-        /// is what bounds the `committed_value` a withdraw action can name.
-        reserve_base_units: u64,
-        /// The largest reserve this reader will attempt to reconstruct through.
+    CommitmentRewardsTooLargeToRead {
+        /// The commitment slot's own recorded `rewards`, read off the generation that created it.
+        rewards_base_units: u64,
+        /// The largest commitment-slot `rewards` this reader will carry through to a withdraw.
         max_readable_base_units: u64,
     },
 }

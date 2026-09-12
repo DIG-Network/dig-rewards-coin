@@ -195,13 +195,25 @@ pub fn withdraw_committed_incentives(
         return Err(RewardsError::NotTheClawbackAuthority);
     }
 
-    let rewards_base_units = commitment_slot.info.value.rewards;
     let withdrawal_share_bps = distributor.info.constants.withdrawal_share_bps;
 
     // Pre-guard, BEFORE the upstream call: `chia-sdk-driver` 0.36.0's own share multiply
     // (`withdraw_incentives.rs:105-107`) is a plain `u64` multiply and panics under checked
     // arithmetic with no chance to return anything at all (#3286). A post-hoc check cannot run
     // inside a call that never returns.
+    //
+    // The guarded value must be the one upstream will ACTUALLY multiply, not the caller-supplied
+    // `commitment_slot` as passed in: `RewardDistributor::actual_commitment_slot_value`
+    // (`reward_distributor.rs:833-849`) silently substitutes any pending commitment slot created
+    // earlier in this same spend that matches on `epoch_start` alone -- ignoring `clawback_ph`
+    // and `rewards` -- and `.spend()` below re-derives from that substituted value
+    // (`withdraw_incentives.rs:103`), not from the slot this function was handed. A caller who
+    // funds a future epoch (`crate::fund::commit_incentives_for_distributor_epoch`) and claws
+    // back an earlier commitment for the same `epoch_start` in one bundle would otherwise have
+    // this guard check one number while upstream multiplies another.
+    let actual_commitment_slot = distributor.actual_commitment_slot_value(commitment_slot);
+    let rewards_base_units = actual_commitment_slot.info.value.rewards;
+
     if rewards_base_units
         .checked_mul(withdrawal_share_bps)
         .is_none()
@@ -214,7 +226,7 @@ pub fn withdraw_committed_incentives(
 
     let (conditions, recovered_base_units) = distributor
         .new_action::<RewardDistributorWithdrawIncentivesAction>()
-        .spend(ctx, distributor, commitment_slot, reward_slot)?;
+        .spend(ctx, distributor, actual_commitment_slot, reward_slot)?;
 
     // Cross-check the driver's returned figure against this crate's own restatement. A
     // disagreement means the pre-guard above was not tight enough to catch every way the
@@ -228,7 +240,7 @@ pub fn withdraw_committed_incentives(
     if restated != Some(recovered_base_units) {
         return Err(RewardsError::DriverShareDisagrees {
             driver_reported: recovered_base_units,
-            restated: restated.unwrap_or(0),
+            restated,
         });
     }
 
