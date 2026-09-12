@@ -252,6 +252,26 @@ fn test_constants(
     funder_refund_puzzle_hash: Bytes32,
     simulator_asset_id: Bytes32,
 ) -> RewardDistributorConstants {
+    test_constants_with_bps(
+        manager_singleton_launcher_id,
+        funder_refund_puzzle_hash,
+        simulator_asset_id,
+        WITHDRAWAL_SHARE_BPS,
+    )
+}
+
+/// As [`test_constants`], but with `withdrawal_share_bps` supplied by the caller.
+///
+/// `RewardDistributorConstants` takes a raw `u64` there, and nothing upstream or in
+/// `launch_dig_distributor` narrows it -- which is exactly why `read_distributor` has to reject an
+/// out-of-domain value itself (SPEC.md §0.1 clause 5d). This exists so a test can launch the
+/// hostile distributor an attacker can launch, rather than assert about one it cannot.
+fn test_constants_with_bps(
+    manager_singleton_launcher_id: Bytes32,
+    funder_refund_puzzle_hash: Bytes32,
+    simulator_asset_id: Bytes32,
+    withdrawal_share_bps: u64,
+) -> RewardDistributorConstants {
     RewardDistributorConstants::without_launcher_id(
         RewardDistributorType::Managed {
             manager_singleton_launcher_id,
@@ -263,7 +283,7 @@ fn test_constants(
         PAYOUT_THRESHOLD_BASE_UNITS,
         false,
         0,
-        WITHDRAWAL_SHARE_BPS,
+        withdrawal_share_bps,
         simulator_asset_id,
     )
 }
@@ -287,17 +307,31 @@ struct Harness {
 
 /// Mint $DIG, launch a manager singleton, build the launch offer, and launch the distributor.
 fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
+    launch_harness_with(ctx, MINTED_BASE_UNITS, WITHDRAWAL_SHARE_BPS)
+}
+
+/// As [`launch_harness`], but mints `minted_base_units` of the reward CAT and curries
+/// `withdrawal_share_bps` into the distributor's constants.
+///
+/// Both are parameters rather than constants because the #3286 guards are about scale and domain:
+/// a fixture that can only mint `MINTED_BASE_UNITS` at `WITHDRAWAL_SHARE_BPS` cannot reach either
+/// bound, and a guard no fixture can reach is a claim rather than a proof.
+fn launch_harness_with(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    withdrawal_share_bps: u64,
+) -> anyhow::Result<Harness> {
     let mut sim = Simulator::new();
 
     // Mint the reward CAT.
-    let funder = sim.bls(MINTED_BASE_UNITS);
+    let funder = sim.bls(minted_base_units);
     let funder_p2 = StandardLayer::new(funder.pk);
     let (issue_cat, source_cats) = Cat::single_issuance(
         ctx,
         funder.coin.coin_id(),
         None,
-        MINTED_BASE_UNITS,
-        Conditions::new().create_coin(funder.puzzle_hash, MINTED_BASE_UNITS, Memos::None),
+        minted_base_units,
+        Conditions::new().create_coin(funder.puzzle_hash, minted_base_units, Memos::None),
     )?;
     funder_p2.spend(ctx, funder.coin, issue_cat)?;
     let source_cat = source_cats[0];
@@ -382,10 +416,11 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         },
     )?;
 
-    let constants = test_constants(
+    let constants = test_constants_with_bps(
         manager.launcher_id,
         funder.puzzle_hash,
         source_cat.info.asset_id,
+        withdrawal_share_bps,
     );
     let launched = launch_dig_distributor(
         ctx,
@@ -1275,7 +1310,7 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         "a wrong authority is NotTheClawbackAuthority, got: {refusal}"
     );
 
-    // The recorded authority succeeds, and the figure returned is the puzzle's own.
+    // The recorded authority succeeds, and the guards cross-check the figure returned.
     let clawback = withdraw_committed_incentives(
         ctx,
         &mut harness.distributor,
@@ -1284,13 +1319,13 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         harness.funder.puzzle_hash,
     )?;
     assert_eq!(
-        clawback.recovered_base_units,
+        clawback.recovered_base_units(),
         COMMITTED_BASE_UNITS * WITHDRAWAL_SHARE_BPS / 10_000,
         "§7.5: the funder recovers withdrawal_share_bps of the commitment, and the rest stays \
          in the reserve"
     );
     assert!(
-        clawback.recovered_base_units < COMMITTED_BASE_UNITS,
+        clawback.recovered_base_units() < COMMITTED_BASE_UNITS,
         "a clawback is never the whole commitment: the forfeit is the deterrent"
     );
 
@@ -2185,4 +2220,172 @@ fn a_chain_source_that_errors_never_renders_as_an_empty_distributor() {
              render a failed read as 'no distributor was ever launched'; got {other:?}"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #3303 / #3305: read_distributor's two pre-guards against chia-sdk-driver 0.36.0's unchecked u64
+// share multiply (#3286). SPEC.md 0.1 clause 5d.
+//
+// Both tests reach the guards the way an attacker does -- through the PUBLIC reader, over chain
+// input nobody authenticated -- rather than by calling the guard's own predicate.
+// ---------------------------------------------------------------------------------------------
+
+/// B1, end to end: a distributor launched with a `withdrawal_share_bps` outside `0..=10_000` is
+/// refused by `read_distributor` as an **error**, not reported as state and not `Ok(None)`.
+///
+/// `RewardDistributorConstants` takes `withdrawal_share_bps` as a raw `u64` and neither upstream
+/// nor `launch_dig_distributor` narrows it, so anyone can launch this distributor and any caller
+/// of the public reader then reads it. Before the guard (commit `933b2ea`) this call returned
+/// `Ok(Some(snapshot))` whose `withdrawal_share_bps` was `u64::MAX / 2`, handed on as
+/// authenticated distributor state -- the match below is what distinguishes the two.
+///
+/// The bps is written as `u64::MAX / 2`, never as a decimal literal: a literal here would still
+/// pass if the guard's own bound were mutated.
+#[test]
+fn a_distributor_launched_with_an_out_of_domain_bps_is_refused_by_the_reader() -> anyhow::Result<()>
+{
+    const HOSTILE_BPS: u64 = u64::MAX / 2;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness_with(ctx, MINTED_BASE_UNITS, HOSTILE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::UnreadableDistributorConstants {
+            withdrawal_share_bps,
+        }) => assert_eq!(
+            withdrawal_share_bps, HOSTILE_BPS,
+            "the refusal must name the bps it read off the chain"
+        ),
+        Ok(Some(snapshot)) => panic!(
+            "the reader handed on an out-of-domain bps as authenticated state: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!(
+            "Ok(None) asserts the positive fact that no such distributor exists, and one does \
+             (SPEC.md 0.1 clause 5d)"
+        ),
+        Err(other) => panic!("expected UnreadableDistributorConstants, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// B2, end to end, with **DIG's own** `WITHDRAWAL_SHARE_BPS`: a commitment one base unit above
+/// `u64::MAX / WITHDRAWAL_SHARE_BPS`, withdrawn on chain, makes upstream's `get_log` multiply
+/// (`withdraw_incentives.rs:71`) wrap while the puzzle itself pays correctly -- so the reader must
+/// refuse the generation rather than reconstruct a fabricated `created_reward_slot.rewards`.
+///
+/// This is the reachable shape of #3286 through the public reader, and it needs no hostile
+/// constants at all: bps is DIG's 9_000, the table is DIG's own, and the only unusual thing is the
+/// SIZE of the commitment. B1 cannot catch it; B2 is what does.
+///
+/// **Release-only, by necessity.** Building the fixture means calling upstream's withdraw action
+/// directly, and upstream's own share multiply (`withdraw_incentives.rs:105-107`) is the same
+/// unchecked `u64`: under `debug_assertions` it panics before returning, so the on-chain spend
+/// this test reads back cannot be constructed in a checked profile at all. `cargo test --release`
+/// covers it (see `.github/workflows/ci.yml`); the debug profile covers the panic itself in
+/// `tests/recoverable_share.rs`.
+///
+/// Before the guard (commit `933b2ea`) this read returned `Ok(Some(snapshot))` built from a
+/// wrapped multiply.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Result<()> {
+    // One base unit past the largest commitment whose share upstream can compute in a u64.
+    // Derived from the bound, never spelled: a decimal literal here would survive a mutation of
+    // MAX_REPORTABLE_COMMITMENT_BASE_UNITS.
+    let committed_base_units = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    // A commitment is withdrawable while its epoch is still in the future.
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        second_epoch_start,
+        committed_base_units,
+    )?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let commitment_slot = harness
+        .last_commitment_slot
+        .clone()
+        .expect("committing created a commitment slot");
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    // Deliberately NOT through `withdraw_committed_incentives`: its own pre-guard refuses exactly
+    // this pair, and the question here is what the READER does with a spend already on chain.
+    let mut distributor = harness.distributor.clone();
+    let (conditions, driver_reported) = distributor
+        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
+        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
+    harness.distributor = distributor;
+
+    // The fixture's own premise: the driver's returned figure is ALREADY wrong here. The correct
+    // share is `committed * 9_000 / 10_000`, computed in u128 so this comparison does not share
+    // the arithmetic it is judging.
+    let true_share =
+        u64::try_from(u128::from(committed_base_units) * u128::from(WITHDRAWAL_SHARE_BPS) / 10_000)
+            .expect("the share never exceeds the commitment");
+    assert_ne!(
+        driver_reported, true_share,
+        "this fixture only proves something if the driver has already misreported"
+    );
+
+    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
+    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::DistributorReserveTooLargeToRead {
+            reserve_base_units,
+            max_readable_base_units,
+        }) => {
+            assert_eq!(
+                max_readable_base_units,
+                u64::MAX / 10_000,
+                "the refusal must name the derived bound"
+            );
+            assert!(
+                reserve_base_units > max_readable_base_units,
+                "the refusal must name a reserve that actually exceeds the bound, not any reserve"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the reader reconstructed a generation through a wrapped u64 multiply: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected DistributorReserveTooLargeToRead, got: {other}"),
+    }
+
+    Ok(())
 }

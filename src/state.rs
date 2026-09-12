@@ -4,7 +4,7 @@
 //!
 //! Every `ChainSource` error MUST become [`crate::RewardsError::ChainUnavailable`]. A distributor
 //! whose read failed MUST NOT render as "no entries" or "nothing accrued" — those are claims about
-//! money, and the honest answer is that the question went unanswered. [`Ok(None)`] is reserved for
+//! money, and the honest answer is that the question went unanswered. `Ok(None)` is reserved for
 //! exactly one fact: the launcher id was never spent, i.e. no distributor was ever launched there.
 //!
 //! # The landmine this reader must never touch
@@ -399,6 +399,49 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// 8. A money cross-check: the tip reserve coin must be unspent and its amount must equal
 ///    `state.total_reserves`.
 /// 9. `peak_height` and `block_timestamp(peak_height)`, both mandatory.
+///
+/// # Two pre-guards against #3286, ahead of the withdraw path this walk can reconstruct
+///
+/// `chia-sdk-driver` 0.36.0's `WithdrawIncentives` action re-derives the withdrawal share with a
+/// plain `u64` multiply (`withdraw_incentives.rs:71,89`) and this walk calls into that code
+/// (`RewardDistributor::from_spend`, step 7) for every generation, so an unrepresentable share
+/// would panic (checked arithmetic) or silently corrupt `RewardDistributorRewardSlotValue::rewards`
+/// (release) with no chance for this function to intervene afterwards -- a post-hoc check cannot
+/// run inside a call that never returns. Both guards therefore run BEFORE the call they protect:
+///
+/// - **B1** (constants domain): refuses if the distributor's own `withdrawal_share_bps` is outside
+///   `0..=10_000`, immediately after `from_launcher_solution`.
+/// - **B2** (scale domain): refuses, as soon as the generation that CREATES a commitment slot is
+///   reconstructed, if that slot's own recorded `rewards` exceeds
+///   [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] (`u64::MAX / 10_000`).
+///
+/// Together they make `committed_value * withdrawal_share_bps <= u64::MAX` for every withdraw
+/// action `from_spend` reconstructs, and the subtraction at `withdraw_incentives.rs:89` safe with
+/// it, because:
+///
+/// 1. **B2 bounds the quantity itself, not a proxy for it.** An earlier version of this guard
+///    bounded a high-water mark of the reserve COIN's amount instead, on the premise that a
+///    commitment's value is always reflected in the reserve by the time it could be withdrawn.
+///    That premise is false: `chia-sdk-driver` 0.36.0's action layer can batch a `CommitIncentives`
+///    together with any number of other reserve-affecting actions into ONE distributor-coin spend
+///    (`reward_distributor.rs:699-747`), so the reserve coin's amount after a generation reflects
+///    only that generation's NET effect -- a large commitment netted against a same-generation
+///    outflow is never visible to a reader that only ever samples the reserve amount at generation
+///    boundaries. `CommitIncentives::get_log` performs no multiply at all, so the generation that
+///    creates a commitment slot parses safely at any scale and hands this walk the slot's `rewards`
+///    directly, with no risk of the panic B2 exists to avoid.
+/// 2. A withdraw is always in a **strictly later** generation than the slot it withdraws: upstream's
+///    withdraw action asserts `assert_concurrent_puzzle(commitment_slot.coin.puzzle_hash)`
+///    (`withdraw_incentives.rs:120`), so the commitment slot must already exist on chain as a
+///    spendable coin. A slot created in the same distributor spend does not, so commit and
+///    withdraw of one commitment can never share a generation -- meaning B2, checked at the
+///    creating generation, is always ahead of any generation that could reach the unchecked
+///    multiply for that slot.
+///
+/// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
+/// the bound is checked against the slot bookkeeping this walk already reconstructs
+/// ([`DistributorSlots::apply_generation`]'s `created_commitments`), never against the reserve
+/// coin, so nothing about how many other actions share the generation changes what B2 sees.
 pub fn read_distributor(
     source: &impl ChainSource,
     launcher_id: Bytes32,
@@ -437,6 +480,20 @@ pub fn read_distributor(
             "launcher solution is not a reward-distributor launch",
         ));
     };
+
+    // B1 (constants domain): the same 0..=10_000 domain rule `recoverable_base_units` already
+    // enforces, checked here against the distributor's OWN constants rather than DIG's -- this
+    // reader is deliberately distributor-agnostic (see this function's own docs), so an equality
+    // check against WITHDRAWAL_SHARE_BPS would wrongly refuse an honest self-skim variant. A
+    // hostile or corrupt launcher reaches this from unauthenticated chain input, and refusing here
+    // -- before B2, before any `from_spend` -- is the only chance to refuse at all: once inside
+    // the walk, `chia-sdk-driver` 0.36.0's own share multiply (#3286) has no domain check of its
+    // own.
+    if constants.withdrawal_share_bps > 10_000 {
+        return Err(RewardsError::UnreadableDistributorConstants {
+            withdrawal_share_bps: constants.withdrawal_share_bps,
+        });
+    }
 
     let Some(eve_spend) = source
         .coin_spend(eve_coin.coin_id())
@@ -506,6 +563,21 @@ pub fn read_distributor(
                 "a spend mid-walk did not parse as this distributor",
             ));
         };
+
+        // B2 (scale domain), composed with B1 above: refuse as soon as a commitment slot's own
+        // `rewards` is observed being created, rather than waiting for a later generation to name
+        // it in a withdraw -- the generation that WOULD reach the unchecked multiply is always
+        // strictly later (see this function's docs, point 2), so this refusal always lands first.
+        // `CommitIncentives::get_log` performs no multiply, so reading `rewards` here risks no
+        // panic of its own.
+        for created_commitment in &reconstructed.pending_spend.created_commitment_slots {
+            if created_commitment.rewards > crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS {
+                return Err(RewardsError::CommitmentRewardsTooLargeToRead {
+                    rewards_base_units: created_commitment.rewards,
+                    max_readable_base_units: crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+                });
+            }
+        }
 
         // §12.4 is a signal a counterparty judges the OPERATOR by, so it must count only actions
         // the operator can take. `InitiatePayout` spends an entry slot and re-creates it

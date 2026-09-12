@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "dig-rewards-coin"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chia-bls 0.36.1",

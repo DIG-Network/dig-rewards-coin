@@ -29,10 +29,16 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by the equality test
    `recoverable_base_units_matches_a_real_clawback_at_odd_amounts` in `tests/recoverable_share.rs`.
    An untested copy scattered in a consumer drifts **silently**; a tested copy here fails **loudly**.
-   That asymmetry is the justification. The equality proof holds at or below `u64::MAX / withdrawal_share_bps`.
-   Above that bound, the **`chia-sdk-driver` 0.36.0 Rust driver** cannot construct the spend (dig_ecosystem#3286
-   — a driver limitation), while the on-chain puzzle still pays correctly because **CLVM arithmetic is bignum**.
-   That is a driver defect, not a property of the reward system.
+   That asymmetry is the justification.
+   The equality proof holds at or below `u64::MAX / withdrawal_share_bps`. Above that bound the
+   **`chia-sdk-driver` 0.36.0 Rust driver** wraps: its share multiply is a plain `u64`
+   (`withdraw_incentives.rs:105-107` in `spend`, and again at `:71` in `get_log`, whose result is
+   then subtracted at `:89`). The on-chain puzzle still pays correctly, because **CLVM arithmetic
+   is bignum** and the puzzle is handed the **full** committed amount, never the share -- the
+   driver's returned `u64` is an independent Rust **re-derivation** of what the puzzle will pay.
+   Above the bound, driver and puzzle therefore **disagree, and the puzzle is right**: the spend is
+   valid on chain while the returned number is a lie about it. That is a driver defect
+   (dig_ecosystem#3286), not a property of the reward system.
 2. This crate MUST perform no socket I/O, MUST hold no keys, and MUST NOT broadcast. Chain reads
    arrive through a caller-supplied chain source (`dig-chainsource-interface`); spend builders return
    unsigned coin spends. This is the same rule the sibling `dig-mirror-coin` states as its invariant
@@ -45,6 +51,42 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    the rule cannot be enforced, and §15 lists which side each clause lands on.
 4. This crate MUST NOT depend on `dig-epoch`. See §0.3; a Cargo dependency on `dig-epoch` from this
    crate is a defect, not a style preference.
+
+5. Where an upstream figure is a re-derivation, this crate MUST NOT pass it on unchecked, and MUST
+   NOT substitute a plausible number for it.
+
+   a. `withdraw_committed_incentives` MUST establish that
+      `rewards_base_units * withdrawal_share_bps` is representable in a `u64` **before** invoking
+      the upstream action, and MUST refuse with a `RewardsError` naming dig_ecosystem#3286 when it
+      is not. The check MUST precede the call: upstream's multiply is in upstream's crate, so in an
+      overflow-checked build it **panics before returning** and no post-hoc check can run. Above
+      the bound the chain would honour the spend and this crate still refuses; that cost is
+      accepted, because the figure the caller would receive cannot be built at all in a portable
+      profile.
+
+   b. Below the bound, `withdraw_committed_incentives` MUST compare the driver's returned figure
+      against `recoverable_base_units` and MUST refuse on disagreement. A disagreement means the
+      driver wrapped, so the whole returned tuple is untrustworthy even where the spend is sound.
+
+   c. `Clawback` MUST NOT be constructible outside this crate. A public field on the wrapper
+      reintroduces, at the wrapper, the exact defect the element's guard removes: a consumer can
+      write any figure into a money field the documentation calls the puzzle's own.
+
+   d. `read_distributor` MUST refuse a distributor it cannot reconstruct without wrapping, and MUST
+      refuse it as an **error**, never as `Ok(None)`. `withdrawal_share_bps` and the reserve amount
+      arrive from **unauthenticated chain input** -- an attacker may launch a distributor with any
+      `u64` bps -- so the reader MUST reject `withdrawal_share_bps > 10_000` on the launch constants
+      and MUST reject a generation whose reserve exceeds `u64::MAX / 10_000` before calling
+      `RewardDistributor::from_spend`. Those two bounds together make upstream's `get_log` multiply
+      and its following subtraction unreachable outside their safe domain. Without them, a read
+      **panics** in an overflow-checked build (a remote denial of service on every caller of the
+      public reader) or, in release, underflows and returns a fabricated
+      `created_reward_slot.rewards` as authenticated distributor state. `Ok(None)` is forbidden
+      here because it asserts the positive fact that no such distributor exists.
+
+   e. Every bound above MUST be written as a derivation (`u64::MAX / 10_000`), never as a decimal
+      literal, in both the code and its tests. A literal bound lets a mutation of the bound pass a
+      test that spells the same literal.
 
 ### 0.2 Units — named once, never converted silently
 
