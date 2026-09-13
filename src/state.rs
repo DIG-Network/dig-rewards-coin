@@ -43,6 +43,30 @@ use crate::RewardsError;
 /// reported `EntrySetStale` to anyone reading it (`SPEC.md` §12.4).
 pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 
+/// The largest number of reward slots `refuse_unrepresentable_action_arithmetic` will let a
+/// single `commit_incentives` action backfill, in its non-adjacent-epoch branch
+/// (`chia-sdk-driver-0.36.0`'s `commit_incentives.rs:101-112`), before refusing the generation.
+///
+/// Fixed and independent of any distributor's own declared constants — never a ratio of
+/// `max_seconds_offset` to `epoch_seconds`, which produced `0` at DIG's own real launch constants
+/// (`604_800` / `300`) while an attacker's own `epoch_seconds = 1, max_seconds_offset = u64::MAX`
+/// inflated the same ratio past `1.8e19`, a bound in name only. See
+/// `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc for both failures.
+///
+/// One million is comfortably beyond any plausible historical gap in real incentive commitments
+/// — at DIG's own one-week epoch it is roughly nineteen thousand years of backfilled epochs --
+/// while still bounding what this reader must hold in memory for one action to a few tens of
+/// megabytes of `RewardDistributorRewardSlotValue` structs (~40 bytes each), never the unbounded
+/// count an attacker's own `epoch_seconds` could otherwise demand.
+pub const MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS: u64 = 1_000_000;
+
+/// The largest `max_seconds_offset` a distributor's own launch constants may declare before
+/// `read_distributor` refuses to read it at all. See
+/// `RewardsError::UnreadableMaxSecondsOffset`'s doc for why: nothing in `chia-sdk-driver` 0.36.0
+/// or elsewhere in this crate bounds this value on its own, so an unbounded reader would trust an
+/// attacker's own launch constant as a real clock-skew tolerance.
+pub const MAX_SANE_SECONDS_OFFSET: u64 = u32::MAX as u64;
+
 /// Turns a `ChainSource` error into the one `RewardsError` variant a failed read may ever produce.
 fn chain_unavailable<E: core::fmt::Display>(error: E) -> RewardsError {
     RewardsError::ChainUnavailable(error.to_string())
@@ -621,12 +645,18 @@ fn refuse_unrepresentable_action_arithmetic(
                         operation: "slot_epoch_time + epoch_seconds",
                     })?;
 
-                // Reuse the distributor's own declared `max_seconds_offset` -- the same tolerance
-                // `chia-sdk-driver` 0.36.0 curries into every other action that carries an
-                // epoch-time-like field (`add_entry`, `stake`, `unstake`, `refresh`) -- as the
-                // bound on how many epochs a single commit may backfill, rather than a figure this
-                // pre-screen invents.
-                let max_backfill_slots = constants.max_seconds_offset / constants.epoch_seconds;
+                // A FIXED cap, `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` -- never a ratio of the
+                // distributor's own declared constants. An earlier version of this bound divided
+                // `max_seconds_offset` by `epoch_seconds`, which was wrong in both directions at
+                // once: at DIG's own real launch constants (`604_800` / `300`) the quotient is
+                // `0`, refusing every honest non-adjacent-epoch commit outright, while an
+                // attacker's own `epoch_seconds = 1, max_seconds_offset = u64::MAX` inflated the
+                // same quotient past `1.8e19`, no bound at all. `read_distributor` is
+                // deliberately distributor-agnostic, so for an attacker's own launcher every
+                // operand of that ratio was attacker-chosen -- a ratio of two attacker-reachable
+                // parameters cannot be a safety bound in either direction. See
+                // `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
+                let max_backfill_slots = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
 
                 if params.epoch_start > start_epoch_time {
                     let iterations =
@@ -909,6 +939,18 @@ pub fn read_distributor(
     if constants.withdrawal_share_bps > 10_000 {
         return Err(RewardsError::UnreadableDistributorConstants {
             withdrawal_share_bps: constants.withdrawal_share_bps,
+        });
+    }
+
+    // Same shape as B1 immediately above: `max_seconds_offset` is curried into `add_entry`,
+    // `stake`, `unstake` and `refresh` as a clock-skew tolerance, and nothing in
+    // `chia-sdk-driver` 0.36.0 or elsewhere in this crate bounds it. Left unchecked, it also
+    // silently controlled `refuse_unrepresentable_action_arithmetic`'s old (now-removed)
+    // backfill-iteration ratio -- an attacker's own `max_seconds_offset = u64::MAX` inflated that
+    // ratio past any real bound (DIG_ecosystem#3313's security-leg finding).
+    if constants.max_seconds_offset > MAX_SANE_SECONDS_OFFSET {
+        return Err(RewardsError::UnreadableMaxSecondsOffset {
+            max_seconds_offset: constants.max_seconds_offset,
         });
     }
 
@@ -1677,18 +1719,21 @@ mod tests {
         }
     }
 
-    /// `commit_incentives.rs:103-112`'s backfill loop is bounded here by a DERIVED cap
-    /// (`max_seconds_offset / epoch_seconds`), never a decimal literal -- a solution whose
-    /// `epoch_start` is far enough past `slot_epoch_time` to need more iterations than that cap
-    /// must be refused before the (unbounded, from this reader's point of view) loop runs.
+    /// `commit_incentives.rs:103-112`'s backfill loop is bounded here by a FIXED, named cap
+    /// (`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`), never a ratio of the distributor's own declared
+    /// constants (see `refuse_unrepresentable_action_arithmetic`'s comment on why the old ratio
+    /// failed in both directions) and never a bare decimal literal -- a solution whose
+    /// `epoch_start` is far enough past `slot_epoch_time` to need more iterations than that fixed
+    /// cap must be refused before the (unbounded, from this reader's point of view) loop runs.
     #[test]
-    fn a_commit_incentives_backfill_past_the_derived_cap_is_refused() {
+    fn a_commit_incentives_backfill_past_the_fixed_cap_is_refused() {
         let ctx = &mut SpendContext::new();
         let launcher_id = some_identity();
-        let epoch_seconds = 1_000u64;
-        let max_seconds_offset = 1_000u64;
-        // `max_backfill_slots = max_seconds_offset / epoch_seconds` = 1: this distributor's own
-        // declared tolerance allows backfilling exactly one empty epoch, never two.
+        // `epoch_seconds = 1` is not itself hostile (the domain check on `max_seconds_offset`
+        // guards the attacker-controlled shape); it is chosen here only to make the backfill span
+        // needed to exceed a MILLION-slot fixed cap reachable with small solution fields.
+        let epoch_seconds = 1u64;
+        let max_seconds_offset = 300u64;
 
         let constants = RewardDistributorConstants::without_launcher_id(
             RewardDistributorType::Managed {
@@ -1707,9 +1752,10 @@ mod tests {
         .with_launcher_id(launcher_id);
 
         let slot_epoch_time = 0u64;
-        // Two epochs past `slot_epoch_time + epoch_seconds` (1_000): needs 3 backfill iterations,
-        // past the cap of 1 derived above.
-        let epoch_start = 3_000u64;
+        // `start_epoch_time = slot_epoch_time + epoch_seconds = 1`; picking `epoch_start` one past
+        // `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` iterations out puts the real iteration count one
+        // above the fixed cap.
+        let epoch_start = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 2;
 
         let action_puzzle = ctx
             .curry(
@@ -1741,19 +1787,75 @@ mod tests {
                 max_backfill_slots,
             }) => {
                 assert_eq!(
-                    max_backfill_slots, 1,
-                    "the cap must be derived, not hardcoded"
+                    max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
+                    "the cap must be the fixed, named constant, not a re-derived value"
                 );
                 assert_eq!(
-                    iterations, 3,
+                    iterations,
+                    MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 1,
                     "the refusal must name the real iteration count"
                 );
             }
             Ok(()) => panic!(
-                "the pre-screen let a commit_incentives backfill through past its own derived cap"
+                "the pre-screen let a commit_incentives backfill through past its own fixed cap"
             ),
             Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
         }
+    }
+
+    /// The revised cap must not merely be uncrossable -- it must still ADMIT the honest case it
+    /// exists to serve: DIG's own real launch constants (`epoch_seconds = 604_800`,
+    /// `max_seconds_offset = 300`) backfilling exactly two empty epochs. The retired ratio-based
+    /// cap evaluated to `0` at these exact constants, refusing this every time; this is the red
+    /// test that would have caught it.
+    #[test]
+    fn an_honest_two_epoch_backfill_succeeds_under_dig_distributor_constants() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let refund_hash = some_identity();
+        let terms = crate::constants::dig_distributor_terms_for_testing();
+        let constants = crate::constants::dig_distributor_constants(&terms, refund_hash)
+            .expect("DIG's own canonical constants must build")
+            .with_launcher_id(launcher_id);
+
+        let epoch_seconds = constants.epoch_seconds;
+        let slot_epoch_time = 0u64;
+        // Exactly two epochs past `slot_epoch_time + epoch_seconds`: an honest backfill of two
+        // empty epochs, well inside `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`.
+        let epoch_start = epoch_seconds
+            .checked_mul(3)
+            .expect("small multiple of DIG's own epoch_seconds must be representable");
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                    slot_counter: 0,
+                    slot_epoch_time,
+                    slot_next_epoch_initialized: false,
+                    slot_total_rewards: 0,
+                    epoch_start,
+                    clawback_ph: some_identity(),
+                    rewards_to_add: 1,
+                },
+            )
+            .expect("a well-formed commit solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        assert_eq!(
+            refuse_unrepresentable_action_arithmetic(ctx, &spend, constants),
+            Ok(()),
+            "an honest two-epoch backfill under DIG's own real constants must be admitted, not \
+             refused by a cap that evaluates to zero at those exact constants"
+        );
     }
 
     /// `unstake.rs:235`: `entry_slot.shares - removed_shares` underflows when a solution names an

@@ -289,6 +289,32 @@ fn test_constants_with_bps(
     )
 }
 
+/// As [`test_constants_with_bps`], but overrides `max_seconds_offset` instead of the withdrawal
+/// share -- builds the fixture `RewardsError::UnreadableMaxSecondsOffset`'s domain check needs a
+/// distributor to actually exceed, rather than merely asserting the check reads correctly against
+/// values nobody's launch could produce.
+fn test_constants_with_max_seconds_offset(
+    manager_singleton_launcher_id: Bytes32,
+    funder_refund_puzzle_hash: Bytes32,
+    simulator_asset_id: Bytes32,
+    max_seconds_offset: u64,
+) -> RewardDistributorConstants {
+    RewardDistributorConstants::without_launcher_id(
+        RewardDistributorType::Managed {
+            manager_singleton_launcher_id,
+        },
+        funder_refund_puzzle_hash,
+        TEST_EPOCH_SECONDS,
+        u64::MAX,
+        max_seconds_offset,
+        PAYOUT_THRESHOLD_BASE_UNITS,
+        false,
+        0,
+        0,
+        simulator_asset_id,
+    )
+}
+
 /// Everything a launched test distributor needs to keep being driven.
 struct Harness {
     sim: Simulator,
@@ -321,6 +347,34 @@ fn launch_harness_with(
     ctx: &mut SpendContext,
     minted_base_units: u64,
     withdrawal_share_bps: u64,
+) -> anyhow::Result<Harness> {
+    launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
+        test_constants_with_bps(manager, funder, asset_id, withdrawal_share_bps)
+    })
+}
+
+/// As [`launch_harness_with`], but overrides `max_seconds_offset` instead of the withdrawal
+/// share -- the clock-skew-tolerance constant `RewardsError::UnreadableMaxSecondsOffset` domain-
+/// checks. A fixture that can only launch at `MAX_SECONDS_OFFSET` cannot reach that bound, and a
+/// guard no fixture can reach is a claim rather than a proof.
+fn launch_harness_with_max_seconds_offset(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    max_seconds_offset: u64,
+) -> anyhow::Result<Harness> {
+    launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
+        test_constants_with_max_seconds_offset(manager, funder, asset_id, max_seconds_offset)
+    })
+}
+
+/// Shared body behind [`launch_harness_with`] and [`launch_harness_with_max_seconds_offset`]:
+/// mint the reward CAT, launch a manager singleton, build the launch offer, then hand the
+/// manager/funder/asset identities `launch_dig_distributor` needs to whatever constants table the
+/// caller's closure builds from them, and launch.
+fn launch_harness_with_constants_builder(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    build_constants: impl FnOnce(Bytes32, Bytes32, Bytes32) -> RewardDistributorConstants,
 ) -> anyhow::Result<Harness> {
     let mut sim = Simulator::new();
 
@@ -417,11 +471,10 @@ fn launch_harness_with(
         },
     )?;
 
-    let constants = test_constants_with_bps(
+    let constants = build_constants(
         manager.launcher_id,
         funder.puzzle_hash,
         source_cat.info.asset_id,
-        withdrawal_share_bps,
     );
     let launched = launch_dig_distributor(
         ctx,
@@ -2274,6 +2327,49 @@ fn a_distributor_launched_with_an_out_of_domain_bps_is_refused_by_the_reader() -
              (SPEC.md 0.1 clause 5d)"
         ),
         Err(other) => panic!("expected UnreadableDistributorConstants, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// B1 sibling for `max_seconds_offset`, end to end: a distributor launched with a hostile
+/// clock-skew tolerance (`max_seconds_offset = u64::MAX`) is exactly the shape that, paired with
+/// a small `epoch_seconds`, inflated the old ratio-derived backfill cap to roughly `1.8e19` with
+/// no bound at all -- real memory/CPU exhaustion reachable through `read_distributor`, not merely
+/// a wrong-answer risk. The fixed, distributor-independent `MAX_SANE_SECONDS_OFFSET` domain check
+/// must refuse this distributor before any backfill arithmetic runs at all, regardless of what
+/// `epoch_seconds` it is paired with.
+#[test]
+fn a_distributor_launched_with_an_out_of_domain_max_seconds_offset_is_refused_by_the_reader(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let harness =
+        launch_harness_with_max_seconds_offset(ctx, MINTED_BASE_UNITS, u64::MAX)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::UnreadableMaxSecondsOffset {
+            max_seconds_offset,
+        }) => assert_eq!(
+            max_seconds_offset,
+            u64::MAX,
+            "the refusal must name the max_seconds_offset it read off the chain"
+        ),
+        Ok(Some(snapshot)) => panic!(
+            "the reader handed on an out-of-domain max_seconds_offset as authenticated state: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!(
+            "Ok(None) asserts the positive fact that no such distributor exists, and one does              (SPEC.md 0.1 clause 5d)"
+        ),
+        Err(other) => panic!("expected UnreadableMaxSecondsOffset, got: {other}"),
     }
 
     Ok(())

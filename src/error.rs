@@ -244,11 +244,26 @@ pub enum RewardsError {
     /// [`RewardsError::CommitIncentivesEpochSecondsZero`]) pushes one reward slot per iteration of
     /// `(epoch_start - slot_epoch_time) / epoch_seconds`, both `epoch_start` and `slot_epoch_time`
     /// being attacker-supplied action-solution fields with `epoch_seconds > 0` but otherwise
-    /// unbounded in magnitude. Refusing once the derived iteration count exceeds
-    /// `max_backfill_slots` bounds this reader's own CPU and memory to a value derived from the
-    /// distributor's own declared `max_seconds_offset` tolerance — the same bound
-    /// `chia-sdk-driver` 0.36.0 curries into every other action that carries an epoch-time-like
-    /// field — rather than to a figure an attacker's own solution controls.
+    /// unbounded in magnitude — `read_distributor` is deliberately distributor-agnostic, so for an
+    /// attacker's own launcher `epoch_seconds` is also attacker-chosen, all the way down to `1`.
+    ///
+    /// An earlier version of this bound divided the distributor's own declared
+    /// `max_seconds_offset` tolerance by `epoch_seconds` and refused past the quotient. That
+    /// derivation was wrong in **both** directions at once, which is why it is gone: at DIG's own
+    /// real launch constants (`epoch_seconds = 604_800`, `max_seconds_offset = 300`) the quotient
+    /// is `0`, so it refused every honest non-adjacent-epoch commit outright; and because nothing
+    /// in this crate bounds `max_seconds_offset` (see
+    /// [`RewardsError::UnreadableMaxSecondsOffset`]), an attacker's own `epoch_seconds = 1,
+    /// max_seconds_offset = u64::MAX` inflated the same quotient to roughly `1.8e19`, which is no
+    /// bound at all. A ratio of two attacker-reachable parameters cannot be a safety bound in
+    /// either direction.
+    ///
+    /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS)
+    /// replaces it: a fixed count this reader chose, independent of anything either an honest or a
+    /// hostile launcher supplies, large enough that no plausible honest gap in real incentive
+    /// commitments comes close (at DIG's own one-week epoch it is roughly nineteen thousand
+    /// years), while still bounding the `RewardDistributorRewardSlotValue` structs this reader's
+    /// own memory must hold for one action to a few tens of megabytes at most.
     #[error(
         "commit_incentives action would backfill {iterations} reward slots, exceeding the \
          {max_backfill_slots} this reader will construct for one action -- refusing rather than \
@@ -257,8 +272,30 @@ pub enum RewardsError {
     CommitIncentivesBackfillBoundExceeded {
         /// The derived backfill iteration count: `(epoch_start - slot_epoch_time) / epoch_seconds`.
         iterations: u64,
-        /// The cap this reader enforces: `constants.max_seconds_offset / constants.epoch_seconds`.
+        /// The fixed cap this reader enforces, independent of any distributor's own constants:
+        /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS).
         max_backfill_slots: u64,
+    },
+
+    /// A distributor's own `max_seconds_offset` launch constant is outside a plausible
+    /// clock-skew-tolerance domain.
+    ///
+    /// `max_seconds_offset` is curried into `add_entry`, `stake`, `unstake` and `refresh` as a
+    /// tolerance between an action's own claimed time and the chain's, in seconds. Nothing in
+    /// `chia-sdk-driver` 0.36.0 or in this crate bounded it before this check existed, so a
+    /// hostile or corrupt launcher — reached the same distributor-agnostic way
+    /// `read_distributor` reaches every other launch constant — could set it to `u64::MAX`.
+    /// Bounded here at [`u32::MAX`] seconds (about 136 years): no honest clock-skew tolerance
+    /// approaches that range (DIG's own is `300`), so a value beyond it proves the constant is
+    /// hostile or corrupt, not merely generous.
+    #[error(
+        "distributor constants carry max_seconds_offset={max_seconds_offset}, beyond a plausible \
+         clock-skew-tolerance domain (u32::MAX seconds) -- refusing to read rather than trusting \
+         an unbounded attacker-chosen tolerance (#3313)"
+    )]
+    UnreadableMaxSecondsOffset {
+        /// The out-of-domain `max_seconds_offset` read off the distributor's own constants.
+        max_seconds_offset: u64,
     },
 }
 
