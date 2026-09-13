@@ -44,6 +44,24 @@ This project adheres to [Semantic Versioning](https://semver.org) and
     of the public reader, reachable from unauthenticated chain input with DIG's own 9_000 bps and a
     large enough commitment -- or, in release, reconstructed a fabricated
     `created_reward_slot.rewards` as authenticated distributor state.
+- `read_distributor` now runs a fail-closed pre-screen, `refuse_unrepresentable_action_arithmetic`,
+  over every generation's action-layer solution BEFORE calling `chia-sdk-driver`'s
+  `RewardDistributor::from_spend`, closing seven further unchecked-arithmetic and
+  non-termination hazards inside upstream's `get_log` methods that B1/B2 above do not reach
+  (dig_ecosystem#3313): `withdraw_incentives.rs:71,89`'s multiply and subtract,
+  `commit_incentives.rs:85,101`'s two adds plus its `commit_incentives.rs:103-112` backfill loop
+  (refused outright when the distributor's own `epoch_seconds` constant is zero, since the loop
+  would never terminate; otherwise bounded by a derived cap,
+  `max_seconds_offset / epoch_seconds`, rather than a decimal literal), `unstake.rs:235`'s
+  subtract (closed by actually running the action's own unlock puzzle to recover
+  `removed_shares`, since it is not a static solution field), and `stake.rs:326,329`'s counter
+  increment (`i128`, panics at `i128::MAX`) and add (closed the same way, via the action's own
+  lock puzzle). New `RewardsError` variants: `ActionArithmeticNotRepresentable` (extended to name
+  all four affected actions), `CommitIncentivesEpochSecondsZero`,
+  `CommitIncentivesBackfillBoundExceeded`. The pre-screen also fails closed on any action puzzle
+  hash it does not recognise as one of the eleven reward-distributor actions
+  `chia-sdk-driver` 0.36.0 defines (`UnrecognisedActionPuzzle`) -- a future pin bump that changes
+  an action puzzle makes every read refuse loudly rather than silently skip an unscreened hazard.
 
 ### Documentation
 - Corrected `src/clawback.rs`'s claims that the driver returns "the puzzle's own figure, never a
