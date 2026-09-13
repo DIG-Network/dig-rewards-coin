@@ -69,17 +69,19 @@ anyhow = "1.0.100"
 # simulator coin records/spends, so `read_distributor` (#3267) is exercised through its real
 # trait boundary rather than a bespoke test-only shortcut.
 dig-chainsource-interface = { version = "0.3.3", features = ["testing"] }
-# Cohort crates only the TESTS name. `chia-puzzles`, `clvm-traits`, `clvm-utils` and `clvmr` are all
-# reached transitively by the library through `chia-consensus`/`chia-sdk-driver`, so declaring them
-# under `[dependencies]` added no capability — it only pinned four extra versions, immutably, in
+# Cohort crates only the TESTS name. `chia-puzzles` and `clvm-utils` are reached transitively by
+# the library through `chia-consensus`/`chia-sdk-driver`, so declaring them under
+# `[dependencies]` would add no capability -- it would only pin two extra versions, immutably, in
 # every consumer's resolution. Being dev-only, they are absent from the published requirement set
 # entirely (SPEC.md §0.5 clause 1, #3272), so pinning them here constrains nothing downstream; the
 # versions below are DESCRIPTIVE of this repo's own `Cargo.lock`, not a normative consumer
 # requirement, and are asserted by `tests/cohort_lock_guard.rs`.
+#
+# `clvm-traits` and `clvmr` are deliberately NOT repeated here: the pre-screen (#3313) promoted
+# both to `[dependencies]` above, at the same versions, and a dev-dependency entry duplicating a
+# normal one adds nothing while inviting the two to drift apart in a later edit.
 chia-puzzles = "0.20.3"
-clvm-traits = "0.36.1"
 clvm-utils = "0.36.1"
-clvmr = "0.16.4"
 # The simulator harness the acceptance tests run against — `Simulator`, `Benchmark` and
 # `BlsPairWithCoin` live here. Cohort-matched to `chia-sdk-driver` 0.36.0 on purpose: a test built
 # on different puzzle bytes than the library would prove nothing about the library.
