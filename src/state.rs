@@ -43,9 +43,14 @@ use crate::RewardsError;
 /// reported `EntrySetStale` to anyone reading it (`SPEC.md` §12.4).
 pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 
-/// The largest number of reward slots `refuse_unrepresentable_action_arithmetic` will let a
-/// single `commit_incentives` action backfill, in its non-adjacent-epoch branch
-/// (`chia-sdk-driver-0.36.0`'s `commit_incentives.rs:101-112`), before refusing the generation.
+/// The largest number of reward slots `refuse_unrepresentable_action_arithmetic` will let ONE
+/// READ backfill in total, through `commit_incentives`'s non-adjacent-epoch branch
+/// (`chia-sdk-driver-0.36.0`'s `commit_incentives.rs:101-112`), before refusing the read.
+///
+/// It is a budget spent across the whole walk -- across every generation, and across every action
+/// within a generation -- because the reward slots it bounds are retained for the whole walk. See
+/// `read_distributor`, which owns the accumulator, and
+/// `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
 ///
 /// Fixed and independent of any distributor's own declared constants — never a ratio of
 /// `max_seconds_offset` to `epoch_seconds`, which produced `0` at DIG's own real launch constants
@@ -55,9 +60,10 @@ pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 ///
 /// One million is comfortably beyond any plausible historical gap in real incentive commitments
 /// — at DIG's own one-week epoch it is roughly nineteen thousand years of backfilled epochs --
-/// while still bounding what this reader must hold in memory for one action to a few tens of
+/// while still bounding what this reader must hold in memory across one read to a few tens of
 /// megabytes of `RewardDistributorRewardSlotValue` structs (~40 bytes each), never the unbounded
-/// count an attacker's own `epoch_seconds` could otherwise demand.
+/// count an attacker's own `epoch_seconds`, or an unbounded number of cheaply-mined generations,
+/// could otherwise demand.
 pub const MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS: u64 = 1_000_000;
 
 /// Turns a `ChainSource` error into the one `RewardsError` variant a failed read may ever produce.
@@ -473,6 +479,7 @@ fn refuse_unrepresentable_action_arithmetic(
     ctx: &mut SpendContext,
     spend: &CoinSpend,
     constants: RewardDistributorConstants,
+    backfill_slots_committed: &mut u64,
 ) -> Result<(), RewardsError> {
     let solution_ptr = ctx.alloc(&spend.solution).map_err(RewardsError::from)?;
     let singleton_solution = ctx
@@ -579,17 +586,6 @@ fn refuse_unrepresentable_action_arithmetic(
     .ok()
     .map(|args| args.curry_tree_hash());
 
-    // `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` is a budget for the WHOLE generation, consumed as
-    // this walk goes, never a ceiling re-offered to every action in turn. `action_spends` is a
-    // plain `Vec<Spend>` (`action_layer.rs:42`) whose length nothing bounds here or upstream, and
-    // `parse_solution` resolves repeated selectors through one CACHED Merkle proof
-    // (`action_layer.rs:255-272`), so one leaf can be spent arbitrarily many times in a single
-    // generation. A `commit_incentives` action's on-chain CLVM cost does not scale with its
-    // backfill gap -- only the off-chain `get_log` reconstruction this pre-screen is protecting
-    // does -- so a per-action ceiling would let one cheaply-mined spend force every reader to
-    // materialise `action_spends.len()` times the cap. See
-    // `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
-    let mut backfill_slots_committed: u64 = 0;
     for action_spend in &action_layer_solution.action_spends {
         let raw_action_hash = ctx.tree_hash(action_spend.puzzle);
 
@@ -676,22 +672,22 @@ fn refuse_unrepresentable_action_arithmetic(
                     let iterations =
                         (params.epoch_start - start_epoch_time).div_ceil(constants.epoch_seconds);
 
-                    // The budget is consumed, not re-offered: what is left after the earlier
-                    // actions of THIS generation is what this action may spend. The subtraction
-                    // cannot underflow because the assignment below runs only when
-                    // `iterations <= budget_remaining`, so `backfill_slots_committed` is never
-                    // above `max_backfill_slots`.
-                    let budget_remaining = max_backfill_slots - backfill_slots_committed;
+                    // The budget is consumed, not re-offered: what is left after every earlier
+                    // action of this READ -- this generation's and every generation before it --
+                    // is what this action may spend. The subtraction cannot underflow because the
+                    // assignment below runs only when `iterations <= budget_remaining`, so
+                    // `*backfill_slots_committed` is never above `max_backfill_slots`.
+                    let budget_remaining = max_backfill_slots - *backfill_slots_committed;
                     if iterations > budget_remaining {
                         return Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                             iterations,
-                            already_committed: backfill_slots_committed,
+                            already_committed: *backfill_slots_committed,
                             max_backfill_slots,
                         });
                     }
                     // Bounded above by `max_backfill_slots` by the refusal directly above, so this
                     // add is representable without a check in every profile.
-                    backfill_slots_committed += iterations;
+                    *backfill_slots_committed += iterations;
 
                     // A count bound says nothing about the value being counted. Upstream's
                     // `start_epoch_time += epoch_seconds` runs once per pass
@@ -1052,6 +1048,24 @@ pub fn read_distributor(
     };
     let mut last_entry_write_unix: Option<u64> = None;
 
+    // `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` is a budget for the WHOLE READ, consumed as this walk
+    // goes, never a ceiling re-offered to each generation or to each action within one. It is
+    // declared HERE, one frame above the loop, because that is the frame that owns the data it
+    // bounds: the reward slots a backfill creates land in `slots.rewards`, which is retained until
+    // this function returns and is never pruned -- backfilled slots carry `counter: 0, rewards: 0`
+    // and an attacker's own distributor need never spend them. A budget scoped to one generation
+    // would therefore bound nothing: N cheaply-mined generations multiply this reader's retained
+    // memory by N, and nothing bounds N.
+    //
+    // Within one generation the same reasoning applies to actions: `action_spends` is a plain
+    // `Vec<Spend>` (`action_layer.rs:42`) whose length nothing bounds here or upstream, and
+    // `parse_solution` resolves repeated selectors through one CACHED Merkle proof
+    // (`action_layer.rs:255-272`), so one leaf can be spent arbitrarily many times in a single
+    // generation. A `commit_incentives` action's on-chain CLVM cost does not scale with its
+    // backfill gap -- only the off-chain `get_log` reconstruction the pre-screen is protecting
+    // does. See `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
+    let mut backfill_slots_committed: u64 = 0;
+
     loop {
         if !lineage.contains(distributor.coin.coin_id()) {
             return Err(malformed(
@@ -1075,7 +1089,12 @@ pub fn read_distributor(
         // `u64` arithmetic on solution fields inside that call, ahead of this crate's own B1/B2
         // guards, which only run once `from_spend` returns. See
         // `refuse_unrepresentable_action_arithmetic`'s own doc for the two fail-closed rules.
-        refuse_unrepresentable_action_arithmetic(&mut ctx, &spend, constants)?;
+        refuse_unrepresentable_action_arithmetic(
+            &mut ctx,
+            &spend,
+            constants,
+            &mut backfill_slots_committed,
+        )?;
 
         let reserve_lineage_proof = distributor.reserve.child_lineage_proof();
         let Some(reconstructed) = chia_sdk_driver::RewardDistributor::from_spend(
@@ -1489,7 +1508,7 @@ mod tests {
             solution,
         );
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::UnrecognisedActionPuzzle { action_puzzle_hash }) => {
                 assert_eq!(
                     action_puzzle_hash,
@@ -1583,7 +1602,7 @@ mod tests {
             solution,
         );
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "withdraw_incentives");
                 assert_eq!(operation, "reward_slot_total_rewards - withdrawal_share");
@@ -1670,7 +1689,7 @@ mod tests {
             solution,
         );
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "commit_incentives");
                 assert_eq!(operation, "slot_total_rewards + rewards_to_add");
@@ -1788,7 +1807,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::UnreadableEpochSeconds) => {}
             Ok(()) => panic!(
                 "the pre-screen let a commit_incentives backfill through with epoch_seconds == 0, \
@@ -1860,7 +1879,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                 iterations,
                 already_committed,
@@ -1960,7 +1979,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "commit_incentives");
                 assert_eq!(operation, "start_epoch_time + iterations * epoch_seconds");
@@ -2050,7 +2069,7 @@ mod tests {
 
         let spend = repeated_action_spend(ctx, action_puzzle, action_solutions);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                 iterations,
                 already_committed,
@@ -2078,6 +2097,127 @@ mod tests {
             Ok(()) => panic!(
                 "the pre-screen admitted a generation whose commit_incentives actions sum past \
                  the budget -- one cheap spend, unbounded reward-slot allocation"
+            ),
+            Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
+        }
+    }
+    /// The budget must span the WHOLE READ, not one generation. `read_distributor` calls this
+    /// pre-screen once per generation inside its walk loop (`state.rs`'s `loop`), and the reward
+    /// slots a `commit_incentives` backfill creates are RETAINED in `DistributorSlots::rewards`
+    /// for the entire walk -- pushed with `counter: 0, rewards: 0` and never spent again on an
+    /// attacker's own distributor, so nothing prunes them. A budget that resets per generation
+    /// therefore bounds nothing: an attacker mines N cheap generations and multiplies this
+    /// reader's retained memory by N.
+    ///
+    /// Each generation here is individually well under the budget, so a per-generation budget
+    /// admits both; only a budget carried across the read refuses the second. That is what makes
+    /// this discriminate the walk-wide bound from the per-generation one.
+    #[test]
+    fn commit_incentives_generations_summing_past_the_budget_are_refused_even_though_each_fits() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        // `epoch_seconds = 1` only so a large iteration count is reachable with small solution
+        // fields; the budget is absolute, so no distributor constant moves it.
+        let epoch_seconds = 1u64;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            300,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        // Derived from the budget, never spelled as a literal (SPEC 0.1 clause 5e): just over
+        // half of it, so ONE generation is admitted and TWO are not.
+        let iterations_per_generation = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS / 2 + 1;
+        let slot_epoch_time = 0u64;
+        let epoch_start = slot_epoch_time
+            .checked_add(epoch_seconds)
+            .and_then(|start| start.checked_add(iterations_per_generation))
+            .expect("a gap just over half the budget is representable");
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+
+        let mut generation_spend = || {
+            let action_solution = ctx
+                .alloc(
+                    &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                        slot_counter: 0,
+                        slot_epoch_time,
+                        slot_next_epoch_initialized: false,
+                        slot_total_rewards: 0,
+                        epoch_start,
+                        clawback_ph: some_identity(),
+                        rewards_to_add: 1,
+                    },
+                )
+                .expect("a well-formed commit solution always allocates");
+            single_action_spend(ctx, action_puzzle, action_solution)
+        };
+        let first_generation = generation_spend();
+        let second_generation = generation_spend();
+
+        // Exactly what `read_distributor`'s walk does: one pre-screen call per generation, the
+        // budget carried across them in the frame that owns the retained slots.
+        let mut backfill_slots_committed: u64 = 0;
+        refuse_unrepresentable_action_arithmetic(
+            ctx,
+            &first_generation,
+            constants,
+            &mut backfill_slots_committed,
+        )
+        .expect("one generation under the budget must be admitted");
+
+        match refuse_unrepresentable_action_arithmetic(
+            ctx,
+            &second_generation,
+            constants,
+            &mut backfill_slots_committed,
+        ) {
+            Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+                iterations,
+                already_committed,
+                max_backfill_slots,
+            }) => {
+                assert_eq!(
+                    max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
+                    "the budget must be the fixed, named constant, not a re-derived value"
+                );
+                assert_eq!(
+                    iterations, iterations_per_generation,
+                    "the refusal must name the real iteration count of the refused action"
+                );
+                assert_eq!(
+                    already_committed, iterations_per_generation,
+                    "the refusal must name what the EARLIER GENERATION already spent -- a \
+                     non-zero figure here is the whole point of a walk-wide budget"
+                );
+                assert!(
+                    iterations < max_backfill_slots,
+                    "each generation must be individually UNDER the budget, or this test cannot \
+                     tell a walk-wide bound from a per-generation one"
+                );
+            }
+            Ok(()) => panic!(
+                "the pre-screen admitted a second generation that pushes the read past the \
+                 budget -- the budget resets every generation, while the reward slots it bounds \
+                 are retained for the whole walk"
             ),
             Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
         }
@@ -2139,7 +2279,9 @@ mod tests {
 
         // `RewardsError` is deliberately not `PartialEq` (it carries a `String`), so the admission
         // is asserted by matching rather than comparing.
-        if let Err(refusal) = refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        if let Err(refusal) =
+            refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0)
+        {
             panic!(
                 "an honest two-epoch backfill under DIG's own real constants must be admitted, \
                  not refused by a cap that evaluates to zero at those exact constants: {refusal}"
@@ -2306,7 +2448,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "unstake");
                 assert_eq!(operation, "entry_slot.shares - removed_shares");
@@ -2377,7 +2519,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "stake");
                 assert_eq!(operation, "existing_slot_shares + new_shares");
@@ -2445,7 +2587,7 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants, &mut 0) {
             Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
                 assert_eq!(action, "stake");
                 assert_eq!(operation, "existing_slot_counter + 1");

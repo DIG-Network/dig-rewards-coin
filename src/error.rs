@@ -276,7 +276,15 @@ pub enum RewardsError {
     /// years), while still bounding the `RewardDistributorRewardSlotValue` structs this reader's
     /// own memory must hold to a few tens of megabytes at most.
     ///
-    /// **It is a budget for a whole generation, not a ceiling for one action.** A generation's
+    /// **It is a budget for a whole READ, not a ceiling for one action or one generation.**
+    /// [`crate::state::read_distributor`] declares the accumulator outside its own walk loop,
+    /// because that is the frame that owns the data the budget bounds: every reward slot a
+    /// backfill creates is retained in the walk's `DistributorSlots::rewards` until the read
+    /// returns, and nothing prunes it -- backfilled slots carry `counter: 0, rewards: 0`, and an
+    /// attacker's own distributor need never spend them. A budget that reset each generation
+    /// would bound nothing, since nothing bounds a walk's generation count: N cheaply-mined
+    /// generations would multiply this reader's retained memory by N. Within one generation the
+    /// same reasoning applies action by action. A generation's
     /// `ActionLayerSolution::action_spends` is a plain `Vec<Spend>`
     /// (`chia-sdk-driver-0.36.0/src/layers/action_layer/action_layer.rs:42`) whose length nothing
     /// bounds, here or upstream, and `ActionLayer::parse_solution` resolves repeated selectors
@@ -285,27 +293,29 @@ pub enum RewardsError {
     /// does not scale with its backfill gap -- only the off-chain `get_log` reconstruction does --
     /// so a per-action ceiling would let one cheaply-mined spend force every reader to materialise
     /// `action_spends.len()` times the cap. This reader therefore CONSUMES the budget as it walks
-    /// the generation's actions and refuses when an action asks for more than is left, which is
-    /// why the refusal names the two operands of what remains rather than a single count.
+    /// the read's generations and their actions, and refuses when an action asks for more than is
+    /// left, which is why the refusal names the two operands of what remains rather than a single
+    /// count.
     ///
     /// `action_spends.len()` itself is deliberately NOT refused separately: an action that
     /// backfills nothing allocates nothing, so a length bound would name no hazard this budget
     /// does not already cover, and would refuse honest callers for nothing.
     #[error(
         "a commit_incentives action would backfill {iterations} reward slots on top of the \
-         {already_committed} this generation's earlier actions already committed, exceeding \
-         the {max_backfill_slots} this reader will construct for one generation -- refusing \
+         {already_committed} this read's earlier actions already committed, exceeding \
+         the {max_backfill_slots} this reader will construct across one read -- refusing \
          rather than risking unbounded CPU/memory (#3313)"
     )]
     CommitIncentivesBackfillBoundExceeded {
         /// The real backfill iteration count upstream's loop would run for THIS action: the
         /// CEILING of `epoch_start - (slot_epoch_time + epoch_seconds)` over `epoch_seconds`.
         iterations: u64,
-        /// How much of the budget the same generation's EARLIER `commit_incentives` actions have
-        /// already consumed. Zero when this action is the generation's first backfilling one, so
-        /// a single-action refusal reads exactly as it did when the cap was per-action.
+        /// How much of the budget this read's EARLIER `commit_incentives` actions have already
+        /// consumed -- across every generation walked so far, not only this one. Zero when this
+        /// action is the read's first backfilling one, so a single-action refusal reads exactly
+        /// as it did when the cap was per-action.
         already_committed: u64,
-        /// The fixed per-generation budget this reader enforces, independent of any distributor's
+        /// The fixed per-read budget this reader enforces, independent of any distributor's
         /// own constants:
         /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS).
         max_backfill_slots: u64,

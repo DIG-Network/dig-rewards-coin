@@ -59,8 +59,10 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   which is bounded in TWO dimensions because bounding either alone leaves the other open:
   its iteration count, by `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` -- an ABSOLUTE constant this
   crate chooses, never a ratio of the distributor's own declared constants, never a bare decimal
-  literal, and spent as a budget across the WHOLE generation rather than re-offered to each of its
-  action spends; and its accumulator, by requiring the loop's terminal `start_epoch_time +
+  literal, and spent as a budget across the WHOLE READ -- every generation of the walk and every
+  action within one -- rather than re-offered to each generation or each action spend in turn,
+  because the reward slots it bounds are retained in the walk's own slot set until the read
+  returns and nothing prunes them, so a budget that reset per generation would bound nothing; and its accumulator, by requiring the loop's terminal `start_epoch_time +
   iterations * epoch_seconds` to be representable, since the count is smallest exactly when the
   step is largest (`iterations == 1` at `epoch_seconds = u64::MAX / 2 + 1` passes any count cap
   while that one advance overflows `u64` -- a panic where overflow checks are on, a
