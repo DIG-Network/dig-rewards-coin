@@ -134,8 +134,16 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       directions at once -- at DIG's own published constants it is `300 / 604_800 = 0`, refusing
       every honest multi-epoch commit, while `epoch_seconds = 1, max_seconds_offset = u64::MAX`
       inflates it past `1.8e19`. A bound derived from attacker-controlled parameters is not a
-      bound. That constant MUST be a **budget for the whole generation, consumed across its action
-      spends**, never a ceiling re-offered to each action in turn: `ActionLayerSolution`'s
+      bound. That constant MUST be a **budget for the whole READ, consumed across every generation
+      the walk visits and every action spend within one**, never a ceiling re-offered to each
+      generation or each action in turn. The reader MUST hold the accumulator in the frame that
+      owns the reconstructed slot set, not in the per-generation pre-screen: every reward slot a
+      backfill creates is retained for the whole walk and nothing prunes it -- backfilled slots
+      carry a zero counter and zero rewards, and an attacker's own distributor need never spend
+      them -- while nothing bounds a walk's generation count, so a budget that reset per
+      generation would multiply the reader's retained memory by an attacker-chosen N for the
+      price of N cheaply-mined generations. Within one generation the same reasoning applies
+      action by action: `ActionLayerSolution`'s
       `action_spends` is a plain `Vec<Spend>` whose length nothing bounds, `parse_solution`
       resolves repeated selectors through one cached Merkle proof so a single leaf may be spent
       arbitrarily many times, and a `commit_incentives` action's on-chain CLVM cost does not scale
