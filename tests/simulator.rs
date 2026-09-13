@@ -19,12 +19,13 @@ use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
 use chia_puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_sdk_driver::{
-    sign_standard_transaction, Cat, CatSpend, Launcher, Offer, RewardDistributor,
-    RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
-    SpendWithConditions, StandardLayer,
+    sign_standard_transaction, ActionLayer, Cat, CatSpend, HashedPtr, Launcher, Layer, Offer,
+    RewardDistributor, RewardDistributorConstants, RewardDistributorState, RewardDistributorType,
+    SingleCatSpend, Slot, Spend, SpendContext, SpendWithConditions, StandardLayer,
 };
 use chia_sdk_test::Simulator;
 use chia_sdk_types::puzzles::{
+    RawActionLayerSolution, RewardDistributorCommitIncentivesActionSolution,
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
     RewardDistributorSlotNonce,
 };
@@ -49,6 +50,7 @@ use dig_rewards_coin::epoch::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
+use dig_rewards_coin::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
 use dig_rewards_coin::{
     read_distributor, DistributorSnapshot, RewardsError, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
     STALE_ENTRY_SET_SECONDS,
@@ -2905,6 +2907,213 @@ fn withdraw_guards_the_substituted_commitment_not_the_callers_stale_one() -> any
              {paid:?}"
         ),
         Err(other) => panic!("expected DriverShareNotRepresentable, got: {other}"),
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The backfill budget (SPEC.md 0.1 clause 5d) is a READ-WIDE accumulator, hoisted into
+// `read_distributor` above its walk loop rather than declared inside the per-generation
+// pre-screen. The discriminator: a two-generation history whose first generation genuinely
+// backfills 3 epochs, and whose second DECLARES a backfill far past the whole budget. Hoisted,
+// the second generation's refusal reports `already_committed == 3` (gen 1's real spend carried
+// into gen 2's refusal); un-hoisted, the accumulator resets per generation and reports 0.
+// ---------------------------------------------------------------------------------------------
+
+/// Rewrites a real, recorded `commit_incentives` `CoinSpend`'s solution to declare
+/// `forged_epoch_start` instead of whatever epoch it was really built with -- leaving the coin,
+/// the puzzle reveal, the lineage proof and the Merkle proof exactly as the real spend built
+/// them. Only the one field `refuse_unrepresentable_action_arithmetic` reads is forged, which is
+/// what makes a refusal here evidence about the PRE-SCREEN, not about a hand-built fixture: the
+/// spend genuinely came out of the driver, and every other field genuinely authenticates.
+///
+/// Never used to build a spend whose declared backfill is real (that is exactly the closed
+/// approach: a real spend backfilling anywhere near this crate's budget runs into
+/// `chia-sdk-driver`'s own `CostExceeded` long before it is useful as a test fixture).
+fn commit_incentives_spend_with_forged_epoch_start(
+    ctx: &mut SpendContext,
+    real_spend: &chia_protocol::CoinSpend,
+    forged_epoch_start: u64,
+) -> chia_protocol::CoinSpend {
+    let solution_ptr = ctx
+        .alloc(&real_spend.solution)
+        .expect("a real recorded solution always allocates");
+    let singleton_solution = ctx
+        .extract::<SingletonSolution<NodePtr>>(solution_ptr)
+        .expect("a real singleton spend's solution always parses as SingletonSolution");
+    let action_layer_solution = ActionLayer::<RewardDistributorState, HashedPtr>::parse_solution(
+        ctx,
+        singleton_solution.inner_solution,
+    )
+    .expect("a real action-layer solution always parses");
+
+    assert_eq!(
+        action_layer_solution.action_spends.len(),
+        1,
+        "this fixture only ever forges a single-action generation"
+    );
+    let action_spend = &action_layer_solution.action_spends[0];
+    let mut params = ctx
+        .extract::<RewardDistributorCommitIncentivesActionSolution>(action_spend.solution)
+        .expect("this fixture only ever forges a commit_incentives generation");
+    params.epoch_start = forged_epoch_start;
+    let forged_action_solution = ctx
+        .alloc(&params)
+        .expect("the forged commit_incentives solution always allocates");
+
+    let raw_action_layer_solution = RawActionLayerSolution {
+        puzzles: vec![action_spend.puzzle],
+        selectors_and_proofs: vec![(2, Some(action_layer_solution.proofs[0].clone()))],
+        solutions: vec![forged_action_solution],
+        finalizer_solution: action_layer_solution.finalizer_solution,
+    };
+    let forged_inner_solution = ctx
+        .alloc(&raw_action_layer_solution)
+        .expect("the rebuilt action-layer solution always allocates");
+
+    let forged_singleton_solution = SingletonSolution {
+        lineage_proof: singleton_solution.lineage_proof,
+        amount: singleton_solution.amount,
+        inner_solution: forged_inner_solution,
+    };
+    let forged_solution = ctx
+        .serialize(&forged_singleton_solution)
+        .expect("the rebuilt singleton solution always serializes");
+
+    chia_protocol::CoinSpend::new(
+        real_spend.coin,
+        real_spend.puzzle_reveal.clone(),
+        forged_solution,
+    )
+}
+
+/// Discriminating regression for the backfill budget's FRAME (SPEC.md 0.1 clause 5d, rule (1)):
+/// the accumulator MUST live in `read_distributor`, one frame above its walk loop, never inside
+/// `refuse_unrepresentable_action_arithmetic` itself -- because the reward slots a backfill
+/// creates are retained in `DistributorSlots::rewards` for the WHOLE walk, so a per-generation
+/// accumulator bounds nothing (an attacker mines N cheap generations and multiplies the reader's
+/// retained memory by N).
+///
+/// Gen 1 is a genuine, cheap, real `commit_incentives` spend backfilling 3 epochs -- real puzzle,
+/// real `from_spend`, milliseconds. Gen 2 is a second genuine, cheap real spend whose solution's
+/// `epoch_start` is then rewritten (see `commit_incentives_spend_with_forged_epoch_start`) to
+/// declare a backfill of `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 1` -- one past the WHOLE budget,
+/// not merely past what gen 1 already spent, so an un-hoisted (per-generation) accumulator would
+/// still refuse it on the count alone. What discriminates hoisted from un-hoisted is the
+/// `already_committed` figure the refusal carries: hoisted, it is `3` (gen 1's real backfill,
+/// carried forward); un-hoisted, it is `0` (gen 2 read as if it were the read's first
+/// backfilling action).
+///
+/// This is deliberately debug-profile-safe: gen 2's declared backfill is refused at the
+/// pre-screen, `refuse_unrepresentable_action_arithmetic`, which runs on the action's solution
+/// fields alone and never calls `from_spend` -- and never runs the real backfill loop -- on the
+/// generation it refuses.
+///
+/// **This test's validity depends on the pre-screen running BEFORE `from_spend` on every
+/// generation** (`src/state.rs`: `refuse_unrepresentable_action_arithmetic`'s call site inside
+/// `read_distributor`'s walk loop precedes `RewardDistributor::from_spend`'s call there). If that
+/// ordering is ever reversed, gen 2's forged, giant declared backfill would instead reach the
+/// driver's own loop, and this test HANGS (or times out under `CostExceeded`) rather than failing
+/// cleanly -- it does not fail loudly on its own.
+#[test]
+fn a_backfill_forged_past_the_whole_budget_is_refused_with_the_earlier_generations_count(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    // Gen 1: a genuine backfill of 3 epochs. `commit_to_epoch`'s `epoch_start` is 4 epochs past
+    // `first_epoch_slot`'s own `epoch_start` (an adjacent commit would be the `slot_epoch_time ==
+    // epoch_start` branch, which never backfills at all), so the real gap is 3 epochs --
+    // `already_committed` after this generation must be exactly 3.
+    let gen1_epoch_start = FIRST_EPOCH_START + 4 * TEST_EPOCH_SECONDS;
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots_after_gen1 = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        gen1_epoch_start,
+        COMMITTED_BASE_UNITS,
+    )?;
+    members.push(harness.distributor.coin.coin_id());
+    let gen2_coin_id = harness.distributor.coin.coin_id();
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    // Gen 2's raw material: a second genuine, CHEAP real commit (a one-epoch gap) spending the
+    // gen-1 tip coin. Its only purpose is to produce a well-formed `commit_incentives` CoinSpend
+    // for that coin -- real puzzle reveal, real lineage proof, real Merkle proof -- whose
+    // solution is then forged below. Building it with a real huge gap instead is the closed
+    // approach: `chia-sdk-driver` hits `CostExceeded` long before N reaches this crate's budget.
+    let gen2_reward_slot = pick_reward_slot(&reward_slots_after_gen1, gen1_epoch_start);
+    let gen2_slot_epoch_time = gen2_reward_slot.info.value.epoch_start;
+    commit_to_epoch(
+        ctx,
+        &mut harness,
+        gen2_reward_slot,
+        gen1_epoch_start + 2 * TEST_EPOCH_SECONDS,
+        COMMITTED_BASE_UNITS,
+    )?;
+
+    let real_gen2_spend = harness
+        .sim
+        .coin_spend(gen2_coin_id)
+        .expect("gen 2's real spend was just recorded by the simulator");
+
+    // One past the WHOLE budget -- never `MAX - 1`, which an un-hoisted (per-generation)
+    // accumulator would still admit (0 already committed + `MAX - 1` <= `MAX`), passing for the
+    // wrong reason and, worse, proceeding into the real backfill loop and its 290s `CostExceeded`
+    // wall. `start_epoch_time` mirrors `refuse_unrepresentable_action_arithmetic`
+    // (`slot_epoch_time + epoch_seconds`) so the forged gap divides evenly by `epoch_seconds`,
+    // matching upstream's own ceiling-of-gap-over-step arithmetic exactly.
+    let start_epoch_time = gen2_slot_epoch_time + TEST_EPOCH_SECONDS;
+    let forged_iterations = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 1;
+    let forged_epoch_start = start_epoch_time + forged_iterations * TEST_EPOCH_SECONDS;
+
+    let forged_gen2_spend =
+        commit_incentives_spend_with_forged_epoch_start(ctx, &real_gen2_spend, forged_epoch_start);
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    )
+    .with_spend(gen2_coin_id, forged_gen2_spend);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+            iterations,
+            already_committed,
+            max_backfill_slots,
+        }) => {
+            assert_eq!(
+                already_committed, 3,
+                "the accumulator must be HOISTED above the walk loop: gen 1's real 3-epoch \
+                 backfill must be carried into gen 2's refusal. An un-hoisted (per-generation) \
+                 accumulator reports 0 here instead -- the discriminator this test exists for"
+            );
+            assert_eq!(
+                max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
+                "the refusal must name the fixed, named budget, not a re-derived value"
+            );
+            assert_eq!(
+                iterations, forged_iterations,
+                "the refusal must name the real iteration count the forged declaration implies"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the reader accepted a generation whose declared backfill is forged past the whole \
+             budget: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
     }
 
     Ok(())
