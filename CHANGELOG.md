@@ -55,9 +55,16 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   `RewardDistributor::from_spend`, closing seven further unchecked-arithmetic and
   non-termination hazards inside upstream's `get_log` methods that B1/B2 above do not reach
   (dig_ecosystem#3313): `withdraw_incentives.rs:71,89`'s multiply and subtract,
-  `commit_incentives.rs:85,101`'s two adds plus its `commit_incentives.rs:103-112` backfill loop
-  (bounded by `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`, an ABSOLUTE constant this crate chooses --
-  never a ratio of the distributor's own declared constants, and never a bare decimal literal),
+  `commit_incentives.rs:85,101`'s two adds plus its `commit_incentives.rs:103-112` backfill loop,
+  which is bounded in TWO dimensions because bounding either alone leaves the other open:
+  its iteration count, by `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` -- an ABSOLUTE constant this
+  crate chooses, never a ratio of the distributor's own declared constants, never a bare decimal
+  literal, and spent as a budget across the WHOLE generation rather than re-offered to each of its
+  action spends; and its accumulator, by requiring the loop's terminal `start_epoch_time +
+  iterations * epoch_seconds` to be representable, since the count is smallest exactly when the
+  step is largest (`iterations == 1` at `epoch_seconds = u64::MAX / 2 + 1` passes any count cap
+  while that one advance overflows `u64` -- a panic where overflow checks are on, a
+  non-terminating loop over an unbounded `Vec` where they are off),
   `unstake.rs:235`'s subtract (closed by actually running the action's own unlock puzzle to
   recover `removed_shares`, since it is not a static solution field), and `stake.rs:326,329`'s
   counter increment (`i128`, panics at `i128::MAX`) and add (closed the same way, via the action's
@@ -75,9 +82,12 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   chain honours while misreporting what it pays.
 - SPEC.md 0.1 clause 1's exception paragraph corrected, and clause 5 added.
 - SPEC.md 0.1 clause 5d gains B1a (`epoch_seconds == 0` MUST be refused on the launch constants,
-  before any generation is parsed) and a normative rule that the backfill bound MUST be an
-  absolute constant the reader chooses, never derived from the distributor's own parameters. The
-  clause previously mandated a reserve-amount bound, which the gate round proved bypassable.
+  before any generation is parsed) and a normative rule that the backfill loop MUST be bounded in
+  two independent dimensions: an iteration count bounded by an absolute constant the reader
+  chooses -- never derived from the distributor's own parameters, and spent as a per-generation
+  budget rather than a per-action ceiling -- and the loop accumulator's terminal value. The clause
+  previously mandated a reserve-amount bound, which the gate round proved bypassable, and then
+  claimed the count cap bounded the loop, which it did not.
 
 ### Miscellaneous
 - New public `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` (`u64::MAX / 10_000`), derived rather than
@@ -86,6 +96,13 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   reader chooses, deliberately independent of any distributor's own declared constants, because a
   bound derived from parameters an attacker picks is not a bound. At DIG's own one-week epoch it
   is roughly nineteen thousand years of backfilled epochs, so no honest commitment approaches it.
+  It is a budget for one GENERATION, consumed as the reader walks that generation's action spends:
+  `ActionLayerSolution::action_spends` is a plain `Vec<Spend>` whose length nothing bounds, the
+  same Merkle leaf may be selected repeatedly, and a `commit_incentives` action's on-chain CLVM
+  cost does not scale with its backfill gap, so a per-action ceiling would have admitted
+  `action_spends.len()` times the intended allocation for the price of one spend.
+  `CommitIncentivesBackfillBoundExceeded` therefore carries `already_committed` alongside
+  `iterations`, so a refusal names what the generation had already spent.
 - `clvm-traits` and `clvmr` moved from `[dev-dependencies]` to `[dependencies]`: the pre-screen
   runs the `unstake`/`stake` unlock and lock puzzles from the library itself, so they must be
   nameable outside the test harness. Both were already resolved at these exact versions

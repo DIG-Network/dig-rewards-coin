@@ -101,8 +101,9 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       `commit_incentives.rs:85` (`slot_total_rewards + rewards_to_add`, gated on
       `slot_epoch_time == epoch_start`), `commit_incentives.rs:101` (`slot_epoch_time +
       epoch_seconds`, the non-adjacent-epoch branch) plus its `commit_incentives.rs:103-112`
-      backfill loop (non-termination when `epoch_seconds == 0`, unbounded iteration otherwise),
-      `unstake.rs:235` (`entry_slot.shares - removed_shares`, where `removed_shares` is the output
+      backfill loop (non-termination when `epoch_seconds == 0`, an unbounded iteration count and
+      an unbounded accumulator otherwise), `unstake.rs:235` (`entry_slot.shares -
+      removed_shares`, where `removed_shares` is the output
       of running the action's own unlock puzzle), and `stake.rs:326,329` (`existing_slot_counter +
       1` on `i128`, and `existing_slot_shares + new_shares` where `new_shares` is likewise a
       lock-puzzle output). (B1 runs earlier still, but bounds only `withdrawal_share_bps` -- it
@@ -115,23 +116,45 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       every generation's action-layer solution BEFORE calling `from_spend` on it, and MUST refuse
       with a `RewardsError` under either of three rules: (i) the action solution cannot be parsed,
       (ii) the action puzzle hash is not one of the eleven reward-distributor actions
-      `chia-sdk-driver` 0.36.0 defines, or (iii) one of the seven named sites above is not
-      representable. (The loop-termination case is no longer a rule of this pre-screen: it is refused
-      earlier, on the launch constants, by B1a.) Rule (ii) MUST refuse an unrecognised
-      hash outright and MUST NOT skip it: a future pin bump that changes an action puzzle must make
-      every read refuse loudly, not walk past an action this crate never screened for the same
-      hazard.
+      `chia-sdk-driver` 0.36.0 defines, or (iii) one of the seven named sites above, or the backfill
+      loop's own accumulator, is not representable. (The loop-termination case is no longer a rule
+      of this pre-screen: it is refused earlier, on the launch constants, by B1a.) Rule (ii) MUST
+      refuse an unrecognised hash outright and MUST NOT skip it: a future pin bump that changes an
+      action puzzle must make every read refuse loudly, not walk past an action this crate never
+      screened for the same hazard.
 
-      The backfill loop's iteration count MUST be bounded by an **absolute, named constant the
-      reader itself chooses**, and MUST NOT be derived from the distributor's own declared
-      constants. A bound computed as `max_seconds_offset / epoch_seconds` is specifically
-      forbidden: for an attacker-launched distributor both operands are attacker-chosen, and the
-      same expression fails in both directions at once -- at DIG's own published constants it is
-      `300 / 604_800 = 0`, refusing every honest multi-epoch commit, while `epoch_seconds = 1,
-      max_seconds_offset = u64::MAX` inflates it past `1.8e19`. A bound derived from
-      attacker-controlled parameters is not a bound. The count the reader compares against that cap
-      MUST be the true ceiling of the epoch gap over `epoch_seconds`, matching upstream's loop
-      exactly, so a refusal names a count the loop would really have run.
+      The backfill loop MUST be bounded in **two independent dimensions**. Bounding either alone
+      leaves the other wide open, and the two fail in opposite directions, so neither can stand in
+      for the other.
+
+      **(1) Its iteration count**, by an **absolute, named constant the reader itself chooses**,
+      never derived from the distributor's own declared constants. A bound computed as
+      `max_seconds_offset / epoch_seconds` is specifically forbidden: for an attacker-launched
+      distributor both operands are attacker-chosen, and the same expression fails in both
+      directions at once -- at DIG's own published constants it is `300 / 604_800 = 0`, refusing
+      every honest multi-epoch commit, while `epoch_seconds = 1, max_seconds_offset = u64::MAX`
+      inflates it past `1.8e19`. A bound derived from attacker-controlled parameters is not a
+      bound. That constant MUST be a **budget for the whole generation, consumed across its action
+      spends**, never a ceiling re-offered to each action in turn: `ActionLayerSolution`'s
+      `action_spends` is a plain `Vec<Spend>` whose length nothing bounds, `parse_solution`
+      resolves repeated selectors through one cached Merkle proof so a single leaf may be spent
+      arbitrarily many times, and a `commit_incentives` action's on-chain CLVM cost does not scale
+      with its backfill gap -- so a per-action ceiling admits `action_spends.len()` times the
+      intended allocation for the price of one cheaply-mined spend. The count compared against that
+      budget MUST be the true ceiling of the epoch gap over `epoch_seconds`, matching upstream's
+      loop exactly, so a refusal names a count the loop would really have run.
+
+      **(2) Its accumulator.** Upstream advances `start_epoch_time += epoch_seconds` once per
+      iteration (`commit_incentives.rs:111`) and never checks that addition, so the reader MUST
+      also refuse unless the loop's TERMINAL value, `start_epoch_time + iterations *
+      epoch_seconds`, is representable. No iteration bound can substitute: the count is smallest
+      exactly when the step is largest, so at `epoch_seconds = u64::MAX / 2 + 1` a gap of one makes
+      `iterations == 1` -- under any cap -- while that single advance overflows `u64`, panicking
+      where overflow checks are on and, where they are off, wrapping below `end_epoch_time` so the
+      loop never terminates and its `Vec` grows without bound.
+
+      A per-generation budget and an accumulator bound are separate obligations, and a test for
+      each MUST fail when only that guard is removed.
 
       This pre-screen is a shim with an exit, not a durable fix -- the durable fix is upstream
       (<https://github.com/xch-dev/chia-wallet-sdk/issues/436>) -- and it establishes
