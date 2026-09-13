@@ -60,13 +60,6 @@ pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 /// count an attacker's own `epoch_seconds` could otherwise demand.
 pub const MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS: u64 = 1_000_000;
 
-/// The largest `max_seconds_offset` a distributor's own launch constants may declare before
-/// `read_distributor` refuses to read it at all. See
-/// `RewardsError::UnreadableMaxSecondsOffset`'s doc for why: nothing in `chia-sdk-driver` 0.36.0
-/// or elsewhere in this crate bounds this value on its own, so an unbounded reader would trust an
-/// attacker's own launch constant as a real clock-skew tolerance.
-pub const MAX_SANE_SECONDS_OFFSET: u64 = u32::MAX as u64;
-
 /// Turns a `ChainSource` error into the one `RewardsError` variant a failed read may ever produce.
 fn chain_unavailable<E: core::fmt::Display>(error: E) -> RewardsError {
     RewardsError::ChainUnavailable(error.to_string())
@@ -967,18 +960,6 @@ pub fn read_distributor(
         });
     }
 
-    // Same shape as B1 immediately above: `max_seconds_offset` is curried into `add_entry`,
-    // `stake`, `unstake` and `refresh` as a clock-skew tolerance, and nothing in
-    // `chia-sdk-driver` 0.36.0 or elsewhere in this crate bounds it. Left unchecked, it also
-    // silently controlled `refuse_unrepresentable_action_arithmetic`'s old (now-removed)
-    // backfill-iteration ratio -- an attacker's own `max_seconds_offset = u64::MAX` inflated that
-    // ratio past any real bound (DIG_ecosystem#3313's security-leg finding).
-    if constants.max_seconds_offset > MAX_SANE_SECONDS_OFFSET {
-        return Err(RewardsError::UnreadableMaxSecondsOffset {
-            max_seconds_offset: constants.max_seconds_offset,
-        });
-    }
-
     // The third constants-domain check, and the earliest one this reader can possibly make:
     // `epoch_seconds` is curried into the action puzzles at LAUNCH, never supplied per spend, so
     // it is knowable here -- before one generation is parsed -- rather than only per action once
@@ -1767,9 +1748,9 @@ mod tests {
     fn a_commit_incentives_backfill_past_the_fixed_cap_is_refused() {
         let ctx = &mut SpendContext::new();
         let launcher_id = some_identity();
-        // `epoch_seconds = 1` is not itself hostile (the domain check on `max_seconds_offset`
-        // guards the attacker-controlled shape); it is chosen here only to make the backfill span
-        // needed to exceed a MILLION-slot fixed cap reachable with small solution fields.
+        // `epoch_seconds = 1` is chosen only to make a backfill span past a MILLION-slot cap
+        // reachable with small solution fields; the cap is absolute, so no distributor constant
+        // can move it either way.
         let epoch_seconds = 1u64;
         let max_seconds_offset = 300u64;
 

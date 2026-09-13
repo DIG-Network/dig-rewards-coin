@@ -44,11 +44,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
     of the public reader, reachable from unauthenticated chain input with DIG's own 9_000 bps and a
     large enough commitment -- or, in release, reconstructed a fabricated
     `created_reward_slot.rewards` as authenticated distributor state.
-- `read_distributor` now domain-checks two further launch constants, on the constants and before
+- `read_distributor` now domain-checks one further launch constant, on the constants and before
   a single generation is parsed, for the same reason B1 is checked there (dig_ecosystem#3313):
-  - `max_seconds_offset` above `MAX_SANE_SECONDS_OFFSET` (`u32::MAX` seconds, about 136 years)
-    is refused (`UnreadableMaxSecondsOffset`). Nothing in `chia-sdk-driver` 0.36.0 bounded it, so
-    an attacker-launched distributor could declare `u64::MAX` as a clock-skew tolerance.
   - `epoch_seconds == 0` is refused (`UnreadableEpochSeconds`). Upstream's reward-slot backfill
     loop never advances at that value, and being a pure non-yielding CPU loop no caller-side
     `tokio::time::timeout` can cancel it -- a refusal by this reader is the only defence that can
@@ -65,7 +62,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   recover `removed_shares`, since it is not a static solution field), and `stake.rs:326,329`'s
   counter increment (`i128`, panics at `i128::MAX`) and add (closed the same way, via the action's
   own lock puzzle). New `RewardsError` variants: `ActionArithmeticNotRepresentable` (extended to
-  name all four affected actions), `UnreadableEpochSeconds`, `UnreadableMaxSecondsOffset`,
+  name all four affected actions), `UnreadableEpochSeconds`,
   `CommitIncentivesBackfillBoundExceeded`. The pre-screen also fails closed on any action puzzle
   hash it does not recognise as one of the eleven reward-distributor actions
   `chia-sdk-driver` 0.36.0 defines (`UnrecognisedActionPuzzle`) -- a future pin bump that changes
@@ -81,10 +78,9 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Miscellaneous
 - New public `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` (`u64::MAX / 10_000`), derived rather than
   spelled.
-- New public `state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` (`1_000_000`) and
-  `state::MAX_SANE_SECONDS_OFFSET` (`u32::MAX` seconds). Both are absolute figures this reader
-  chooses, deliberately independent of any distributor's own declared constants: a bound derived
-  from parameters an attacker picks is not a bound. At DIG's own one-week epoch the backfill cap
+- New public `state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` (`1_000_000`): an absolute figure this
+  reader chooses, deliberately independent of any distributor's own declared constants, because a
+  bound derived from parameters an attacker picks is not a bound. At DIG's own one-week epoch it
   is roughly nineteen thousand years of backfilled epochs, so no honest commitment approaches it.
 - `clvm-traits` and `clvmr` moved from `[dev-dependencies]` to `[dependencies]`: the pre-screen
   runs the `unstake`/`stake` unlock and lock puzzles from the library itself, so they must be

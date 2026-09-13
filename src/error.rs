@@ -241,11 +241,10 @@ pub enum RewardsError {
     /// point the timeout future is never polled and the worker thread hangs regardless. A refusal
     /// by this reader is the only defence that can work, which is why
     /// [`crate::state::read_distributor`] takes it on the **launch constants**, beside
-    /// [`RewardsError::UnreadableDistributorConstants`] and
-    /// [`RewardsError::UnreadableMaxSecondsOffset`], before a single generation is parsed — and
-    /// not only per action inside the replay walk. Matching one of this reader's recognised eleven
-    /// action hashes proves only that the distributor's constants are well-formed, never that they
-    /// are benign.
+    /// [`RewardsError::UnreadableDistributorConstants`], before a single generation is parsed
+    /// -- and not only per action inside the replay walk. Matching one of this reader's recognised
+    /// eleven action hashes proves only that the distributor's constants are well-formed, never
+    /// that they are benign.
     #[error(
         "distributor constants carry epoch_seconds == 0 -- the driver's own reward-slot backfill \
          loop would never terminate on this value, and being a pure CPU loop no caller-side \
@@ -265,8 +264,7 @@ pub enum RewardsError {
     /// derivation was wrong in **both** directions at once, which is why it is gone: at DIG's own
     /// real launch constants (`epoch_seconds = 604_800`, `max_seconds_offset = 300`) the quotient
     /// is `0`, so it refused every honest non-adjacent-epoch commit outright; and because nothing
-    /// in this crate bounds `max_seconds_offset` (see
-    /// [`RewardsError::UnreadableMaxSecondsOffset`]), an attacker's own `epoch_seconds = 1,
+    /// in this crate bounded `max_seconds_offset`, an attacker's own `epoch_seconds = 1,
     /// max_seconds_offset = u64::MAX` inflated the same quotient to roughly `1.8e19`, which is no
     /// bound at all. A ratio of two attacker-reachable parameters cannot be a safety bound in
     /// either direction.
@@ -289,27 +287,6 @@ pub enum RewardsError {
         /// The fixed cap this reader enforces, independent of any distributor's own constants:
         /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS).
         max_backfill_slots: u64,
-    },
-
-    /// A distributor's own `max_seconds_offset` launch constant is outside a plausible
-    /// clock-skew-tolerance domain.
-    ///
-    /// `max_seconds_offset` is curried into `add_entry`, `stake`, `unstake` and `refresh` as a
-    /// tolerance between an action's own claimed time and the chain's, in seconds. Nothing in
-    /// `chia-sdk-driver` 0.36.0 or in this crate bounded it before this check existed, so a
-    /// hostile or corrupt launcher — reached the same distributor-agnostic way
-    /// `read_distributor` reaches every other launch constant — could set it to `u64::MAX`.
-    /// Bounded here at [`u32::MAX`] seconds (about 136 years): no honest clock-skew tolerance
-    /// approaches that range (DIG's own is `300`), so a value beyond it proves the constant is
-    /// hostile or corrupt, not merely generous.
-    #[error(
-        "distributor constants carry max_seconds_offset={max_seconds_offset}, beyond a plausible \
-         clock-skew-tolerance domain (u32::MAX seconds) -- refusing to read rather than trusting \
-         an unbounded attacker-chosen tolerance (#3313)"
-    )]
-    UnreadableMaxSecondsOffset {
-        /// The out-of-domain `max_seconds_offset` read off the distributor's own constants.
-        max_seconds_offset: u64,
     },
 }
 
