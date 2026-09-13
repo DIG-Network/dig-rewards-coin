@@ -86,8 +86,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 - SPEC.md 0.1 clause 5d gains B1a (`epoch_seconds == 0` MUST be refused on the launch constants,
   before any generation is parsed) and a normative rule that the backfill loop MUST be bounded in
   two independent dimensions: an iteration count bounded by an absolute constant the reader
-  chooses -- never derived from the distributor's own parameters, and spent as a per-generation
-  budget rather than a per-action ceiling -- and the loop accumulator's terminal value. The clause
+  chooses -- never derived from the distributor's own parameters, and spent as a read-wide
+  budget rather than a per-generation or per-action ceiling -- and the loop accumulator's terminal value. The clause
   previously mandated a reserve-amount bound, which the gate round proved bypassable, and then
   claimed the count cap bounded the loop, which it did not.
 
@@ -98,13 +98,13 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   reader chooses, deliberately independent of any distributor's own declared constants, because a
   bound derived from parameters an attacker picks is not a bound. At DIG's own one-week epoch it
   is roughly nineteen thousand years of backfilled epochs, so no honest commitment approaches it.
-  It is a budget for one GENERATION, consumed as the reader walks that generation's action spends:
+  It is a budget for one READ, consumed as the reader walks every generation of the singleton and every action spend within one:
   `ActionLayerSolution::action_spends` is a plain `Vec<Spend>` whose length nothing bounds, the
   same Merkle leaf may be selected repeatedly, and a `commit_incentives` action's on-chain CLVM
   cost does not scale with its backfill gap, so a per-action ceiling would have admitted
   `action_spends.len()` times the intended allocation for the price of one spend.
   `CommitIncentivesBackfillBoundExceeded` therefore carries `already_committed` alongside
-  `iterations`, so a refusal names what the generation had already spent.
+  `iterations`, so a refusal names what the read had already spent.
 - `clvm-traits` and `clvmr` moved from `[dev-dependencies]` to `[dependencies]`: the pre-screen
   runs the `unstake`/`stake` unlock and lock puzzles from the library itself, so they must be
   nameable outside the test harness. Both were already resolved at these exact versions

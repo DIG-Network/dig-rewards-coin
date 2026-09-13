@@ -161,7 +161,7 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       where overflow checks are on and, where they are off, wrapping below `end_epoch_time` so the
       loop never terminates and its `Vec` grows without bound.
 
-      A per-generation budget and an accumulator bound are separate obligations, and a test for
+      A read-wide budget and an accumulator bound are separate obligations, and a test for
       each MUST fail when only that guard is removed.
 
       This pre-screen is a shim with an exit, not a durable fix -- the durable fix is upstream

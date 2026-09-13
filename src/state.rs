@@ -1717,7 +1717,7 @@ mod tests {
     /// Merkle leaf. `ActionLayer::parse_solution` caches a selector's proof the first time it sees
     /// it and reuses it for every later occurrence (`action_layer.rs:255-262`), so repeating one
     /// leaf across a generation is something a real solution can do -- which is exactly why the
-    /// backfill bound has to be a per-generation budget rather than a per-action ceiling.
+    /// backfill bound has to be a read-wide budget rather than a per-action ceiling.
     fn repeated_action_spend(
         ctx: &mut SpendContext,
         action_puzzle: NodePtr,
@@ -1996,7 +1996,7 @@ mod tests {
         }
     }
 
-    /// The backfill bound has to be a per-generation BUDGET, not a per-action ceiling. A
+    /// The backfill bound has to be a read-wide BUDGET, not a per-action ceiling. A
     /// generation's `action_spends` is a plain `Vec<Spend>` with no length bound in this crate or
     /// in `chia-sdk-driver` 0.36.0, and the same Merkle leaf may be selected repeatedly
     /// (`action_layer.rs:255-272` caches a selector's proof), while a `commit_incentives` action's
