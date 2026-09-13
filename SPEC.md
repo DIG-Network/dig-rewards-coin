@@ -73,16 +73,43 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       write any figure into a money field the documentation calls the puzzle's own.
 
    d. `read_distributor` MUST refuse a distributor it cannot reconstruct without wrapping, and MUST
-      refuse it as an **error**, never as `Ok(None)`. `withdrawal_share_bps` and the reserve amount
-      arrive from **unauthenticated chain input** -- an attacker may launch a distributor with any
-      `u64` bps -- so the reader MUST reject `withdrawal_share_bps > 10_000` on the launch constants
-      and MUST reject a generation whose reserve exceeds `u64::MAX / 10_000` before calling
-      `RewardDistributor::from_spend`. Those two bounds together make upstream's `get_log` multiply
-      and its following subtraction unreachable outside their safe domain. Without them, a read
-      **panics** in an overflow-checked build (a remote denial of service on every caller of the
-      public reader) or, in release, underflows and returns a fabricated
-      `created_reward_slot.rewards` as authenticated distributor state. `Ok(None)` is forbidden
-      here because it asserts the positive fact that no such distributor exists.
+      refuse it as an **error**, never as `Ok(None)`. `withdrawal_share_bps` and every committed
+      amount arrive from **unauthenticated chain input** -- an attacker may launch a distributor
+      with any `u64` bps -- so the reader MUST reject `withdrawal_share_bps > 10_000` on the launch
+      constants (B1) **before** calling `RewardDistributor::from_spend`, and MUST reject any
+      commitment slot whose recorded `rewards` exceed `u64::MAX / 10_000` (B2) **as each generation
+      is reconstructed, on `from_spend`'s return path**. B2 MUST NOT be expressed as a bound on the
+      reserve coin's amount: several actions may be composed into one distributor-coin spend, so
+      the reserve records only the net and never observes the peak, and a commitment may be
+      created and withdrawn within a single spend.
+
+      B1 and B2 alone do NOT make every unchecked `u64` site upstream's `get_log` methods touch
+      unreachable: `chia-sdk-driver` 0.36.0 computes three of those sites -- `withdraw_incentives.rs:71`
+      (`committed_value * withdrawal_share_bps`), `withdraw_incentives.rs:89`
+      (`reward_slot_total_rewards - withdrawal_share`), and `commit_incentives.rs:85`
+      (`slot_total_rewards + rewards_to_add`, gated on `slot_epoch_time == epoch_start`) -- from an
+      action solution's OWN fields, inside `from_spend`, ahead of B2, which only runs once
+      `from_spend` returns. (B1 runs earlier still, but bounds only `withdrawal_share_bps` -- it
+      says nothing about these operands.) See DIG-Network/dig_ecosystem#3313. `read_distributor`
+      MUST therefore run a fail-closed pre-screen, `refuse_unrepresentable_action_arithmetic`, over
+      every generation's action-layer solution BEFORE calling `from_spend` on it, and MUST refuse
+      with a `RewardsError` under either of two rules: (i) the action solution cannot be parsed, or
+      (ii) the action puzzle hash is not one of the eleven reward-distributor actions
+      `chia-sdk-driver` 0.36.0 defines. Rule (ii) MUST refuse an unrecognised hash outright and MUST
+      NOT skip it: a future pin bump that changes an action puzzle must make every read refuse
+      loudly, not walk past an action this crate never screened for the same hazard.
+
+      This pre-screen is a shim with an exit, not a durable fix -- the durable fix is upstream
+      (<https://github.com/xch-dev/chia-wallet-sdk/issues/436>) -- and it establishes
+      representability only for these three named sites, and only on the READER path: it says
+      nothing about the write-side builders, and a future reader must not infer whole-crate coverage
+      from it. It makes no claim about `commit_incentives.rs:82`'s `slot_counter + 1` (bounded by
+      the real on-chain counter, not a solution field) or `new_epoch.rs:124`'s fee multiply
+      (unreached by `get_log`; tracked separately, dig-rewards-coin#10). Without B1, B2 and this
+      pre-screen together, a read **panics** in an overflow-checked build (a remote denial of
+      service on every caller of the public reader) or, in release, wraps and returns a fabricated
+      figure as authenticated distributor state. `Ok(None)` is forbidden here because it asserts the
+      positive fact that no such distributor exists.
 
    e. Every bound above MUST be written as a derivation (`u64::MAX / 10_000`), never as a decimal
       literal, in both the code and its tests. A literal bound lets a mutation of the bound pass a
