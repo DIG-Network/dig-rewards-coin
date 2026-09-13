@@ -19,12 +19,13 @@ use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
 use chia_puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_sdk_driver::{
-    sign_standard_transaction, Cat, CatSpend, Launcher, Offer, RewardDistributor,
-    RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
-    SpendWithConditions, StandardLayer,
+    sign_standard_transaction, ActionLayer, Cat, CatSpend, HashedPtr, Launcher, Layer, Offer,
+    RewardDistributor, RewardDistributorConstants, RewardDistributorState, RewardDistributorType,
+    SingleCatSpend, Slot, Spend, SpendContext, SpendWithConditions, StandardLayer,
 };
 use chia_sdk_test::Simulator;
 use chia_sdk_types::puzzles::{
+    RawActionLayerSolution, RewardDistributorCommitIncentivesActionSolution,
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
     RewardDistributorSlotNonce,
 };
@@ -49,8 +50,10 @@ use dig_rewards_coin::epoch::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
+use dig_rewards_coin::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
 use dig_rewards_coin::{
-    read_distributor, DistributorSnapshot, RewardsError, STALE_ENTRY_SET_SECONDS,
+    read_distributor, DistributorSnapshot, RewardsError, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+    STALE_ENTRY_SET_SECONDS,
 };
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
@@ -252,6 +255,26 @@ fn test_constants(
     funder_refund_puzzle_hash: Bytes32,
     simulator_asset_id: Bytes32,
 ) -> RewardDistributorConstants {
+    test_constants_with_bps(
+        manager_singleton_launcher_id,
+        funder_refund_puzzle_hash,
+        simulator_asset_id,
+        WITHDRAWAL_SHARE_BPS,
+    )
+}
+
+/// As [`test_constants`], but with `withdrawal_share_bps` supplied by the caller.
+///
+/// `RewardDistributorConstants` takes a raw `u64` there, and nothing upstream or in
+/// `launch_dig_distributor` narrows it -- which is exactly why `read_distributor` has to reject an
+/// out-of-domain value itself (SPEC.md §0.1 clause 5d). This exists so a test can launch the
+/// hostile distributor an attacker can launch, rather than assert about one it cannot.
+fn test_constants_with_bps(
+    manager_singleton_launcher_id: Bytes32,
+    funder_refund_puzzle_hash: Bytes32,
+    simulator_asset_id: Bytes32,
+    withdrawal_share_bps: u64,
+) -> RewardDistributorConstants {
     RewardDistributorConstants::without_launcher_id(
         RewardDistributorType::Managed {
             manager_singleton_launcher_id,
@@ -263,7 +286,34 @@ fn test_constants(
         PAYOUT_THRESHOLD_BASE_UNITS,
         false,
         0,
-        WITHDRAWAL_SHARE_BPS,
+        withdrawal_share_bps,
+        simulator_asset_id,
+    )
+}
+
+/// As [`test_constants_with_bps`], but overrides `epoch_seconds` instead of the withdrawal share
+/// -- builds the fixture `RewardsError::UnreadableEpochSeconds`'s domain check needs a distributor
+/// to actually carry. `dig_distributor_constants` refuses a zero epoch length at launch, so the
+/// only way this reaches the reader at all is a hostile launcher assembling the table directly,
+/// which is exactly the threat model `read_distributor` is written for.
+fn test_constants_with_epoch_seconds(
+    manager_singleton_launcher_id: Bytes32,
+    funder_refund_puzzle_hash: Bytes32,
+    simulator_asset_id: Bytes32,
+    epoch_seconds: u64,
+) -> RewardDistributorConstants {
+    RewardDistributorConstants::without_launcher_id(
+        RewardDistributorType::Managed {
+            manager_singleton_launcher_id,
+        },
+        funder_refund_puzzle_hash,
+        epoch_seconds,
+        u64::MAX,
+        MAX_SECONDS_OFFSET,
+        PAYOUT_THRESHOLD_BASE_UNITS,
+        false,
+        0,
+        0,
         simulator_asset_id,
     )
 }
@@ -287,17 +337,58 @@ struct Harness {
 
 /// Mint $DIG, launch a manager singleton, build the launch offer, and launch the distributor.
 fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
+    launch_harness_with(ctx, MINTED_BASE_UNITS, WITHDRAWAL_SHARE_BPS)
+}
+
+/// As [`launch_harness`], but mints `minted_base_units` of the reward CAT and curries
+/// `withdrawal_share_bps` into the distributor's constants.
+///
+/// Both are parameters rather than constants because the #3286 guards are about scale and domain:
+/// a fixture that can only mint `MINTED_BASE_UNITS` at `WITHDRAWAL_SHARE_BPS` cannot reach either
+/// bound, and a guard no fixture can reach is a claim rather than a proof.
+fn launch_harness_with(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    withdrawal_share_bps: u64,
+) -> anyhow::Result<Harness> {
+    launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
+        test_constants_with_bps(manager, funder, asset_id, withdrawal_share_bps)
+    })
+}
+
+/// As [`launch_harness_with`], but overrides `epoch_seconds` -- the launch constant
+/// `RewardsError::UnreadableEpochSeconds` domain-checks, and the one whose zero value makes
+/// upstream's backfill loop non-terminating.
+fn launch_harness_with_epoch_seconds(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    epoch_seconds: u64,
+) -> anyhow::Result<Harness> {
+    launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
+        test_constants_with_epoch_seconds(manager, funder, asset_id, epoch_seconds)
+    })
+}
+
+/// Shared body behind [`launch_harness_with`] and [`launch_harness_with_epoch_seconds`]:
+/// mint the reward CAT, launch a manager singleton, build the launch offer, then hand the
+/// manager/funder/asset identities `launch_dig_distributor` needs to whatever constants table the
+/// caller's closure builds from them, and launch.
+fn launch_harness_with_constants_builder(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    build_constants: impl FnOnce(Bytes32, Bytes32, Bytes32) -> RewardDistributorConstants,
+) -> anyhow::Result<Harness> {
     let mut sim = Simulator::new();
 
     // Mint the reward CAT.
-    let funder = sim.bls(MINTED_BASE_UNITS);
+    let funder = sim.bls(minted_base_units);
     let funder_p2 = StandardLayer::new(funder.pk);
     let (issue_cat, source_cats) = Cat::single_issuance(
         ctx,
         funder.coin.coin_id(),
         None,
-        MINTED_BASE_UNITS,
-        Conditions::new().create_coin(funder.puzzle_hash, MINTED_BASE_UNITS, Memos::None),
+        minted_base_units,
+        Conditions::new().create_coin(funder.puzzle_hash, minted_base_units, Memos::None),
     )?;
     funder_p2.spend(ctx, funder.coin, issue_cat)?;
     let source_cat = source_cats[0];
@@ -382,7 +473,7 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         },
     )?;
 
-    let constants = test_constants(
+    let constants = build_constants(
         manager.launcher_id,
         funder.puzzle_hash,
         source_cat.info.asset_id,
@@ -425,8 +516,10 @@ fn launch_harness(ctx: &mut SpendContext) -> anyhow::Result<Harness> {
         "the manager singleton is curried from the constants table"
     );
     assert_eq!(
-        launched.distributor.info.constants.epoch_seconds, TEST_EPOCH_SECONDS,
-        "epoch_seconds is curried from the constants table"
+        launched.distributor.info.constants.epoch_seconds, constants.epoch_seconds,
+        "epoch_seconds is curried from the constants table the caller's builder produced -- \
+         compared against THAT table, not against TEST_EPOCH_SECONDS, so a fixture that \
+         deliberately launches a hostile epoch length is not refused by its own harness"
     );
 
     Ok(Harness {
@@ -1275,7 +1368,7 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         "a wrong authority is NotTheClawbackAuthority, got: {refusal}"
     );
 
-    // The recorded authority succeeds, and the figure returned is the puzzle's own.
+    // The recorded authority succeeds, and the guards cross-check the figure returned.
     let clawback = withdraw_committed_incentives(
         ctx,
         &mut harness.distributor,
@@ -1284,13 +1377,13 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         harness.funder.puzzle_hash,
     )?;
     assert_eq!(
-        clawback.recovered_base_units,
+        clawback.recovered_base_units(),
         COMMITTED_BASE_UNITS * WITHDRAWAL_SHARE_BPS / 10_000,
         "§7.5: the funder recovers withdrawal_share_bps of the commitment, and the rest stays \
          in the reserve"
     );
     assert!(
-        clawback.recovered_base_units < COMMITTED_BASE_UNITS,
+        clawback.recovered_base_units() < COMMITTED_BASE_UNITS,
         "a clawback is never the whole commitment: the forfeit is the deterrent"
     );
 
@@ -2185,4 +2278,843 @@ fn a_chain_source_that_errors_never_renders_as_an_empty_distributor() {
              render a failed read as 'no distributor was ever launched'; got {other:?}"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #3303 / #3305: read_distributor's two pre-guards against chia-sdk-driver 0.36.0's unchecked u64
+// share multiply (#3286). SPEC.md 0.1 clause 5d.
+//
+// Both tests reach the guards the way an attacker does -- through the PUBLIC reader, over chain
+// input nobody authenticated -- rather than by calling the guard's own predicate.
+// ---------------------------------------------------------------------------------------------
+
+/// B1, end to end: a distributor launched with a `withdrawal_share_bps` outside `0..=10_000` is
+/// refused by `read_distributor` as an **error**, not reported as state and not `Ok(None)`.
+///
+/// `RewardDistributorConstants` takes `withdrawal_share_bps` as a raw `u64` and neither upstream
+/// nor `launch_dig_distributor` narrows it, so anyone can launch this distributor and any caller
+/// of the public reader then reads it. Before the guard (commit `933b2ea`) this call returned
+/// `Ok(Some(snapshot))` whose `withdrawal_share_bps` was `u64::MAX / 2`, handed on as
+/// authenticated distributor state -- the match below is what distinguishes the two.
+///
+/// The bps is written as `u64::MAX / 2`, never as a decimal literal: a literal here would still
+/// pass if the guard's own bound were mutated.
+#[test]
+fn a_distributor_launched_with_an_out_of_domain_bps_is_refused_by_the_reader() -> anyhow::Result<()>
+{
+    const HOSTILE_BPS: u64 = u64::MAX / 2;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness_with(ctx, MINTED_BASE_UNITS, HOSTILE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::UnreadableDistributorConstants {
+            withdrawal_share_bps,
+        }) => assert_eq!(
+            withdrawal_share_bps, HOSTILE_BPS,
+            "the refusal must name the bps it read off the chain"
+        ),
+        Ok(Some(snapshot)) => panic!(
+            "the reader handed on an out-of-domain bps as authenticated state: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!(
+            "Ok(None) asserts the positive fact that no such distributor exists, and one does \
+             (SPEC.md 0.1 clause 5d)"
+        ),
+        Err(other) => panic!("expected UnreadableDistributorConstants, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// B1 sibling for `epoch_seconds`, and a POSITION test as much as a domain test.
+///
+/// A distributor launched with `epoch_seconds = 0` makes upstream's reward-slot backfill loop
+/// (`commit_incentives.rs:101-111`) non-terminating, and being a pure non-yielding CPU loop no
+/// consumer-side `tokio::time::timeout` can cancel it -- so this reader's refusal is the only
+/// defence that can work, and it must therefore run as early as it possibly can.
+///
+/// What makes this discriminating rather than merely a type assertion: the history read back here
+/// contains **no `commit_incentives` action at all** -- only the launch and the eve spend. The
+/// per-action screen (`refuse_unrepresentable_action_arithmetic`) inspects `epoch_seconds` only
+/// inside its `commit_incentives` branch, so it can never fire on this history. A refusal here can
+/// only have come from the launch-constants check, which runs before a single generation is
+/// parsed. Moving that check back down into the walk turns this test red while an
+/// error-variant-only assertion would stay green.
+#[test]
+fn a_distributor_launched_with_zero_epoch_seconds_is_refused_before_any_generation_is_parsed(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness_with_epoch_seconds(ctx, MINTED_BASE_UNITS, 0)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::UnreadableEpochSeconds) => {}
+        Ok(Some(snapshot)) => panic!(
+            "the reader handed on a zero-epoch_seconds distributor as authenticated state: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!(
+            "Ok(None) asserts the positive fact that no such distributor exists, and one does \
+             (SPEC.md 0.1 clause 5d)"
+        ),
+        Err(other) => panic!("expected UnreadableEpochSeconds, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// B2, end to end, with **DIG's own** `WITHDRAWAL_SHARE_BPS`: a commitment one base unit above
+/// `u64::MAX / WITHDRAWAL_SHARE_BPS`, withdrawn on chain, makes upstream's `get_log` multiply
+/// (`withdraw_incentives.rs:71`) wrap while the puzzle itself pays correctly -- so the reader must
+/// refuse the generation rather than reconstruct a fabricated `created_reward_slot.rewards`.
+///
+/// This is the reachable shape of #3286 through the public reader, and it needs no hostile
+/// constants at all: bps is DIG's 9_000, the table is DIG's own, and the only unusual thing is the
+/// SIZE of the commitment. B1 cannot catch it; B2 is what does.
+///
+/// **Release-only, by necessity.** Building the fixture means calling upstream's withdraw action
+/// directly, and upstream's own share multiply (`withdraw_incentives.rs:105-107`) is the same
+/// unchecked `u64`: under `debug_assertions` it panics before returning, so the on-chain spend
+/// this test reads back cannot be constructed in a checked profile at all. `cargo test --release`
+/// covers it (see `.github/workflows/ci.yml`); the debug profile covers the panic itself in
+/// `tests/recoverable_share.rs`.
+///
+/// Before the guard (commit `933b2ea`) this read returned `Ok(Some(snapshot))` built from a
+/// wrapped multiply.
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Result<()> {
+    // One base unit past the largest commitment whose share upstream can compute in a u64.
+    // Derived from the bound, never spelled: a decimal literal here would survive a mutation of
+    // MAX_REPORTABLE_COMMITMENT_BASE_UNITS.
+    let committed_base_units = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    // A commitment is withdrawable while its epoch is still in the future.
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        second_epoch_start,
+        committed_base_units,
+    )?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let commitment_slot = harness
+        .last_commitment_slot
+        .clone()
+        .expect("committing created a commitment slot");
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    // Deliberately NOT through `withdraw_committed_incentives`: its own pre-guard refuses exactly
+    // this pair, and the question here is what the READER does with a spend already on chain.
+    let mut distributor = harness.distributor.clone();
+    let (conditions, driver_reported) = distributor
+        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
+        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
+    harness.distributor = distributor;
+
+    // The fixture's own premise: the driver's returned figure is ALREADY wrong here. The correct
+    // share is `committed * 9_000 / 10_000`, computed in u128 so this comparison does not share
+    // the arithmetic it is judging.
+    let true_share =
+        u64::try_from(u128::from(committed_base_units) * u128::from(WITHDRAWAL_SHARE_BPS) / 10_000)
+            .expect("the share never exceeds the commitment");
+    assert_ne!(
+        driver_reported, true_share,
+        "this fixture only proves something if the driver has already misreported"
+    );
+
+    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
+    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::CommitmentRewardsTooLargeToRead {
+            rewards_base_units,
+            max_readable_base_units,
+        }) => {
+            assert_eq!(
+                max_readable_base_units, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+                "the refusal must name the derived bound"
+            );
+            assert_eq!(
+                rewards_base_units, committed_base_units,
+                "the refusal must name the commitment slot's own recorded rewards, caught at the \
+                 generation that CREATED it -- strictly earlier than the withdraw generation this \
+                 fixture goes on to build"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the reader reconstructed a generation through a wrapped u64 multiply: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected CommitmentRewardsTooLargeToRead, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// One-spend BATCH composition, and the discriminating regression the triple gate required at
+/// PR #8: B2 must refuse a commitment above `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` even when that
+/// commitment is created in the SAME distributor-coin spend as another reserve-affecting action --
+/// not only across two separate, single-action generations, which is the shape
+/// `a_commitment_above_the_driver_bound_is_refused_by_the_reader` above uses and the shape that was
+/// never at risk.
+///
+/// **Why the second action is an `AddEntry`, and why that choice is the whole point.** An earlier
+/// version of this test batched the commit with a withdraw of that same just-created commitment
+/// slot, and could not discriminate the guard at all: this crate's own slot bookkeeping removes a
+/// generation's SPENT slots before extending with its CREATED ones
+/// (`DistributorSlots::apply_generation`, `src/state.rs`), so ANY same-generation
+/// create-then-spend of one slot is refused as `RewardsError::Malformed` by that ordering alone,
+/// at any magnitude, with or without B2. A silently loosened B2 still passed it, so the assertion
+/// was only ever about which error came back, never about accept-versus-refuse.
+///
+/// The same trap catches a second commit chained onto the first one's pending reward slot --
+/// measured, not assumed: that shape fails with "a generation spends a reward slot this walk never
+/// saw created". `AddEntry` avoids it structurally: it CREATES an entry slot and spends none, so
+/// the only slot this generation spends is the first epoch's reward slot, which predates the
+/// generation. The bookkeeping backstop cannot fire, and the accept/refuse decision belongs to B2
+/// alone. Commenting out B2's loop in `src/state.rs` turns this test red with `Ok(Some(..))` -- a
+/// reader that HANDED ON the unrepresentable commitment as authenticated state -- rather than
+/// merely changing which error is returned. Verified by doing exactly that.
+///
+/// The same-generation commit-and-withdraw-of-the-same-slot composition is still built, for the
+/// separate premise that upstream accepts it and keeps the created slot in
+/// `created_commitment_slots`, by
+/// `a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend`
+/// below.
+///
+/// `chia-sdk-driver` 0.36.0's action layer batches any number of actions into one distributor-coin
+/// spend (`reward_distributor.rs:699-747`), and this crate's own
+/// `commit_incentives_for_distributor_epoch` and `add_entry` both leave `finish_spend` to the
+/// caller, so the composition below is directly constructible with this repo's own public API.
+///
+/// Debug-safe on purpose: `committed_base_units` sits just above the READ bound
+/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`, `u64::MAX / 10_000`) but stays under the DRIVER's own
+/// overflow bound (`u64::MAX / WITHDRAWAL_SHARE_BPS`, i.e. `/ 9_000`), so nothing in this fixture
+/// panics without `--release` -- proving the generic B2 bound catches a commitment DIG's own
+/// 9_000 bps table could still have paid out, not merely one already broken by the driver's own
+/// overflow.
+#[test]
+fn a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader(
+) -> anyhow::Result<()> {
+    // One base unit above the read bound; derived, never spelled, so a mutation of
+    // MAX_REPORTABLE_COMMITMENT_BASE_UNITS in src/ cannot survive unnoticed here.
+    let committed_base_units = MAX_REPORTABLE_COMMITMENT_BASE_UNITS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // Action 1 of the batch: the commitment above the read bound. Deliberately NOT finished --
+    // action 2 must land in the SAME pending spend.
+    let commit_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        harness.first_epoch_slot.clone(),
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        committed_base_units,
+    )?;
+
+    // Action 2: an entry-set write, in the SAME pending spend. It creates an entry slot and
+    // spends none, which is exactly what keeps the slot-bookkeeping backstop out of the case
+    // under test.
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write_time = last_update(&harness.distributor);
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        write_time,
+    )?;
+
+    assert_eq!(
+        harness.distributor.pending_spend.logs.len(),
+        2,
+        "the fixture only tests batching if BOTH actions landed in one pending spend"
+    );
+    assert!(
+        harness
+            .distributor
+            .pending_spend
+            .spent_commitment_slots
+            .is_empty()
+            && harness
+                .distributor
+                .pending_spend
+                .spent_entry_slots
+                .is_empty(),
+        "this generation must spend no slot it also creates, or the slot-bookkeeping backstop -- \
+         not B2 -- would be what refuses this read"
+    );
+
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - committed_base_units;
+    let source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            commit_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    harness.distributor = harness
+        .distributor
+        .clone()
+        .finish_spend(ctx, vec![source_cat_spend])?
+        .0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::CommitmentRewardsTooLargeToRead {
+            rewards_base_units,
+            max_readable_base_units,
+        }) => {
+            assert_eq!(
+                max_readable_base_units, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+                "the refusal must name the derived bound"
+            );
+            assert_eq!(
+                rewards_base_units, committed_base_units,
+                "the refusal must name the commitment slot's own recorded rewards, read off the \
+                 generation that created it even though another action shares that generation"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "B2 let an out-of-bounds commitment through when it shared a generation with a \
+             second action: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected CommitmentRewardsTooLargeToRead, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// Discriminating regression for dig_ecosystem#3313's remedy: a one-spend commit+withdraw
+/// composition whose `committed_value` is above the DRIVER's OWN overflow bound
+/// (`u64::MAX / WITHDRAWAL_SHARE_BPS`) -- not merely the READ bound
+/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`) that
+/// `a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader`
+/// above already proves B2 catches. At THIS scale, `chia-sdk-driver` 0.36.0's own
+/// `committed_value * withdrawal_share_bps` multiply (`withdraw_incentives.rs:71`) overflows
+/// INSIDE `RewardDistributor::from_spend`, before B2 -- which only runs once `from_spend`
+/// RETURNS -- ever gets a chance to refuse. The fail-closed pre-screen
+/// (`refuse_unrepresentable_action_arithmetic`) must catch it first, from the action's own
+/// solution fields alone, without ever calling `from_spend` on this generation.
+///
+/// **Release-only, by necessity** (same reason as `a_commitment_above_the_driver_bound_is_refused_by_the_reader`
+/// above): building this fixture calls upstream's withdraw action `.spend()` directly, which
+/// performs the same unchecked multiply while constructing the spend -- panicking under
+/// `debug_assertions` before the coin ever reaches simulated chain state to read back.
+///
+/// Before the pre-screen (this PR), this generation would have reached `from_spend`, and the
+/// wrapped multiply would have flowed through B2 unguarded (B2 only checks the recorded
+/// commitment `rewards`, never re-derives the withdraw share itself).
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend(
+) -> anyhow::Result<()> {
+    // One base unit above the driver's own overflow bound; derived, never spelled.
+    let committed_base_units = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // CommitIncentives -- above the driver's own overflow bound -- deliberately NOT finished yet:
+    // the withdraw below must land in the SAME pending spend.
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        harness.first_epoch_slot.clone(),
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        committed_base_units,
+    )?;
+
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - committed_base_units;
+    let source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    let reward_slots: Vec<Slot<RewardDistributorRewardSlotValue>> = harness
+        .distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
+        })
+        .collect();
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = harness
+        .distributor
+        .pending_spend
+        .created_commitment_slots
+        .first()
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::COMMITMENT)
+        })
+        .expect("the commit above created a commitment slot");
+
+    // WithdrawIncentives of that SAME just-created slot, built directly against the raw driver
+    // action -- deliberately bypassing this crate's own pre-guard, because the question here is
+    // what the PRE-SCREEN does with a spend already on chain, not whether
+    // `withdraw_committed_incentives`'s own entry-point guard would have refused first.
+    let mut distributor = harness.distributor.clone();
+    let (withdraw_conditions, _driver_reported) = distributor
+        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
+        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
+    harness.distributor = distributor;
+
+    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
+    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, withdraw_conditions)?;
+
+    harness.distributor = harness
+        .distributor
+        .clone()
+        .finish_spend(ctx, vec![source_cat_spend])?
+        .0;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+            assert_eq!(
+                action, "withdraw_incentives",
+                "the multiply that overflows here belongs to the withdraw action, not the commit"
+            );
+            assert_eq!(
+                operation, "committed_value * withdrawal_share_bps",
+                "this composition overflows the multiply itself, before any subtraction runs"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the pre-screen let a generation through whose withdraw multiply overflows the \
+             driver's own u64 bound: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => {
+            panic!("expected ActionArithmeticNotRepresentable from the pre-screen, got: {other}")
+        }
+    }
+
+    Ok(())
+}
+
+/// Path A (PR #8 review at `state.rs:433`): `withdraw_committed_incentives`'s pre-guard must judge
+/// the value upstream will ACTUALLY multiply -- the commitment slot `actual_commitment_slot_value`
+/// substitutes in, matching on `epoch_start` ALONE (`reward_distributor.rs:833-849`) -- never the
+/// stale slot the caller happened to pass in.
+///
+/// Constructed exactly as the review described: a small, real, ALREADY-ON-CHAIN commitment to
+/// `second_epoch_start` is clawed back in the SAME generation that commits a SECOND, much larger
+/// amount to that same `epoch_start` -- the caller passes the stale, small, safe slot, and the
+/// guard must still refuse on the large, substituted one.
+///
+/// The revert probe for this test is recorded on its own doc line at the bottom rather than run
+/// automatically: reverting `src/clawback.rs`'s `distributor.actual_commitment_slot_value(...)`
+/// call to a bare `commitment_slot` makes the pre-guard see the caller's stale, SAFE small figure
+/// and let the withdraw through -- at which point the driver's OWN internal resolution (
+/// `withdraw_incentives.rs:103`, unconditional) still substitutes the large value and the same
+/// multiply this crate's guard exists to pre-empt now runs unguarded, panicking under
+/// `debug_assertions` instead of returning a controlled `Err`. That is what "must go red" means
+/// here: not a different Err, but the test failing to reach its `assert_eq!` at all.
+#[test]
+fn withdraw_guards_the_substituted_commitment_not_the_callers_stale_one() -> anyhow::Result<()> {
+    const SMALL_COMMITMENT: u64 = 1_000;
+    // One base unit above the driver's own overflow bound, so the guard's `checked_mul` is what
+    // catches it -- derived, never spelled.
+    let large_commitment = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness_with(
+        ctx,
+        large_commitment + SMALL_COMMITMENT + headroom,
+        WITHDRAWAL_SHARE_BPS,
+    )?;
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // A small, real commitment to `second_epoch_start`, finished onto chain in its OWN generation
+    // -- this is the stale slot the caller below will pass to the guard.
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        second_epoch_start,
+        SMALL_COMMITMENT,
+    )?;
+    let stale_commitment_slot = harness
+        .last_commitment_slot
+        .clone()
+        .expect("the small commit created a commitment slot");
+    let reward_slot_for_second_epoch = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    // A second, much larger commitment to the SAME epoch_start, in a NEW generation deliberately
+    // left open: the withdraw below must land in this same pending spend.
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        reward_slot_for_second_epoch,
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        large_commitment,
+    )?;
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - large_commitment;
+    let _source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    let reward_slot_after_second_commit = harness
+        .distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .find(|value| value.epoch_start == second_epoch_start)
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::REWARD)
+        })
+        .expect("the second commit re-created a reward slot covering second_epoch_start");
+
+    // The caller passes the STALE, small, already-on-chain slot -- `epoch_start` is all
+    // `actual_commitment_slot_value` looks at when it substitutes.
+    let clawback = withdraw_committed_incentives(
+        ctx,
+        &mut harness.distributor,
+        stale_commitment_slot,
+        reward_slot_after_second_commit,
+        harness.funder.puzzle_hash,
+    );
+
+    match clawback {
+        Err(RewardsError::DriverShareNotRepresentable {
+            rewards_base_units,
+            withdrawal_share_bps,
+        }) => {
+            assert_eq!(
+                rewards_base_units, large_commitment,
+                "the guard must judge the SUBSTITUTED commitment upstream will actually multiply \
+                 ({large_commitment}), not the caller's stale slot ({SMALL_COMMITMENT})"
+            );
+            assert_eq!(withdrawal_share_bps, WITHDRAWAL_SHARE_BPS);
+        }
+        Ok(paid) => panic!(
+            "the guard used the caller's stale, safe slot instead of the substituted one: \
+             {paid:?}"
+        ),
+        Err(other) => panic!("expected DriverShareNotRepresentable, got: {other}"),
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The backfill budget (SPEC.md 0.1 clause 5d) is a READ-WIDE accumulator, hoisted into
+// `read_distributor` above its walk loop rather than declared inside the per-generation
+// pre-screen. The discriminator: a two-generation history whose first generation genuinely
+// backfills 3 epochs, and whose second DECLARES a backfill far past the whole budget. Hoisted,
+// the second generation's refusal reports `already_committed == 3` (gen 1's real spend carried
+// into gen 2's refusal); un-hoisted, the accumulator resets per generation and reports 0.
+// ---------------------------------------------------------------------------------------------
+
+/// Rewrites a real, recorded `commit_incentives` `CoinSpend`'s solution to declare
+/// `forged_epoch_start` instead of whatever epoch it was really built with -- leaving the coin,
+/// the puzzle reveal, the lineage proof and the Merkle proof exactly as the real spend built
+/// them. Only the one field `refuse_unrepresentable_action_arithmetic` reads is forged, which is
+/// what makes a refusal here evidence about the PRE-SCREEN, not about a hand-built fixture: the
+/// spend genuinely came out of the driver, and every other field genuinely authenticates.
+///
+/// Never used to build a spend whose declared backfill is real (that is exactly the closed
+/// approach: a real spend backfilling anywhere near this crate's budget runs into
+/// `chia-sdk-driver`'s own `CostExceeded` long before it is useful as a test fixture).
+fn commit_incentives_spend_with_forged_epoch_start(
+    ctx: &mut SpendContext,
+    real_spend: &chia_protocol::CoinSpend,
+    forged_epoch_start: u64,
+) -> chia_protocol::CoinSpend {
+    let solution_ptr = ctx
+        .alloc(&real_spend.solution)
+        .expect("a real recorded solution always allocates");
+    let singleton_solution = ctx
+        .extract::<SingletonSolution<NodePtr>>(solution_ptr)
+        .expect("a real singleton spend's solution always parses as SingletonSolution");
+    let action_layer_solution = ActionLayer::<RewardDistributorState, HashedPtr>::parse_solution(
+        ctx,
+        singleton_solution.inner_solution,
+    )
+    .expect("a real action-layer solution always parses");
+
+    assert_eq!(
+        action_layer_solution.action_spends.len(),
+        1,
+        "this fixture only ever forges a single-action generation"
+    );
+    let action_spend = &action_layer_solution.action_spends[0];
+    let mut params = ctx
+        .extract::<RewardDistributorCommitIncentivesActionSolution>(action_spend.solution)
+        .expect("this fixture only ever forges a commit_incentives generation");
+    params.epoch_start = forged_epoch_start;
+    let forged_action_solution = ctx
+        .alloc(&params)
+        .expect("the forged commit_incentives solution always allocates");
+
+    let raw_action_layer_solution = RawActionLayerSolution {
+        puzzles: vec![action_spend.puzzle],
+        selectors_and_proofs: vec![(2, Some(action_layer_solution.proofs[0].clone()))],
+        solutions: vec![forged_action_solution],
+        finalizer_solution: action_layer_solution.finalizer_solution,
+    };
+    let forged_inner_solution = ctx
+        .alloc(&raw_action_layer_solution)
+        .expect("the rebuilt action-layer solution always allocates");
+
+    let forged_singleton_solution = SingletonSolution {
+        lineage_proof: singleton_solution.lineage_proof,
+        amount: singleton_solution.amount,
+        inner_solution: forged_inner_solution,
+    };
+    let forged_solution = ctx
+        .serialize(&forged_singleton_solution)
+        .expect("the rebuilt singleton solution always serializes");
+
+    chia_protocol::CoinSpend::new(
+        real_spend.coin,
+        real_spend.puzzle_reveal.clone(),
+        forged_solution,
+    )
+}
+
+/// Discriminating regression for the backfill budget's FRAME (SPEC.md 0.1 clause 5d, rule (1)):
+/// the accumulator MUST live in `read_distributor`, one frame above its walk loop, never inside
+/// `refuse_unrepresentable_action_arithmetic` itself -- because the reward slots a backfill
+/// creates are retained in `DistributorSlots::rewards` for the WHOLE walk, so a per-generation
+/// accumulator bounds nothing (an attacker mines N cheap generations and multiplies the reader's
+/// retained memory by N).
+///
+/// Gen 1 is a genuine, cheap, real `commit_incentives` spend backfilling 3 epochs -- real puzzle,
+/// real `from_spend`, milliseconds. Gen 2 is a second genuine, cheap real spend whose solution's
+/// `epoch_start` is then rewritten (see `commit_incentives_spend_with_forged_epoch_start`) to
+/// declare a backfill of `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 1` -- one past the WHOLE budget,
+/// not merely past what gen 1 already spent, so an un-hoisted (per-generation) accumulator would
+/// still refuse it on the count alone. What discriminates hoisted from un-hoisted is the
+/// `already_committed` figure the refusal carries: hoisted, it is `3` (gen 1's real backfill,
+/// carried forward); un-hoisted, it is `0` (gen 2 read as if it were the read's first
+/// backfilling action).
+///
+/// This is deliberately debug-profile-safe: gen 2's declared backfill is refused at the
+/// pre-screen, `refuse_unrepresentable_action_arithmetic`, which runs on the action's solution
+/// fields alone and never calls `from_spend` -- and never runs the real backfill loop -- on the
+/// generation it refuses.
+///
+/// **This test's validity depends on the pre-screen running BEFORE `from_spend` on every
+/// generation** (`src/state.rs`: `refuse_unrepresentable_action_arithmetic`'s call site inside
+/// `read_distributor`'s walk loop precedes `RewardDistributor::from_spend`'s call there). If that
+/// ordering is ever reversed, gen 2's forged, giant declared backfill would instead reach the
+/// driver's own loop, and this test HANGS (or times out under `CostExceeded`) rather than failing
+/// cleanly -- it does not fail loudly on its own.
+#[test]
+fn a_backfill_forged_past_the_whole_budget_is_refused_with_the_earlier_generations_count(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    // Gen 1: a genuine backfill of 3 epochs. `commit_to_epoch`'s `epoch_start` is 4 epochs past
+    // `first_epoch_slot`'s own `epoch_start` (an adjacent commit would be the `slot_epoch_time ==
+    // epoch_start` branch, which never backfills at all), so the real gap is 3 epochs --
+    // `already_committed` after this generation must be exactly 3.
+    let gen1_epoch_start = FIRST_EPOCH_START + 4 * TEST_EPOCH_SECONDS;
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots_after_gen1 = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        gen1_epoch_start,
+        COMMITTED_BASE_UNITS,
+    )?;
+    members.push(harness.distributor.coin.coin_id());
+    let gen2_coin_id = harness.distributor.coin.coin_id();
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+
+    // Gen 2's raw material: a second genuine, CHEAP real commit (a one-epoch gap) spending the
+    // gen-1 tip coin. Its only purpose is to produce a well-formed `commit_incentives` CoinSpend
+    // for that coin -- real puzzle reveal, real lineage proof, real Merkle proof -- whose
+    // solution is then forged below. Building it with a real huge gap instead is the closed
+    // approach: `chia-sdk-driver` hits `CostExceeded` long before N reaches this crate's budget.
+    let gen2_reward_slot = pick_reward_slot(&reward_slots_after_gen1, gen1_epoch_start);
+    let gen2_slot_epoch_time = gen2_reward_slot.info.value.epoch_start;
+    commit_to_epoch(
+        ctx,
+        &mut harness,
+        gen2_reward_slot,
+        gen1_epoch_start + 2 * TEST_EPOCH_SECONDS,
+        COMMITTED_BASE_UNITS,
+    )?;
+
+    let real_gen2_spend = harness
+        .sim
+        .coin_spend(gen2_coin_id)
+        .expect("gen 2's real spend was just recorded by the simulator");
+
+    // One past the WHOLE budget -- never `MAX - 1`, which an un-hoisted (per-generation)
+    // accumulator would still admit (0 already committed + `MAX - 1` <= `MAX`), passing for the
+    // wrong reason and, worse, proceeding into the real backfill loop and its 290s `CostExceeded`
+    // wall. `start_epoch_time` mirrors `refuse_unrepresentable_action_arithmetic`
+    // (`slot_epoch_time + epoch_seconds`) so the forged gap divides evenly by `epoch_seconds`,
+    // matching upstream's own ceiling-of-gap-over-step arithmetic exactly.
+    let start_epoch_time = gen2_slot_epoch_time + TEST_EPOCH_SECONDS;
+    let forged_iterations = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS + 1;
+    let forged_epoch_start = start_epoch_time + forged_iterations * TEST_EPOCH_SECONDS;
+
+    let forged_gen2_spend =
+        commit_incentives_spend_with_forged_epoch_start(ctx, &real_gen2_spend, forged_epoch_start);
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    )
+    .with_spend(gen2_coin_id, forged_gen2_spend);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+            iterations,
+            already_committed,
+            max_backfill_slots,
+        }) => {
+            assert_eq!(
+                already_committed, 3,
+                "the accumulator must be HOISTED above the walk loop: gen 1's real 3-epoch \
+                 backfill must be carried into gen 2's refusal. An un-hoisted (per-generation) \
+                 accumulator reports 0 here instead -- the discriminator this test exists for"
+            );
+            assert_eq!(
+                max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
+                "the refusal must name the fixed, named budget, not a re-derived value"
+            );
+            assert_eq!(
+                iterations, forged_iterations,
+                "the refusal must name the real iteration count the forged declaration implies"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the reader accepted a generation whose declared backfill is forged past the whole \
+             budget: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
+    }
+
+    Ok(())
 }

@@ -5,9 +5,17 @@
 //! distributor whose operator has gone away still works, which is what makes the mirrors'
 //! entitlement independent of the funder's liveness.
 //!
-//! Neither builder restates any of the puzzle's arithmetic. `Sync` moves `cumulative_payout` and
-//! `remaining_rewards`; `NewEpoch` skims `fee_bps` and rolls the reward slot. Both figures are the
-//! puzzle's (`sync.rs`, `new_epoch.rs:124`) and are surfaced, never recomputed (§0.1 clause 1).
+//! Neither builder here restates any arithmetic of its OWN -- both surface a figure the upstream
+//! driver already computed (§0.1 clause 1) rather than a second, independent computation of this
+//! crate's own. That is not the same claim as "never recomputed": `NewEpoch`'s
+//! `epoch_total_rewards * fee_bps / 10000` (`new_epoch.rs:124`) is itself a plain `u64` multiply
+//! inside the driver, the same #3286-shaped hazard `withdraw_incentives.rs:105-107` has for a
+//! withdraw's share. It is inert for every DIG distributor because `fee_bps` is `0` there, but
+//! [`crate::state::read_distributor`] is deliberately distributor-agnostic and replays this same
+//! multiply for `NewEpoch` actions in ANY launcher's history, including a hostile one with a
+//! nonzero `fee_bps` -- tracked as a follow-up (dig-rewards-coin#10), out of this PR's scope,
+//! which is about `WithdrawIncentives` specifically. `Sync` moves `cumulative_payout` and
+//! `remaining_rewards` with no multiply of any kind (`sync.rs`).
 //!
 //! `Refresh` is deliberately **not exposed**. §13.3 measures it as the NFT/DataLayer refresh, which
 //! has no meaning in `Managed` mode; offering it would be offering an action that cannot succeed.

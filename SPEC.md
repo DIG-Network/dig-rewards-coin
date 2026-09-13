@@ -29,10 +29,16 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by the equality test
    `recoverable_base_units_matches_a_real_clawback_at_odd_amounts` in `tests/recoverable_share.rs`.
    An untested copy scattered in a consumer drifts **silently**; a tested copy here fails **loudly**.
-   That asymmetry is the justification. The equality proof holds at or below `u64::MAX / withdrawal_share_bps`.
-   Above that bound, the **`chia-sdk-driver` 0.36.0 Rust driver** cannot construct the spend (dig_ecosystem#3286
-   — a driver limitation), while the on-chain puzzle still pays correctly because **CLVM arithmetic is bignum**.
-   That is a driver defect, not a property of the reward system.
+   That asymmetry is the justification.
+   The equality proof holds at or below `u64::MAX / withdrawal_share_bps`. Above that bound the
+   **`chia-sdk-driver` 0.36.0 Rust driver** wraps: its share multiply is a plain `u64`
+   (`withdraw_incentives.rs:105-107` in `spend`, and again at `:71` in `get_log`, whose result is
+   then subtracted at `:89`). The on-chain puzzle still pays correctly, because **CLVM arithmetic
+   is bignum** and the puzzle is handed the **full** committed amount, never the share -- the
+   driver's returned `u64` is an independent Rust **re-derivation** of what the puzzle will pay.
+   Above the bound, driver and puzzle therefore **disagree, and the puzzle is right**: the spend is
+   valid on chain while the returned number is a lie about it. That is a driver defect
+   (dig_ecosystem#3286), not a property of the reward system.
 2. This crate MUST perform no socket I/O, MUST hold no keys, and MUST NOT broadcast. Chain reads
    arrive through a caller-supplied chain source (`dig-chainsource-interface`); spend builders return
    unsigned coin spends. This is the same rule the sibling `dig-mirror-coin` states as its invariant
@@ -45,6 +51,144 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    the rule cannot be enforced, and §15 lists which side each clause lands on.
 4. This crate MUST NOT depend on `dig-epoch`. See §0.3; a Cargo dependency on `dig-epoch` from this
    crate is a defect, not a style preference.
+
+5. Where an upstream figure is a re-derivation, this crate MUST NOT pass it on unchecked, and MUST
+   NOT substitute a plausible number for it.
+
+   a. `withdraw_committed_incentives` MUST establish that
+      `rewards_base_units * withdrawal_share_bps` is representable in a `u64` **before** invoking
+      the upstream action, and MUST refuse with a `RewardsError` naming dig_ecosystem#3286 when it
+      is not. The check MUST precede the call: upstream's multiply is in upstream's crate, so in an
+      overflow-checked build it **panics before returning** and no post-hoc check can run. Above
+      the bound the chain would honour the spend and this crate still refuses; that cost is
+      accepted, because the figure the caller would receive cannot be built at all in a portable
+      profile.
+
+   b. Below the bound, `withdraw_committed_incentives` MUST compare the driver's returned figure
+      against `recoverable_base_units` and MUST refuse on disagreement. A disagreement means the
+      driver wrapped, so the whole returned tuple is untrustworthy even where the spend is sound.
+
+   c. `Clawback` MUST NOT be constructible outside this crate. A public field on the wrapper
+      reintroduces, at the wrapper, the exact defect the element's guard removes: a consumer can
+      write any figure into a money field the documentation calls the puzzle's own.
+
+   d. `read_distributor` MUST refuse a distributor it cannot reconstruct without wrapping, and MUST
+      refuse it as an **error**, never as `Ok(None)`. `withdrawal_share_bps` and every committed
+      amount arrive from **unauthenticated chain input** -- an attacker may launch a distributor
+      with any `u64` bps -- so the reader MUST reject `withdrawal_share_bps > 10_000` on the launch
+      constants (B1) **before** calling `RewardDistributor::from_spend`, and MUST reject any
+      commitment slot whose recorded `rewards` exceed `u64::MAX / 10_000` (B2) **as each generation
+      is reconstructed, on `from_spend`'s return path**. B2 MUST NOT be expressed as a bound on the
+      reserve coin's amount: several actions may be composed into one distributor-coin spend, so
+      the reserve records only the net and never observes the peak, and a commitment may be
+      created and withdrawn within a single spend.
+
+      B1a. `epoch_seconds` is curried into the action puzzles at launch and is never a per-spend
+      solution field, so a reader knows it before the walk begins. The reader MUST reject
+      `epoch_seconds == 0` **on the launch constants**, before calling
+      `RewardDistributor::from_spend` on any generation -- not only per action inside the replay
+      walk. At zero, upstream's reward-slot backfill loop never advances and never terminates; it
+      is a pure, non-yielding CPU loop, so no caller-side timeout can cancel it and a refusal by
+      the reader is the only defence that can work. It MUST therefore run as early as the reader
+      can run it, not at the generation that happens to carry the offending action.
+
+      B1 and B2 alone do NOT make every unchecked-arithmetic or non-termination hazard upstream's
+      `get_log` methods touch unreachable: `chia-sdk-driver` 0.36.0 computes seven such sites from
+      an action solution's OWN fields (or from a value that solution's locked/unlocked commitment
+      authenticates), inside `from_spend`, ahead of B2, which only runs once `from_spend` returns --
+      `withdraw_incentives.rs:71` (`committed_value * withdrawal_share_bps`),
+      `withdraw_incentives.rs:89` (`reward_slot_total_rewards - withdrawal_share`),
+      `commit_incentives.rs:85` (`slot_total_rewards + rewards_to_add`, gated on
+      `slot_epoch_time == epoch_start`), `commit_incentives.rs:101` (`slot_epoch_time +
+      epoch_seconds`, the non-adjacent-epoch branch) plus its `commit_incentives.rs:103-112`
+      backfill loop (non-termination when `epoch_seconds == 0`, an unbounded iteration count and
+      an unbounded accumulator otherwise), `unstake.rs:235` (`entry_slot.shares -
+      removed_shares`, where `removed_shares` is the output
+      of running the action's own unlock puzzle), and `stake.rs:326,329` (`existing_slot_counter +
+      1` on `i128`, and `existing_slot_shares + new_shares` where `new_shares` is likewise a
+      lock-puzzle output). (B1 runs earlier still, but bounds only `withdrawal_share_bps` -- it
+      says nothing about these operands.) Six further counter-increment sites --
+      `commit_incentives.rs:82`, `commit_incentives.rs:89`, `withdraw_incentives.rs:86`,
+      `new_epoch.rs:98`, `initiate_payout.rs:107`, `refresh.rs:136` -- are deliberately NOT
+      screened: each is bounded by the slot's own real on-chain counter, never by an
+      attacker-supplied magnitude. See DIG-Network/dig_ecosystem#3313. `read_distributor` MUST
+      therefore run a fail-closed pre-screen, `refuse_unrepresentable_action_arithmetic`, over
+      every generation's action-layer solution BEFORE calling `from_spend` on it, and MUST refuse
+      with a `RewardsError` under either of three rules: (i) the action solution cannot be parsed,
+      (ii) the action puzzle hash is not one of the eleven reward-distributor actions
+      `chia-sdk-driver` 0.36.0 defines, or (iii) one of the seven named sites above, or the backfill
+      loop's own accumulator, is not representable. (The loop-termination case is no longer a rule
+      of this pre-screen: it is refused earlier, on the launch constants, by B1a.) Rule (ii) MUST
+      refuse an unrecognised hash outright and MUST NOT skip it: a future pin bump that changes an
+      action puzzle must make every read refuse loudly, not walk past an action this crate never
+      screened for the same hazard.
+
+      The backfill loop MUST be bounded in **two independent dimensions**. Bounding either alone
+      leaves the other wide open, and the two fail in opposite directions, so neither can stand in
+      for the other.
+
+      **(1) Its iteration count**, by an **absolute, named constant the reader itself chooses**,
+      never derived from the distributor's own declared constants. A bound computed as
+      `max_seconds_offset / epoch_seconds` is specifically forbidden: for an attacker-launched
+      distributor both operands are attacker-chosen, and the same expression fails in both
+      directions at once -- at DIG's own published constants it is `300 / 604_800 = 0`, refusing
+      every honest multi-epoch commit, while `epoch_seconds = 1, max_seconds_offset = u64::MAX`
+      inflates it past `1.8e19`. A bound derived from attacker-controlled parameters is not a
+      bound. That constant MUST be a **budget for the whole READ, consumed across every generation
+      the walk visits and every action spend within one**, never a ceiling re-offered to each
+      generation or each action in turn. The reader MUST hold the accumulator in the frame that
+      owns the reconstructed slot set, not in the per-generation pre-screen: every reward slot a
+      backfill creates is retained for the whole walk and nothing prunes it -- backfilled slots
+      carry a zero counter and zero rewards, and an attacker's own distributor need never spend
+      them -- while nothing bounds a walk's generation count, so a budget that reset per
+      generation would multiply the reader's retained memory by an attacker-chosen N for the
+      price of N cheaply-mined generations. Within one generation the same reasoning applies
+      action by action: `ActionLayerSolution`'s
+      `action_spends` is a plain `Vec<Spend>` whose length nothing bounds, `parse_solution`
+      resolves repeated selectors through one cached Merkle proof so a single leaf may be spent
+      arbitrarily many times, and while a `commit_incentives` action's on-chain CLVM cost DOES scale
+      with its backfill gap (one condition per backfilled epoch), nothing bounds how many such
+      actions share one generation -- so a per-action ceiling admits `action_spends.len()` times the
+      intended allocation for the price of one cheaply-mined spend, each individual action staying
+      well under the ceiling. The count compared against that
+      budget MUST be the true ceiling of the epoch gap over `epoch_seconds`, matching upstream's
+      loop exactly, so a refusal names a count the loop would really have run.
+
+      A single generation's `commit_incentives` backfill is bounded far below this budget by
+      consensus CLVM cost: the action's puzzle emits one condition per backfilled epoch, and a
+      generation backfilling 50,000 epochs exceeds the ~11-billion max-cost ceiling (measured,
+      `chia-sdk-driver` 0.36.0). The budget therefore never binds within one generation. It exists
+      solely to bound accumulation across the whole read, because the reader retains every
+      backfilled slot until the read returns and nothing bounds the number of generations an
+      attacker may mine.
+
+      **(2) Its accumulator.** Upstream advances `start_epoch_time += epoch_seconds` once per
+      iteration (`commit_incentives.rs:111`) and never checks that addition, so the reader MUST
+      also refuse unless the loop's TERMINAL value, `start_epoch_time + iterations *
+      epoch_seconds`, is representable. No iteration bound can substitute: the count is smallest
+      exactly when the step is largest, so at `epoch_seconds = u64::MAX / 2 + 1` a gap of one makes
+      `iterations == 1` -- under any cap -- while that single advance overflows `u64`, panicking
+      where overflow checks are on and, where they are off, wrapping below `end_epoch_time` so the
+      loop never terminates and its `Vec` grows without bound.
+
+      A read-wide budget and an accumulator bound are separate obligations, and a test for
+      each MUST fail when only that guard is removed.
+
+      This pre-screen is a shim with an exit, not a durable fix -- the durable fix is upstream
+      (<https://github.com/xch-dev/chia-wallet-sdk/issues/436>) -- and it establishes
+      representability only for these seven named sites, and only on the READER path: it says
+      nothing about the write-side builders, and a future reader must not infer whole-crate coverage
+      from it. It makes no claim about the six excluded counter sites named above or
+      `new_epoch.rs:124`'s fee multiply (unreached by `get_log`; tracked separately,
+      dig-rewards-coin#10). Without B1, B2 and this pre-screen together, a read **panics** in an
+      overflow-checked build (a remote denial of service on every caller of the public reader) or,
+      in release, wraps and returns a fabricated figure as authenticated distributor state, or (for
+      the backfill loop with `epoch_seconds == 0`) never returns at all. `Ok(None)` is forbidden
+      here because it asserts the positive fact that no such distributor exists.
+
+   e. Every bound above MUST be written as a derivation (`u64::MAX / 10_000`), never as a decimal
+      literal, in both the code and its tests. A literal bound lets a mutation of the bound pass a
+      test that spells the same literal.
 
 ### 0.2 Units — named once, never converted silently
 
