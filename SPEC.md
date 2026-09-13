@@ -83,6 +83,15 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       the reserve records only the net and never observes the peak, and a commitment may be
       created and withdrawn within a single spend.
 
+      B1a. `epoch_seconds` is curried into the action puzzles at launch and is never a per-spend
+      solution field, so a reader knows it before the walk begins. The reader MUST reject
+      `epoch_seconds == 0` **on the launch constants**, before calling
+      `RewardDistributor::from_spend` on any generation -- not only per action inside the replay
+      walk. At zero, upstream's reward-slot backfill loop never advances and never terminates; it
+      is a pure, non-yielding CPU loop, so no caller-side timeout can cancel it and a refusal by
+      the reader is the only defence that can work. It MUST therefore run as early as the reader
+      can run it, not at the generation that happens to carry the offending action.
+
       B1 and B2 alone do NOT make every unchecked-arithmetic or non-termination hazard upstream's
       `get_log` methods touch unreachable: `chia-sdk-driver` 0.36.0 computes seven such sites from
       an action solution's OWN fields (or from a value that solution's locked/unlocked commitment
@@ -107,10 +116,22 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       with a `RewardsError` under either of three rules: (i) the action solution cannot be parsed,
       (ii) the action puzzle hash is not one of the eleven reward-distributor actions
       `chia-sdk-driver` 0.36.0 defines, or (iii) one of the seven named sites above is not
-      representable, including the loop-termination case. Rule (ii) MUST refuse an unrecognised
+      representable. (The loop-termination case is no longer a rule of this pre-screen: it is refused
+      earlier, on the launch constants, by B1a.) Rule (ii) MUST refuse an unrecognised
       hash outright and MUST NOT skip it: a future pin bump that changes an action puzzle must make
       every read refuse loudly, not walk past an action this crate never screened for the same
       hazard.
+
+      The backfill loop's iteration count MUST be bounded by an **absolute, named constant the
+      reader itself chooses**, and MUST NOT be derived from the distributor's own declared
+      constants. A bound computed as `max_seconds_offset / epoch_seconds` is specifically
+      forbidden: for an attacker-launched distributor both operands are attacker-chosen, and the
+      same expression fails in both directions at once -- at DIG's own published constants it is
+      `300 / 604_800 = 0`, refusing every honest multi-epoch commit, while `epoch_seconds = 1,
+      max_seconds_offset = u64::MAX` inflates it past `1.8e19`. A bound derived from
+      attacker-controlled parameters is not a bound. The count the reader compares against that cap
+      MUST be the true ceiling of the epoch gap over `epoch_seconds`, matching upstream's loop
+      exactly, so a refusal names a count the loop would really have run.
 
       This pre-screen is a shim with an exit, not a durable fix -- the durable fix is upstream
       (<https://github.com/xch-dev/chia-wallet-sdk/issues/436>) -- and it establishes

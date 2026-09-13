@@ -74,6 +74,10 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   `u64` is an independent Rust re-derivation, and above the bound the driver builds a spend the
   chain honours while misreporting what it pays.
 - SPEC.md 0.1 clause 1's exception paragraph corrected, and clause 5 added.
+- SPEC.md 0.1 clause 5d gains B1a (`epoch_seconds == 0` MUST be refused on the launch constants,
+  before any generation is parsed) and a normative rule that the backfill bound MUST be an
+  absolute constant the reader chooses, never derived from the distributor's own parameters. The
+  clause previously mandated a reserve-amount bound, which the gate round proved bypassable.
 
 ### Miscellaneous
 - New public `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` (`u64::MAX / 10_000`), derived rather than
