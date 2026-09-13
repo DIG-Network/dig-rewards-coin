@@ -1340,6 +1340,91 @@ manager singleton's key **is** the entry set's custody boundary, and there is no
    forbidding a multisig, and the reason §7.4 clause 1 bounds commitment depth: the two together turn
    an unbounded permanent loss into a recoverable one, or failing that a bounded one.
 
+### 7.2a The manager singleton is launched here, and its inner puzzle is a choice this crate cannot make
+
+*Specified, not yet implemented at 0.5.0 — DIG-Network/dig_ecosystem#3308.* At 0.5.0 this crate ships
+no singleton launcher: `DistributorLaunchTerms` **requires** `manager_singleton_launcher_id`
+(`src/constants.rs:91`) and refuses a zero one (`src/constants.rs:197-203`), while nothing in `src/`
+produces one. The consequence is not cosmetic — **no distributor can be minted through this crate at
+all** without a launcher id the crate gives no way to obtain.
+
+1. **This crate MUST provide the manager singleton launch**, and the launcher id it returns MUST be
+   **derived from the launch spend the crate builds**. It MUST NOT accept a launcher id, a launcher
+   coin, a launcher coin id or a singleton coin from its caller, and MUST NOT echo one back. §7.2
+   clause 1a makes the inner puzzle a launch-time-only choice and §7.2 clause 3 makes the id curried
+   and immutable; a crate that demands the id as an input while providing no way to produce one
+   leaves every funder to hand-roll a singleton launch, which is where a zero id, a mistyped id, and
+   an id naming a coin that was never created all come from.
+2. **The inner puzzle MUST be an explicit, un-defaulted choice** (§7.2 clause 1, §15 clause 3a). The
+   parameter carrying it MUST NOT have a `Default` impl, MUST NOT be an `Option` that falls back to
+   a built-in puzzle, and MUST NOT be inferred from any other argument. A caller that supplies
+   nothing MUST fail to compile, not receive a silent default: §15 clause 3a calls defaulting this
+   choice closing a one-way door on the funder's behalf.
+3. **This crate knows what it built and nothing else, and it MUST name only that.**
+   - For an inner puzzle **this crate builds from a public key** — `p2_delegated_puzzle_or_hidden_puzzle`
+     curried to one key, the currying `launch::standard_puzzle_hash` already performs
+     (`src/launch.rs:150`) — the crate knows the puzzle has exactly one key and therefore **no
+     recovery path**, and it MUST say so, because that is the case §7.2 clause 3's permanent freeze
+     is about.
+   - For an inner puzzle hash **the caller supplies**, this crate receives 32 bytes. It cannot run
+     them, cannot see the puzzle they commit to, and cannot tell a 2-of-3 from a single key from a
+     hash of nothing at all. Therefore **no type name, variant name, field name, method name, doc
+     sentence or error message in this crate may describe a caller-supplied inner puzzle hash as
+     recovery-capable, recoverable, multisig, k-of-n, vault, rekeyable or time-delayed.** Such a name
+     would be this crate asserting an unverifiable property about the one value whose loss is the
+     worst irreversible outcome in this document. The two arms MUST be named by their **provenance**
+     — built here from a key, versus supplied by the caller as a hash — never by a capability.
+   - §7.2 clause 1's RECOMMENDation of a recovery-capable inner puzzle is addressed to the **funder
+     and the creation surface** (§15 clause 3a), which can see the puzzle they chose. It MUST NOT be
+     turned into a claim this crate makes about its argument.
+4. **A zero inner puzzle hash MUST be refused** with `RewardsError::InvalidLaunchTerms`, for the
+   reason the zero launcher id is already refused (`src/constants.rs:192-203`): a singleton whose
+   inner puzzle hash is the zero hash can never be spent, so the entry set is frozen from the first
+   block, and this is the last point at which it can be refused at all.
+5. **The singleton amount is `1` XCH mojo, fixed here, never a parameter.** A singleton's amount must
+   be odd, and upstream's own reward-distributor launch uses `1`
+   (`chia-sdk-driver-0.36.0/src/primitives/action_layer/launch_drivers.rs:644`, with
+   `.with_singleton_amount(1)` at `:725`). An even amount yields a singleton that cannot be spent; a
+   caller MUST NOT be given the opportunity to supply one.
+6. **The crate builds the launcher spend; the caller spends the parent.** Upstream `Launcher::spend`
+   inserts the launcher coin spend into the `SpendContext` and returns the conditions the **parent**
+   coin's spend must carry — a `CREATE_COIN` of the launcher coin plus an `ASSERT_COIN_ANNOUNCEMENT`
+   over the launcher solution (`chia-sdk-driver-0.36.0/src/primitives/launcher.rs:107-147`). This
+   crate MUST return those conditions to its caller unchanged, and MUST NOT sign, broadcast or spend
+   the parent coin (§0.1 clause 2): the parent is the funder's coin and the funder's key. The
+   launcher coin spend itself carries no key and needs no signature.
+7. **The manager singleton's launcher solution `key_value_list` MUST be nil.** The distributor's own
+   constants already carry `manager_singleton_launcher_id` (§15 clause 3), so nothing needs to
+   discover this singleton independently. A marker here would be a second on-chain format, unversioned
+   and read by nobody; §13.1's launch comment (§1.3) is the only on-chain format this crate writes.
+8. **The end-to-end mint, in order.** A funder MUST be able to go from nothing to a live distributor
+   through this crate alone:
+   1. choose the manager inner puzzle (clause 2), `distributor_epoch_seconds` and `first_epoch_start`
+      (§15 clause 3a — all three before anything is signed);
+   2. launch the manager singleton (clauses 1-7), which inserts the launcher coin spend into the
+      `SpendContext` and yields the **derived** launcher id;
+   3. carry that launcher id, and no other value, into `DistributorLaunchTerms`. This crate MUST
+      offer a path from the launch result to the terms so the funder never re-types the id. The
+      hand-built path stays legal — `DistributorLaunchTerms`'s fields are public at 0.5.0 and
+      removing them would break every caller (§0.5) — so the zero refusal at
+      `src/constants.rs:197-203` remains the backstop rather than being replaced;
+   4. build the constants with `dig_distributor_constants` (`src/constants.rs:114`) and launch with
+      `launch_dig_distributor` (`src/launch.rs:77`), which completes the table with the
+      **distributor's** own launcher id (§9.2, `with_dig_launcher_id`, `src/constants.rs:159`).
+9. **Both spends MUST reach the chain, and a creation surface SHOULD put them in one bundle.** The
+   two launches are independent spends, and the distributor launch needs only the manager launcher
+   *id* — which is determined the moment the parent coin id is chosen, before the manager launcher
+   coin exists. So a funder MUST NOT broadcast the distributor launch unless the manager launcher
+   spend is in the same spend bundle or already confirmed. A distributor launched against a launcher
+   id whose coin was never created is live, fundable and **permanently unwritable** (§7.2 clause 3),
+   and this crate's zero refusal cannot catch it: the id is not zero, it names a coin that does not
+   exist. One bundle is the form that cannot half-land.
+10. **What is signed, and by whom.** The launcher coin spend: nothing. The parent coin spend: the
+    funder's own key, outside this crate. The distributor launch: the caller signs with the ephemeral
+    security-coin secret key the launch returns and then discards it, and aggregates with the
+    signature the launch returns (`src/launch.rs:31-46`). This crate holds no keys and signs nothing
+    (§0.1 clause 2).
+
 ### 7.3 `fee_bps = 0` is the MVP default, and `fee_payout_puzzle_hash` is the funder's own
 
 The epoch fee is skimmed at `NewEpoch`: `fee = epoch_total_rewards * fee_bps / 10000`, paid to
@@ -1939,6 +2024,91 @@ DIG-Network/dig_ecosystem#3251. §15.4 carries the amendment row.
 2. A peer MUST be able to find, evaluate and claim from a distributor using nothing but a chain
    source. No off-chain component may be a precondition for being paid.
 3. A reader MUST apply §9.3 before treating a discovered distributor as ours.
+4. **The decode is this crate's, and it is the half that is missing.** *Specified, not yet
+   implemented at 0.5.0 — DIG-Network/dig_ecosystem#3249.* `LaunchComment` is rendered into the
+   launch (`src/comment.rs:32`, `src/launch.rs:77`) and parsed from **text** (`src/comment.rs:54`),
+   and at 0.5.0 nothing in `src/` recovers one from an observed spend. Clause 2 is therefore
+   unsatisfiable at 0.5.0 by any consumer of this crate, whatever chain source it holds.
+5. **Where the comment actually is, at field level.** It is **not** in the launcher coin's own
+   solution: that solution's `key_value_list` is `(first_epoch_start . constants)`
+   (`chia-sdk-driver-0.36.0/src/primitives/action_layer/launch_drivers.rs:725-729`), which is what
+   `read_distributor` already decodes (`src/state.rs:953`) and which never carries the generation.
+   The comment is carried in the **memos of the `CREATE_COIN` condition that creates the launcher
+   coin**, emitted by that coin's **parent** — the launch's security coin:
+
+   ```text
+   CREATE_COIN  puzzle_hash = the singleton launcher puzzle hash
+                amount      = 1 (XCH mojo, as upstream launches it)
+                memos       = ( <tree hash of the ASCII string "Reward Distributor v1">
+                                <the §1.3 launch comment, as a CLVM atom> )
+   ```
+
+   built at `launch_drivers.rs:642-644` via `Launcher::with_memos`, which is
+   `Conditions::create_coin(launcher puzzle hash, amount, memos)`
+   (`chia-sdk-driver-0.36.0/src/primitives/launcher.rs:47-51`); `memos` is `Memos::Some(..)`
+   (`chia-puzzle-types-0.36.1/src/memos.rs:10-16`). A decoder MUST therefore be given the **parent**
+   spend, and MUST obtain the conditions by running the spend's puzzle against its solution
+   (`chia_sdk_types::run_puzzle`, `chia-sdk-types-0.36.0/src/run_puzzle.rs:9`). The hint atom MUST be
+   recomputed as the tree hash of the literal string `Reward Distributor v1` and MUST NOT be written
+   as a hash literal; the amount MUST be read from the condition rather than assumed, because it
+   enters the coin id.
+6. **Every value the decode returns MUST be derived from the observed spend.** The decoder MUST NOT
+   take a launcher id, coin id, store id or root from its caller alongside the spend, and MUST NOT
+   echo one back: a check that takes both of its sides from the caller is forged in one line. The
+   launcher id MUST be the coin id of the coin the observed spend creates —
+   `Coin::new(observed.coin.coin_id(), <launcher puzzle hash>, amount).coin_id()`, the same coin
+   `Launcher::new(observed.coin.coin_id(), amount)` builds
+   (`chia-sdk-driver-0.36.0/src/primitives/launcher.rs:38-42`), which is also how the launcher puzzle
+   hash reaches this crate without a hash literal. A `CREATE_COIN` whose puzzle hash is **not** the
+   launcher puzzle hash MUST NOT contribute a result however well-formed its memos are: memos are
+   chosen freely by the spender and are constrained by no puzzle.
+
+   The result type MUST have **private fields and no public constructor**, exposing its values
+   through accessors only — the shape `ChainObservation` and `DistributorSnapshot` already use
+   (`src/state.rs:166`, `src/state.rs:225`) — and it MUST carry `store_id` and `root` together as one
+   `LaunchComment` rather than as two separable halves (`src/comment.rs:22-30`: holding a store at
+   *some* root is not holding it at *this* root).
+7. **A spend that creates more than one launcher MUST NOT be collapsed into one answer.** The decode
+   over a spend yields one result **per** launcher-creating `CREATE_COIN` carrying a well-formed DIG
+   rewards comment, each with its own derived launcher id, in condition order. An implementation MUST
+   NOT return "the first comment in the spend": a caller asking about one launcher id would then be
+   handed the generation advertised for a different one, which an attacker arranges by appending a
+   second condition. A caller asking about one launcher id MUST select by comparing that id against
+   each **derived** id.
+8. **An undecodable comment is an absence, never a zero — and an uninterpretable spend is neither.**
+   - No launcher-creating `CREATE_COIN`; `Memos::None`; memos that are not clause 5's two-element
+     structure; a first element that is not the recomputed hint; or a comment for which
+     `LaunchComment::parse` returns `None` — each means "this spend launched no DIG rewards
+     distributor" and MUST yield **no result for that launcher**, as a terminal non-error outcome
+     (`src/comment.rs:8-11`: a non-parsing comment is a classification, not a failure). An
+     implementation MUST NOT return a result carrying a default, zero or partially filled `store_id`
+     or `root`. A zero `store_id` is a valid-looking 32-byte value, and every downstream comparison
+     against it is a comparison against a generation that does not exist (§1.3).
+   - A spend whose puzzle reveal or solution cannot be deserialised, or whose puzzle does not run, is
+     **not** an absence: the read was attempted and could not be interpreted, so it MUST fail closed
+     with `RewardsError::Malformed`. A chain read that goes unanswered MUST fail closed with
+     `RewardsError::ChainUnavailable` and MUST NOT degrade into "no distributor found"
+     (`src/error.rs:19-30`).
+9. **What a decoded result proves, and the four things it does not.** It proves exactly this: *the
+   spend that created this launcher coin advertised, in a memo, that the distributor it was launching
+   is about `storeId:root`.* It does **not** prove:
+   1. that the distributor is **ours**. The memo is free text from the spender and commits to nothing
+      any puzzle enforces. §13.1 clause 3 and §9.3 still apply, and the `reserve_asset_id` that
+      settles it comes from the **launcher spend** through `read_distributor` (`src/state.rs:953`),
+      never from this decode;
+   2. that the distributor **still exists**, is funded, or ever had an entry. The decode reads a
+      historical spend and says nothing about the present — freshness is `DistributorSnapshot::is_current`
+      (`src/state.rs:351`), which derives its own comparand from a fresh read;
+   3. that the store, the root or the generation exists, is valid, or is held by anyone — the
+      statement `LaunchComment` already makes about itself (`src/comment.rs:26-30`); nor
+   4. that this is the **only** distributor advertising that generation. Anyone may launch one with
+      the same comment. A reader MUST NOT treat `storeId:root` as a key selecting at most one
+      distributor, and MUST NOT rank or trust one advertisement over another on the strength of the
+      comment alone.
+10. **This is the whole of the §13.1 half, and it stands alone.** §13.2's off-chain hint (#3252,
+    `dig-peer-protocol`) MUST NOT be a precondition for this decode, for the scan that consumes it,
+    or for being paid (§13.2 clause 2). Nothing in clauses 4-9 requires a peer, a gossip message or
+    any component other than a chain source.
 
 ### 13.2 Off-chain discovery is an optimisation, and it is deferred (#3252)
 
@@ -2048,6 +2218,13 @@ An implementation conforms when all of the following hold.
    including a recovery-capable option (§7.2 clauses 1, 1a), `epoch_seconds` with its downtime-
    granularity consequence stated (§8.1), and `first_epoch_start` (§8.5). An implementation that
    defaults all three silently has closed three one-way doors on the funder's behalf.
+3b. **The manager singleton launch (§7.2a).** The implementation launches the manager singleton
+   itself and derives the launcher id from the spend it builds, never from caller input; the inner
+   puzzle is an explicit, un-defaulted choice with no `Default` impl and no silent fallback; a zero
+   inner puzzle hash is refused; the singleton amount is fixed at `1` XCH mojo; and a caller-supplied
+   inner puzzle hash is named by its **provenance** only — no identifier, doc sentence or error
+   message calls it recovery-capable, multisig or recoverable, because this crate cannot check that
+   about 32 opaque bytes (§7.2a clause 3).
 4. **Eligibility.** Every entry admitted passed §3's challenge, §4's three-call chain, §4.5's
    transport pinning, and §5's self-exclusion — with no path that bypasses any of them (§5.3, §10.3).
 5. **Entry shape.** Every entry carries `payout_puzzle_hash = MirrorCoin::owner_puzzle_hash()` and
@@ -2090,12 +2267,31 @@ An implementation conforms when all of the following hold.
    on `first_epoch_start` — another one-way door, which is why this must be measured before any
    distributor is launched rather than after.
 
+   **What that test MUST assert**, because "assert where the value went" as written admits a test
+   that asserts nothing load-bearing and passes under either branch: the case MUST assert **exact
+   base-unit figures** — never `> 0`, and never against a value the test recomputed from the same
+   source it is checking — for (a) the base units the single entry receives when it claims after the
+   second epoch, (b) the reserve's remaining base units after that claim, and (c) that (a) plus (b)
+   plus every base unit already paid out or skimmed as fee equals the base units funded. Figures (a)
+   and (b) MUST appear as literals, so that the branch the chain actually takes is **recorded** and an
+   upstream change that moves it turns the test red. The test MUST NOT encode either branch as a
+   precondition: it measures, and the measured answer is then written back into this clause.
+
+10. **On-chain discovery (§13.1 clauses 4-10).** The generation is decoded from the memos of the
+   launcher-creating `CREATE_COIN` of an observed spend; every returned value including the launcher
+   id is derived from that spend; the result type has private fields and no public constructor; an
+   absent, malformed or non-parsing comment yields no result rather than a zero generation; an
+   uninterpretable spend or an unanswered read fails closed. The evidence is a simulator test that
+   decodes the spends **`launch_dig_distributor` itself produced** — a hand-built fixture proves only
+   that the decoder agrees with the fixture, and the memo layout is upstream's, not this crate's.
+
 ### 15.1 Which side each clause lands on
 
 - **This crate (#3249):** §0.1, §0.2, §0.5, §1.3, §4.3's call sequence as a reusable predicate, §6.4's
-  settlement amount, §7, §8, §9, §10.2, §11, §12.1 clause 1, §12.5 clause 3, §15.3.
+  settlement amount, §7, §8, §9, §10.2, §11, §12.1 clause 1, §12.5 clause 3, **§7.2a**, **§13.1 clauses 4-10**, §15.3.
 - **`dig-node` prover (#3250):** §1.1-§1.2, §1.4-§1.5, §2 (except §2.4's rendering and §2.2's
-  wording, which are #3253's), §3, §4.1-§4.2, §4.4-§4.7, §5, §6.3, §6.5, §12.1-§12.3, §12.6, §13.1,
+  wording, which are #3253's), §3, §4.1-§4.2, §4.4-§4.7, §5, §6.3, §6.5, §12.1-§12.3, §12.6, §13.1 clauses 1-3 (the scan and the §9.3 check that consume
+  this crate's §13.1 clauses 4-10 decode),
   and §2.1's `NewEpoch` clause 2.
 - **`dig-node` claim loop (#3251):** §8.6, §12.5, **§2.1's `NewEpoch` clause 1** (it is the obliged
   spender), and **§12.4** — the chain-derived `EntrySetStale` signal. §12.4 was previously allocated
@@ -2182,6 +2378,7 @@ a later reader can tell a decision from an open item.
 | A1 | **§2.2 clause 1 contradicted §2.1 and its own clause 3** — "Rewards are distributed only while **this node's** prover runs" is the false half of §2's opening sentence restated as an instruction, and a stronger form of the phrasing §2.2's closing paragraph bans | **fixed** — clause 1 now states that the prover governs *who* is paid, not *whether* anyone is paid, with the withdrawn wording recorded in place; the closing ban widened to any paraphrase making payment conditional on this node; the lead-in count corrected to "all five". Clauses 2-5 unchanged; no constant, default or driver shape changed |
 | A2 | **§2.6 defined three methods, so §7.4 clauses 3 and 5 could not be fed** — clause 5 orders a per-epoch, per-slot clawback presentation and clause 3 orders a destination parsed from the chain's `clawback_ph`, while no §2.6 method returned a commitment slot and §2.3's record carries no slot field | **fixed** — §2.6 gains `dig.listRewardDistributorCommitments` at `Tier::Control`, matching the shipped `dig-rpc-protocol` **v0.11.0** wire field for field, with six normative clauses: the **responder** MUST compute `recoverable_base_units` as `rewards_base_units * withdrawal_share_bps / 10_000` in integer arithmetic in that order, truncated; the echoed `withdrawal_share_bps` and `epoch_seconds` MUST be used rather than compiled-in constants; the chain's `clawback_ph` and the wire's `clawback_puzzle_hash` are stated to be one value; the figure is share arithmetic, never entitlement; an empty list is legitimate. §15.1's `dig-rpc-protocol` line corrected from "the three §2.6 methods"; §14's §2 row and metrics row record the shipped wire; §15.2 records the one implemented exception. No constant, default or driver shape changed |
 | A3 | **§12.5 clause 1 contradicted its own clauses 2 and 3** — "a **terminal, non-error** outcome for that distributor: stop retrying" admits the reading *never read that distributor again*, which makes clause 2's re-entry unobservable and clause 3 vacuous. Implemented literally in DIG-Network/dig-node#594, as a process-lifetime blacklist keyed by launcher id, it produced two reachable states in which a peer earns nothing while reporting nothing wrong: a peer legitimately re-admitted after `REENTRY_COOLDOWN_SECONDS`, and a peer that discovers a newly funded distributor before the funder's `AddEntry` lands — which §15 clause 9a makes the **ordinary** case rather than an edge | **fixed** — clause 1 now scopes "terminal" to the claim **attempt** and keeps every guarantee it had (no spend, no chain fault, no report of a lost payment, because §6.4 clause 1 already settled everything accrued including a sub-threshold remainder); new clause **1a** requires continued observation on §8.6's cadence and states that a slot read is a chain read, not a spend, so §6.3's write bounds do not reach it; clause **4** reconciles this with clause 3 explicitly — an absence MUST NOT be cached any more than a value is; clause **5** bans a permanent per-distributor exclusion set; clause **6** requires the absence be surfaced in the vocabulary §2.3/§2.4 already define, and states what the shipped v0.11.0 `RewardDistributorRef` cannot carry instead of ordering a presentation no wire can feed; clause **7** forbids guessing "never admitted" apart from "evicted after settlement". The heading widened from "A peer claiming after eviction", which pointed a reader looking for the not-yet-added case at no section at all. Clauses 2 and 3 are unchanged, so §15.1's "§12.5 clause 3" allocation still resolves. No constant, default or driver shape changed |
+| A4 | **Two clauses ordered work no caller could perform.** §7.2 clause 1a and §15 clause 3a order a launch-time manager-singleton inner-puzzle choice, while the crate ships **no singleton launcher at all**: `DistributorLaunchTerms` requires `manager_singleton_launcher_id` (`src/constants.rs:91`) and refuses a zero one (`src/constants.rs:197-203`), so at 0.5.0 no distributor can be minted through this crate without an id it offers no way to obtain. Separately, §13.1 clause 2 requires a peer with nothing but a chain source to find a distributor, while `LaunchComment` was written at launch and never read back from a spend | **specified** — new **§7.2a** (the manager singleton launch: launcher id derived from the spend this crate builds, inner puzzle an explicit un-defaulted choice named by **provenance** rather than by a capability this crate cannot verify of 32 opaque bytes, zero hash refused, both spends in one bundle) and **§13.1 clauses 4-10** (the decode: the comment is in the memos of the launcher-creating `CREATE_COIN`, not in the launcher solution, so every value is derived from the observed spend; absence over a zero generation; what a decoded result does not prove). §15 clauses **3b** and **10** carry them into conformance, §15 clause 9a gains the assertions its test must make, and §15.1 reallocates the §13.1 decode from the prover to this crate. Tracked by DIG-Network/dig_ecosystem#3308 and #3249. No constant, default or driver shape changed |
 
 Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
 reason the gate conditions are: a reader must be able to tell a decision from a correction, and a
