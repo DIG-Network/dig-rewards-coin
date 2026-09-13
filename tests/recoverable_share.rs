@@ -715,14 +715,20 @@ fn the_driver_reports_a_wrapped_share_where_the_puzzle_pays_correctly() -> anyho
     Ok(())
 }
 
-/// `read_distributor`'s B2 guard bounds `committed_value` by the reserve HIGH-WATER MARK, and the
-/// step that makes that sound is: a commitment enters the reserve in its own generation.
+/// `read_distributor`'s B2 guard now bounds a commitment slot's own recorded `committed_value`
+/// directly (`created_commitment_slots[].rewards` against `MAX_REPORTABLE_COMMITMENT_BASE_UNITS`),
+/// not a reserve high-water mark -- an earlier revision of the guard used the reserve amount as a
+/// proxy and was replaced because batching could net a large commitment against a same-generation
+/// outflow, hiding it from that proxy (see `src/state.rs`'s doc-comment). This test pins a
+/// different, still-relevant invariant: `read_distributor`'s money cross-check (its step 8 --
+/// "the tip reserve coin must be unspent and its amount must equal `state.total_reserves`") depends
+/// on a commitment actually depositing what it claims.
 ///
 /// That step is enforced by the reserve finalizer inside compiled puzzle bytes -- there is no
 /// chialisp source in the dependency tree to read it out of -- so it is pinned on chain here
 /// instead. Committing `X` must grow `total_reserves` by exactly `X`, and the physical reserve coin
-/// must hold the result. If either could be less than `X`, B2 would bound the wrong quantity and
-/// `src/state.rs`'s stated invariant would be false.
+/// must hold the result. If either could be less than `X`, the reader's money cross-check would be
+/// comparing against a figure the chain never actually deposited.
 #[test]
 fn committing_deposits_the_full_committed_value_into_the_reserve() -> anyhow::Result<()> {
     const REWARDS_BASE_UNITS: u64 = 7_777;
@@ -741,7 +747,7 @@ fn committing_deposits_the_full_committed_value_into_the_reserve() -> anyhow::Re
     );
     assert!(
         committed.reserve_amount_after_commit >= REWARDS_BASE_UNITS,
-        "which is the step src/state.rs's B2 invariant rests on"
+        "which is the step read_distributor's money cross-check (step 8) rests on"
     );
 
     Ok(())
