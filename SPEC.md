@@ -146,11 +146,21 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
       action by action: `ActionLayerSolution`'s
       `action_spends` is a plain `Vec<Spend>` whose length nothing bounds, `parse_solution`
       resolves repeated selectors through one cached Merkle proof so a single leaf may be spent
-      arbitrarily many times, and a `commit_incentives` action's on-chain CLVM cost does not scale
-      with its backfill gap -- so a per-action ceiling admits `action_spends.len()` times the
-      intended allocation for the price of one cheaply-mined spend. The count compared against that
+      arbitrarily many times, and while a `commit_incentives` action's on-chain CLVM cost DOES scale
+      with its backfill gap (one condition per backfilled epoch), nothing bounds how many such
+      actions share one generation -- so a per-action ceiling admits `action_spends.len()` times the
+      intended allocation for the price of one cheaply-mined spend, each individual action staying
+      well under the ceiling. The count compared against that
       budget MUST be the true ceiling of the epoch gap over `epoch_seconds`, matching upstream's
       loop exactly, so a refusal names a count the loop would really have run.
+
+      A single generation's `commit_incentives` backfill is bounded far below this budget by
+      consensus CLVM cost: the action's puzzle emits one condition per backfilled epoch, and a
+      generation backfilling 50,000 epochs exceeds the ~11-billion max-cost ceiling (measured,
+      `chia-sdk-driver` 0.36.0). The budget therefore never binds within one generation. It exists
+      solely to bound accumulation across the whole read, because the reader retains every
+      backfilled slot until the read returns and nothing bounds the number of generations an
+      attacker may mine.
 
       **(2) Its accumulator.** Upstream advances `start_epoch_time += epoch_seconds` once per
       iteration (`commit_incentives.rs:111`) and never checks that addition, so the reader MUST

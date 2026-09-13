@@ -90,19 +90,33 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   budget rather than a per-generation or per-action ceiling -- and the loop accumulator's terminal value. The clause
   previously mandated a reserve-amount bound, which the gate round proved bypassable, and then
   claimed the count cap bounded the loop, which it did not.
+- SPEC.md 0.1 clause 5d gains a normative statement of WHY the budget is spent across the whole
+  read rather than binding within one generation: a single generation's `commit_incentives`
+  backfill is bounded far below this budget by consensus CLVM cost (one condition per backfilled
+  epoch; measured, `chia-sdk-driver` 0.36.0), so the budget exists solely to bound accumulation
+  across the whole read, because the reader retains every backfilled slot until the read returns
+  and nothing bounds the number of generations an attacker may mine. The clause's per-action
+  reasoning is also corrected: the action's on-chain cost DOES scale with its backfill gap (it
+  previously said it did not); what does not scale is the number of such actions one generation
+  may batch.
 
 ### Miscellaneous
 - New public `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` (`u64::MAX / 10_000`), derived rather than
   spelled.
 - New public `state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` (`1_000_000`): an absolute figure this
   reader chooses, deliberately independent of any distributor's own declared constants, because a
-  bound derived from parameters an attacker picks is not a bound. At DIG's own one-week epoch it
-  is roughly nineteen thousand years of backfilled epochs, so no honest commitment approaches it.
+  bound derived from parameters an attacker picks is not a bound. It is a MEMORY bound -- ~40 MB of
+  retained `RewardDistributorRewardSlotValue` structs at ~40 bytes each -- not a time bound.
   It is a budget for one READ, consumed as the reader walks every generation of the singleton and every action spend within one:
   `ActionLayerSolution::action_spends` is a plain `Vec<Spend>` whose length nothing bounds, the
-  same Merkle leaf may be selected repeatedly, and a `commit_incentives` action's on-chain CLVM
-  cost does not scale with its backfill gap, so a per-action ceiling would have admitted
-  `action_spends.len()` times the intended allocation for the price of one spend.
+  same Merkle leaf may be selected repeatedly, and while a `commit_incentives` action's on-chain
+  CLVM cost DOES scale with its backfill gap (one condition per backfilled epoch; a real spend
+  backfilling 50,000 epochs already exceeds the ~11-billion consensus max-cost ceiling, measured
+  against `chia-sdk-driver` 0.36.0), nothing bounds how many such actions share one generation, so
+  a per-action ceiling would have admitted `action_spends.len()` times the intended allocation for
+  the price of one spend. A single generation's backfill therefore never approaches this budget on
+  its own -- it exists solely to bound accumulation across the whole read, spent across roughly
+  twenty cost-capped generations rather than one.
   `CommitIncentivesBackfillBoundExceeded` therefore carries `already_committed` alongside
   `iterations`, so a refusal names what the read had already spent.
 - `clvm-traits` and `clvmr` moved from `[dev-dependencies]` to `[dependencies]`: the pre-screen

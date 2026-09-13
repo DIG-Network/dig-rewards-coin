@@ -58,12 +58,18 @@ pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 /// inflated the same ratio past `1.8e19`, a bound in name only. See
 /// `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc for both failures.
 ///
-/// One million is comfortably beyond any plausible historical gap in real incentive commitments
-/// — at DIG's own one-week epoch it is roughly nineteen thousand years of backfilled epochs --
-/// while still bounding what this reader must hold in memory across one read to a few tens of
-/// megabytes of `RewardDistributorRewardSlotValue` structs (~40 bytes each), never the unbounded
-/// count an attacker's own `epoch_seconds`, or an unbounded number of cheaply-mined generations,
-/// could otherwise demand.
+/// One million is a MEMORY bound, not a time bound -- the binding constraint this budget exists
+/// for is what this reader must hold across one read, never how long a backfilled gap would
+/// historically take to occur. At ~40 bytes per retained `RewardDistributorRewardSlotValue`,
+/// one million slots is ~40 MB for the whole walk, never the unbounded count an attacker's own
+/// `epoch_seconds`, or an unbounded number of cheaply-mined generations, could otherwise demand.
+///
+/// It is never reachable within one generation: a single `commit_incentives` action's on-chain
+/// CLVM cost scales with its backfill gap -- one condition per backfilled epoch -- and a real
+/// spend backfilling 50,000 epochs already exceeds the ~11-billion consensus max-cost ceiling
+/// (measured, `chia-sdk-driver` 0.36.0). So this budget is spent across roughly twenty such
+/// cost-capped generations, never one -- it bounds accumulation across a whole read, not a single
+/// generation's backfill.
 pub const MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS: u64 = 1_000_000;
 
 /// Turns a `ChainSource` error into the one `RewardsError` variant a failed read may ever produce.
@@ -1061,9 +1067,12 @@ pub fn read_distributor(
     // `Vec<Spend>` (`action_layer.rs:42`) whose length nothing bounds here or upstream, and
     // `parse_solution` resolves repeated selectors through one CACHED Merkle proof
     // (`action_layer.rs:255-272`), so one leaf can be spent arbitrarily many times in a single
-    // generation. A `commit_incentives` action's on-chain CLVM cost does not scale with its
-    // backfill gap -- only the off-chain `get_log` reconstruction the pre-screen is protecting
-    // does. See `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
+    // generation. A `commit_incentives` action's on-chain CLVM cost DOES scale with its backfill
+    // gap -- one condition per backfilled epoch (measured: a real spend backfilling 50,000 epochs
+    // hits `CostExceeded` against the ~11-billion consensus max-cost ceiling, `chia-sdk-driver`
+    // 0.36.0) -- so this half of the hoist is justified by RETAINED MEMORY across the whole walk,
+    // never by the on-chain cost being flat. See `RewardsError::CommitIncentivesBackfillBoundExceeded`'s
+    // doc.
     let mut backfill_slots_committed: u64 = 0;
 
     loop {
@@ -1999,8 +2008,11 @@ mod tests {
     /// The backfill bound has to be a read-wide BUDGET, not a per-action ceiling. A
     /// generation's `action_spends` is a plain `Vec<Spend>` with no length bound in this crate or
     /// in `chia-sdk-driver` 0.36.0, and the same Merkle leaf may be selected repeatedly
-    /// (`action_layer.rs:255-272` caches a selector's proof), while a `commit_incentives` action's
-    /// on-chain CLVM cost does not scale with its backfill gap -- so a ceiling re-offered to every
+    /// (`action_layer.rs:255-272` caches a selector's proof); a `commit_incentives` action's
+    /// on-chain CLVM cost DOES scale with its backfill gap (measured: 50,000 backfilled epochs in
+    /// one action hits `CostExceeded`, `chia-sdk-driver` 0.36.0), so no single action can carry
+    /// anywhere near this budget -- but nothing stops MANY such actions sharing one generation,
+    /// each individually cheap, from summing past it -- so a ceiling re-offered to every
     /// action lets one cheaply-mined spend force this reader to materialise `action_spends.len()`
     /// times the cap in `RewardDistributorRewardSlotValue` structs.
     ///
