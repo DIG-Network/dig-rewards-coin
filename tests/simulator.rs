@@ -315,6 +315,33 @@ fn test_constants_with_max_seconds_offset(
     )
 }
 
+/// As [`test_constants_with_bps`], but overrides `epoch_seconds` instead of the withdrawal share
+/// -- builds the fixture `RewardsError::UnreadableEpochSeconds`'s domain check needs a distributor
+/// to actually carry. `dig_distributor_constants` refuses a zero epoch length at launch, so the
+/// only way this reaches the reader at all is a hostile launcher assembling the table directly,
+/// which is exactly the threat model `read_distributor` is written for.
+fn test_constants_with_epoch_seconds(
+    manager_singleton_launcher_id: Bytes32,
+    funder_refund_puzzle_hash: Bytes32,
+    simulator_asset_id: Bytes32,
+    epoch_seconds: u64,
+) -> RewardDistributorConstants {
+    RewardDistributorConstants::without_launcher_id(
+        RewardDistributorType::Managed {
+            manager_singleton_launcher_id,
+        },
+        funder_refund_puzzle_hash,
+        epoch_seconds,
+        u64::MAX,
+        MAX_SECONDS_OFFSET,
+        PAYOUT_THRESHOLD_BASE_UNITS,
+        false,
+        0,
+        0,
+        simulator_asset_id,
+    )
+}
+
 /// Everything a launched test distributor needs to keep being driven.
 struct Harness {
     sim: Simulator,
@@ -364,6 +391,19 @@ fn launch_harness_with_max_seconds_offset(
 ) -> anyhow::Result<Harness> {
     launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
         test_constants_with_max_seconds_offset(manager, funder, asset_id, max_seconds_offset)
+    })
+}
+
+/// As [`launch_harness_with`], but overrides `epoch_seconds` -- the launch constant
+/// `RewardsError::UnreadableEpochSeconds` domain-checks, and the one whose zero value makes
+/// upstream's backfill loop non-terminating.
+fn launch_harness_with_epoch_seconds(
+    ctx: &mut SpendContext,
+    minted_base_units: u64,
+    epoch_seconds: u64,
+) -> anyhow::Result<Harness> {
+    launch_harness_with_constants_builder(ctx, minted_base_units, |manager, funder, asset_id| {
+        test_constants_with_epoch_seconds(manager, funder, asset_id, epoch_seconds)
     })
 }
 
@@ -514,8 +554,10 @@ fn launch_harness_with_constants_builder(
         "the manager singleton is curried from the constants table"
     );
     assert_eq!(
-        launched.distributor.info.constants.epoch_seconds, TEST_EPOCH_SECONDS,
-        "epoch_seconds is curried from the constants table"
+        launched.distributor.info.constants.epoch_seconds, constants.epoch_seconds,
+        "epoch_seconds is curried from the constants table the caller's builder produced -- \
+         compared against THAT table, not against TEST_EPOCH_SECONDS, so a fixture that \
+         deliberately launches a hostile epoch length is not refused by its own harness"
     );
 
     Ok(Harness {
@@ -2369,6 +2411,50 @@ fn a_distributor_launched_with_an_out_of_domain_max_seconds_offset_is_refused_by
             "Ok(None) asserts the positive fact that no such distributor exists, and one does              (SPEC.md 0.1 clause 5d)"
         ),
         Err(other) => panic!("expected UnreadableMaxSecondsOffset, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// B1 sibling for `epoch_seconds`, and a POSITION test as much as a domain test.
+///
+/// A distributor launched with `epoch_seconds = 0` makes upstream's reward-slot backfill loop
+/// (`commit_incentives.rs:101-111`) non-terminating, and being a pure non-yielding CPU loop no
+/// consumer-side `tokio::time::timeout` can cancel it -- so this reader's refusal is the only
+/// defence that can work, and it must therefore run as early as it possibly can.
+///
+/// What makes this discriminating rather than merely a type assertion: the history read back here
+/// contains **no `commit_incentives` action at all** -- only the launch and the eve spend. The
+/// per-action screen (`refuse_unrepresentable_action_arithmetic`) inspects `epoch_seconds` only
+/// inside its `commit_incentives` branch, so it can never fire on this history. A refusal here can
+/// only have come from the launch-constants check, which runs before a single generation is
+/// parsed. Moving that check back down into the walk turns this test red while an
+/// error-variant-only assertion would stay green.
+#[test]
+fn a_distributor_launched_with_zero_epoch_seconds_is_refused_before_any_generation_is_parsed(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness_with_epoch_seconds(ctx, MINTED_BASE_UNITS, 0)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::UnreadableEpochSeconds) => {}
+        Ok(Some(snapshot)) => panic!(
+            "the reader handed on a zero-epoch_seconds distributor as authenticated state: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!(
+            "Ok(None) asserts the positive fact that no such distributor exists, and one does \
+             (SPEC.md 0.1 clause 5d)"
+        ),
+        Err(other) => panic!("expected UnreadableEpochSeconds, got: {other}"),
     }
 
     Ok(())

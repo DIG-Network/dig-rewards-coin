@@ -434,7 +434,7 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// - `commit_incentives.rs:101` -- `slot_epoch_time + epoch_seconds` (the non-adjacent-epoch
 ///   branch's backfill loop init)
 /// - `commit_incentives.rs:103-112` -- the backfill loop itself: not an overflow hazard but a
-///   non-termination / unbounded-iteration one (see [`RewardsError::CommitIncentivesEpochSecondsZero`]
+///   non-termination / unbounded-iteration one (see [`RewardsError::UnreadableEpochSeconds`]
 ///   and [`RewardsError::CommitIncentivesBackfillBoundExceeded`])
 /// - `unstake.rs:235` -- `entry_slot.shares - removed_shares`, where `removed_shares` is the
 ///   output of running the unstake action's own unlock puzzle (`unstake.rs:228`) against the
@@ -632,9 +632,14 @@ fn refuse_unrepresentable_action_arithmetic(
                 // empty reward slot per epoch between `params.slot_epoch_time` and
                 // `params.epoch_start`, stepping by the distributor's own `constants.epoch_seconds`
                 // (curried into the action puzzle at launch, not a solution field -- see
-                // `RewardsError::CommitIncentivesEpochSecondsZero`'s doc).
+                // `RewardsError::UnreadableEpochSeconds`'s doc).
+                // `read_distributor` already refused this distributor outright on its launch
+                // constants, before any generation was parsed. Repeated here because this
+                // function is also reachable directly (its own unit tests call it), and a screen
+                // that divides by `epoch_seconds` below must be TOTAL rather than rely on a
+                // caller's discipline: an `epoch_seconds` of zero would make `div_ceil` panic.
                 if constants.epoch_seconds == 0 {
-                    return Err(RewardsError::CommitIncentivesEpochSecondsZero);
+                    return Err(RewardsError::UnreadableEpochSeconds);
                 }
 
                 let start_epoch_time = params
@@ -957,6 +962,19 @@ pub fn read_distributor(
         return Err(RewardsError::UnreadableMaxSecondsOffset {
             max_seconds_offset: constants.max_seconds_offset,
         });
+    }
+
+    // The third constants-domain check, and the earliest one this reader can possibly make:
+    // `epoch_seconds` is curried into the action puzzles at LAUNCH, never supplied per spend, so
+    // it is knowable here -- before one generation is parsed -- rather than only per action once
+    // the walk is already running. At zero, upstream's backfill loop
+    // (`commit_incentives.rs:101-111`) never advances and never terminates; it is a pure,
+    // non-yielding CPU loop, so a consumer's own `tokio::time::timeout` cannot cancel it either.
+    // A refusal is the only defence that works, which is why it runs as early as possible rather
+    // than at the generation that happens to carry the offending action. See
+    // `RewardsError::UnreadableEpochSeconds`.
+    if constants.epoch_seconds == 0 {
+        return Err(RewardsError::UnreadableEpochSeconds);
     }
 
     let Some(eve_spend) = source
@@ -1715,12 +1733,12 @@ mod tests {
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
         match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
-            Err(RewardsError::CommitIncentivesEpochSecondsZero) => {}
+            Err(RewardsError::UnreadableEpochSeconds) => {}
             Ok(()) => panic!(
                 "the pre-screen let a commit_incentives backfill through with epoch_seconds == 0, \
                  which is a non-terminating loop upstream, not merely an overflow"
             ),
-            Err(other) => panic!("expected CommitIncentivesEpochSecondsZero, got: {other}"),
+            Err(other) => panic!("expected UnreadableEpochSeconds, got: {other}"),
         }
     }
 

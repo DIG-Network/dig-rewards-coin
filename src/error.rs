@@ -221,6 +221,9 @@ pub enum RewardsError {
         operation: &'static str,
     },
 
+    /// A distributor's own `epoch_seconds` launch constant is zero, which makes
+    /// `chia-sdk-driver` 0.36.0's reward-slot backfill loop non-terminating.
+    ///
     /// `commit_incentives`'s non-adjacent-epoch branch (`chia-sdk-driver-0.36.0`'s
     /// `commit_incentives.rs:101-112`) backfills one empty
     /// [`chia_sdk_types::puzzles::RewardDistributorRewardSlotValue`] per epoch between the spent
@@ -231,17 +234,27 @@ pub enum RewardsError {
     /// `epoch_seconds == 0` the loop's own `start_epoch_time += epoch_seconds` never advances: an
     /// unconditional, profile-independent non-terminating loop, reachable from the public reader,
     /// that a `checked_add` cannot close because the addition never overflows — it just never
-    /// progresses. Matching one of this reader's recognised eleven action hashes proves only that
-    /// the distributor's constants are well-formed, never that they are benign.
+    /// progresses.
+    ///
+    /// That loop is also **pure and non-yielding** (`grep -c await` over `commit_incentives.rs`
+    /// is `0`), so a consumer cannot rescue itself with a `tokio::time::timeout`: with no await
+    /// point the timeout future is never polled and the worker thread hangs regardless. A refusal
+    /// by this reader is the only defence that can work, which is why
+    /// [`crate::state::read_distributor`] takes it on the **launch constants**, beside
+    /// [`RewardsError::UnreadableDistributorConstants`] and
+    /// [`RewardsError::UnreadableMaxSecondsOffset`], before a single generation is parsed — and
+    /// not only per action inside the replay walk. Matching one of this reader's recognised eleven
+    /// action hashes proves only that the distributor's constants are well-formed, never that they
+    /// are benign.
     #[error(
-        "commit_incentives action's distributor has epoch_seconds == 0 -- the driver's own \
-         reward-slot backfill loop would never terminate on this value; refusing rather than \
-         hanging (#3313)"
+        "distributor constants carry epoch_seconds == 0 -- the driver's own reward-slot backfill \
+         loop would never terminate on this value, and being a pure CPU loop no caller-side \
+         timeout can cancel it; refusing to read rather than hanging (#3313)"
     )]
-    CommitIncentivesEpochSecondsZero,
+    UnreadableEpochSeconds,
 
     /// `commit_incentives`'s non-adjacent-epoch backfill loop (see
-    /// [`RewardsError::CommitIncentivesEpochSecondsZero`]) pushes one reward slot per iteration of
+    /// [`RewardsError::UnreadableEpochSeconds`]) pushes one reward slot per iteration of
     /// `(epoch_start - slot_epoch_time) / epoch_seconds`, both `epoch_start` and `slot_epoch_time`
     /// being attacker-supplied action-solution fields with `epoch_seconds > 0` but otherwise
     /// unbounded in magnitude — `read_distributor` is deliberately distributor-agnostic, so for an
@@ -270,7 +283,8 @@ pub enum RewardsError {
          risking unbounded CPU/memory (#3313)"
     )]
     CommitIncentivesBackfillBoundExceeded {
-        /// The derived backfill iteration count: `(epoch_start - slot_epoch_time) / epoch_seconds`.
+        /// The real backfill iteration count upstream's loop would run: the CEILING of
+        /// `epoch_start - (slot_epoch_time + epoch_seconds)` over `epoch_seconds`.
         iterations: u64,
         /// The fixed cap this reader enforces, independent of any distributor's own constants:
         /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS).
