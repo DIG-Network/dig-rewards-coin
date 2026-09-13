@@ -33,6 +33,8 @@ use chia_sdk_types::puzzles::{
     RewardDistributorSlotNonce, RewardDistributorSyncActionArgs,
 };
 use chia_sdk_types::Mod;
+use clvm_traits::clvm_tuple;
+use clvmr::NodePtr;
 use dig_chainsource_interface::ChainSource;
 
 use crate::RewardsError;
@@ -395,21 +397,46 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// this crate cannot patch a pinned dependency and must not ship a reader that panics or
 /// fabricates a figure in the meantime. Delete it the day the pin cohort carries the fix.
 ///
-/// Three of the eleven reward-distributor actions perform unchecked `u64` arithmetic on their own
-/// solution's fields, inside `get_log`, which runs INSIDE `RewardDistributor::from_spend` --
-/// before this crate's own B1/B2 guards ever get a chance to run on `from_spend`'s return:
+/// Four of the eleven reward-distributor actions perform unchecked arithmetic on their own
+/// solution's fields (or on a value their own solution's locked/unlocked commitment
+/// authenticates), inside `get_log`, which runs INSIDE `RewardDistributor::from_spend` -- before
+/// this crate's own B1/B2 guards ever get a chance to run on `from_spend`'s return. Every one of
+/// the eleven `get_log` bodies was read for this round (DIG-Network/dig_ecosystem#3313's
+/// re-gate); this is the complete hazard set, not the dispatch enumeration:
 /// - `withdraw_incentives.rs:71` -- `committed_value * withdrawal_share_bps`
 /// - `withdraw_incentives.rs:89` -- `reward_slot_total_rewards - withdrawal_share`
 /// - `commit_incentives.rs:85` -- `slot_total_rewards + rewards_to_add` (only when
-///   `slot_epoch_time == epoch_start`; the other branch performs no such add)
+///   `slot_epoch_time == epoch_start`; the adjacent-epoch branch)
+/// - `commit_incentives.rs:101` -- `slot_epoch_time + epoch_seconds` (the non-adjacent-epoch
+///   branch's backfill loop init)
+/// - `commit_incentives.rs:103-112` -- the backfill loop itself: not an overflow hazard but a
+///   non-termination / unbounded-iteration one (see [`RewardsError::CommitIncentivesEpochSecondsZero`]
+///   and [`RewardsError::CommitIncentivesBackfillBoundExceeded`])
+/// - `unstake.rs:235` -- `entry_slot.shares - removed_shares`, where `removed_shares` is the
+///   output of running the unstake action's own unlock puzzle (`unstake.rs:228`) against the
+///   solution's `unlock_puzzle_solution` -- there is no static bound on it in the solution, so
+///   closing this site means running that puzzle ourselves, exactly as `get_log` does
+/// - `stake.rs:326` -- `u64::try_from(existing_slot_counter + 1)` where `existing_slot_counter`
+///   is `i128`: the `+ 1` is unchecked `i128` arithmetic and panics at `i128::MAX` before
+///   `try_from` ever runs
+/// - `stake.rs:329` -- `existing_slot_shares + new_shares`, where `new_shares` is likewise the
+///   output of running the stake action's own lock puzzle (`stake.rs:322`) -- both operands
+///   attacker-influenced, one of them only knowable by running attacker-supplied CLVM
 ///
-/// `commit_incentives.rs:82`'s `slot_counter + 1` is deliberately NOT checked here: it is bounded
-/// by the slot's own real on-chain counter (a small, monotonically-incrementing value), not by an
-/// attacker-supplied solution field, so it is not a vector this pre-screen needs to close.
+/// **Six counter-increment sites are deliberately NOT checked here**, stated once: each is bounded
+/// by the slot's own real on-chain counter (a small, monotonically-incrementing value copied
+/// forward from a genuine prior slot), never by an attacker-supplied magnitude, so none is a
+/// vector this pre-screen needs to close --
+/// `commit_incentives.rs:82`, `commit_incentives.rs:89`, `withdraw_incentives.rs:86`,
+/// `new_epoch.rs:98`, `initiate_payout.rs:107`, `refresh.rs:136`.
 /// `new_epoch.rs:124`'s `epoch_total_rewards * fee_bps / 10000` is also NOT checked here: that
 /// multiply lives only in `NewEpochAction::spend` (the write-side builder), never in `get_log`,
 /// and `from_spend`/this reader's walk calls only `get_log` -- see dig-rewards-coin#10, which
-/// stays deferred on that ground and is not closed by this pre-screen.
+/// stays deferred on that ground and is not closed by this pre-screen. `refresh.rs:143-144`
+/// already uses the safe wide-int pattern this crate's own
+/// [`crate::clawback::recoverable_base_units`] follows (`i128::from(x) + i128::from(y)` then
+/// `u64::try_from`) -- the contrast that shows the unchecked sites above are oversights, not a
+/// deliberate design upstream chose.
 ///
 /// Two fail-closed rules, checked for every action spend in the generation's inner solution,
 /// BEFORE `from_spend` is called on that generation at all:
@@ -576,12 +603,158 @@ fn refuse_unrepresentable_action_arithmetic(
                         action: "commit_incentives",
                         operation: "slot_total_rewards + rewards_to_add",
                     })?;
+            } else {
+                // The non-adjacent-epoch branch: `commit_incentives.rs:88-112` backfills one
+                // empty reward slot per epoch between `params.slot_epoch_time` and
+                // `params.epoch_start`, stepping by the distributor's own `constants.epoch_seconds`
+                // (curried into the action puzzle at launch, not a solution field -- see
+                // `RewardsError::CommitIncentivesEpochSecondsZero`'s doc).
+                if constants.epoch_seconds == 0 {
+                    return Err(RewardsError::CommitIncentivesEpochSecondsZero);
+                }
+
+                let start_epoch_time = params
+                    .slot_epoch_time
+                    .checked_add(constants.epoch_seconds)
+                    .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                        action: "commit_incentives",
+                        operation: "slot_epoch_time + epoch_seconds",
+                    })?;
+
+                // Reuse the distributor's own declared `max_seconds_offset` -- the same tolerance
+                // `chia-sdk-driver` 0.36.0 curries into every other action that carries an
+                // epoch-time-like field (`add_entry`, `stake`, `unstake`, `refresh`) -- as the
+                // bound on how many epochs a single commit may backfill, rather than a figure this
+                // pre-screen invents.
+                let max_backfill_slots = constants.max_seconds_offset / constants.epoch_seconds;
+
+                if params.epoch_start > start_epoch_time {
+                    let iterations = (params.epoch_start - start_epoch_time) / constants.epoch_seconds + 1;
+                    if iterations > max_backfill_slots {
+                        return Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+                            iterations,
+                            max_backfill_slots,
+                        });
+                    }
+                }
             }
+        } else if raw_action_hash == unstake_hash {
+            let params = ctx
+                .extract::<chia_sdk_types::puzzles::RewardDistributorUnstakeActionSolution<NodePtr>>(
+                    action_spend.solution,
+                )
+                .map_err(RewardsError::from)?;
+
+            // `unstake.rs:228-229`: `removed_shares` is the output of running the unstake
+            // action's own unlock puzzle -- there is no static bound on it in the solution, so
+            // closing `unstake.rs:235` means running that puzzle ourselves, exactly as `get_log`
+            // does. `ctx.run` bounds CPU by `chia-sdk-types::MAINNET_CONSTANTS.max_block_cost_clvm`
+            // and memory by the allocator's atom/pair caps, and upstream itself already runs
+            // attacker CLVM unconditionally on every action before hash dispatch
+            // (`reward_distributor.rs:168`) -- so this adds no new class of exposure, only a
+            // second bounded, already-tolerated run.
+            //
+            // The unlock puzzle's solution also carries an `ephemeral_state` NodePtr threaded
+            // forward from whichever action ran immediately before this one in the SAME
+            // generation (`RewardDistributorPendingSpendInfo::new` seeds it to `NodePtr::NIL` for
+            // a generation's first action; every action after that receives the prior action's
+            // own full-puzzle output). This pre-screen does not replay prior actions' full
+            // puzzles -- doing so would duplicate `from_spend` itself -- so it always supplies
+            // `NodePtr::NIL` here. For an unstake that is its generation's first (or only) action
+            // this is the exact correct value. For a later action, a wrong `ephemeral_state`
+            // makes the unlock puzzle's own internal checks fail, which this pre-screen maps to a
+            // refusal (`RewardsError::Driver`/`Malformed`) rather than a wrong `removed_shares` --
+            // an over-refusal on a legitimate multi-action generation, the only direction this
+            // reader may fail in, never an under-refusal.
+            let unlock_puzzle = RewardDistributorUnstakeAction::unlock_puzzle(
+                ctx,
+                constants.launcher_id,
+                constants.reward_distributor_type,
+            )
+            .map_err(RewardsError::from)?;
+            let actual_unlock_solution = ctx
+                .alloc(&clvm_tuple!(
+                    NodePtr::NIL,
+                    clvm_tuple!(
+                        params.entry_slot.payout_puzzle_hash,
+                        params.unlock_puzzle_solution
+                    )
+                ))
+                .map_err(RewardsError::from)?;
+            let unlock_puzzle_result = ctx
+                .run(unlock_puzzle, actual_unlock_solution)
+                .map_err(RewardsError::from)?;
+            let removed_shares = ctx
+                .extract::<(u64, NodePtr)>(unlock_puzzle_result)
+                .map_err(RewardsError::from)?
+                .0;
+
+            params
+                .entry_slot
+                .shares
+                .checked_sub(removed_shares)
+                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                    action: "unstake",
+                    operation: "entry_slot.shares - removed_shares",
+                })?;
+        } else if raw_action_hash == stake_hash {
+            let params = ctx
+                .extract::<chia_sdk_types::puzzles::RewardDistributorStakeActionSolution<NodePtr>>(
+                    action_spend.solution,
+                )
+                .map_err(RewardsError::from)?;
+
+            // `stake.rs:326`: `u64::try_from(existing_slot_counter + 1)` -- the `+ 1` is
+            // unchecked `i128` arithmetic and panics at `i128::MAX` before `try_from` ever runs.
+            params
+                .existing_slot_counter
+                .checked_add(1)
+                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                    action: "stake",
+                    operation: "existing_slot_counter + 1",
+                })?;
+
+            // `stake.rs:322,329`: `new_shares` is the output of running the stake action's own
+            // lock puzzle against `lock_puzzle_solution` -- no static bound on it in the solution,
+            // so closing `stake.rs:329` means running that puzzle ourselves, exactly as
+            // `created_slot_value` does (same `Bytes32::default()`/`1` placeholders upstream
+            // itself uses to build `lock_puzzle` here -- that construction only depends on
+            // `distributor_type`, never on `launcher_id`/`max_second_offset`, for the numeric
+            // output this screen re-derives).
+            let lock_puzzle = RewardDistributorStakeAction::new_args(
+                ctx,
+                Bytes32::default(),
+                1,
+                constants.reward_distributor_type,
+            )
+            .map_err(RewardsError::from)?
+            .lock_puzzle;
+            let actual_lock_solution = ctx
+                .alloc(&(
+                    1,
+                    (
+                        params.entry_custody_puzzle_hash,
+                        params.lock_puzzle_solution,
+                    ),
+                ))
+                .map_err(RewardsError::from)?;
+            let lock_puzzle_output = ctx
+                .run(lock_puzzle, actual_lock_solution)
+                .map_err(RewardsError::from)?;
+            let (new_shares, _conditions): (u64, NodePtr) = ctx
+                .extract(lock_puzzle_output)
+                .map_err(RewardsError::from)?;
+
+            params
+                .existing_slot_shares
+                .checked_add(new_shares)
+                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                    action: "stake",
+                    operation: "existing_slot_shares + new_shares",
+                })?;
         } else if raw_action_hash == new_epoch_hash
             || raw_action_hash == add_entry_hash
             || raw_action_hash == remove_entry_hash
-            || raw_action_hash == stake_hash
-            || raw_action_hash == unstake_hash
             || raw_action_hash == initiate_payout_hash
             || raw_action_hash == add_incentives_hash
             || raw_action_hash == sync_hash

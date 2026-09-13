@@ -193,11 +193,12 @@ pub enum RewardsError {
         action_puzzle_hash: Bytes32,
     },
 
-    /// One of the three practically-reachable unchecked `u64` sites inside `chia-sdk-driver`
-    /// 0.36.0's action `get_log` methods (`withdraw_incentives.rs:71`, `:89`,
-    /// `commit_incentives.rs:85`) would overflow on the operands this generation's own action
-    /// solution carries, before `RewardDistributor::from_spend` ever returns to let this crate's
-    /// own B1/B2 guards run.
+    /// One of the unchecked `u64` (or `i128`) arithmetic sites inside `chia-sdk-driver` 0.36.0's
+    /// action `get_log` methods (`withdraw_incentives.rs:71`, `:89`, `commit_incentives.rs:85`,
+    /// `:101`, `unstake.rs:235`, `stake.rs:326`, `:329`) would overflow on the operands this
+    /// generation's own action solution carries (or, for `unstake`/`stake`, on a value the
+    /// solution's own locked/unlocked CAT or NFT commitment authenticates), before
+    /// `RewardDistributor::from_spend` ever returns to let this crate's own B1/B2 guards run.
     ///
     /// Refused BEFORE calling `from_spend` on this generation, because a checked-arithmetic build
     /// (`dig-node` and `dig-relay` both ship `overflow-checks = true` in release) panics inside the
@@ -205,17 +206,59 @@ pub enum RewardsError {
     /// fabricated figure as authenticated distributor state (DIG-Network/dig_ecosystem#3313).
     #[error(
         "action {action} solution's {operation} would overflow chia-sdk-driver 0.36.0's unchecked \
-         u64 arithmetic before RewardDistributor::from_spend can return -- refusing rather than \
+         arithmetic before RewardDistributor::from_spend can return -- refusing rather than \
          risking a panic (checked build) or a fabricated figure (wrapping build) (#3313)"
     )]
     ActionArithmeticNotRepresentable {
-        /// Which of the three screened actions this came from (`"withdraw_incentives"` or
-        /// `"commit_incentives"`).
+        /// Which screened action this came from (`"withdraw_incentives"`, `"commit_incentives"`,
+        /// `"unstake"` or `"stake"`).
         action: &'static str,
         /// Which operation would overflow (`"committed_value * withdrawal_share_bps"`,
-        /// `"reward_slot_total_rewards - withdrawal_share"`, or
-        /// `"slot_total_rewards + rewards_to_add"`).
+        /// `"reward_slot_total_rewards - withdrawal_share"`, `"slot_total_rewards +
+        /// rewards_to_add"`, `"slot_epoch_time + epoch_seconds"`, `"entry_slot.shares -
+        /// removed_shares"`, `"existing_slot_counter + 1"` or `"existing_slot_shares +
+        /// new_shares"`).
         operation: &'static str,
+    },
+
+    /// `commit_incentives`'s non-adjacent-epoch branch (`chia-sdk-driver-0.36.0`'s
+    /// `commit_incentives.rs:101-112`) backfills one empty
+    /// [`chia_sdk_types::puzzles::RewardDistributorRewardSlotValue`] per epoch between the spent
+    /// reward slot's `slot_epoch_time` and the new commitment's `epoch_start`, stepping by
+    /// `epoch_seconds` — a value curried into the action puzzle from the distributor's own launch
+    /// constants ([`chia_sdk_driver::RewardDistributorConstants::epoch_seconds`]), not a per-spend
+    /// solution field. An attacker who launches their own distributor picks it freely, and at
+    /// `epoch_seconds == 0` the loop's own `start_epoch_time += epoch_seconds` never advances: an
+    /// unconditional, profile-independent non-terminating loop, reachable from the public reader,
+    /// that a `checked_add` cannot close because the addition never overflows — it just never
+    /// progresses. Matching one of this reader's recognised eleven action hashes proves only that
+    /// the distributor's constants are well-formed, never that they are benign.
+    #[error(
+        "commit_incentives action's distributor has epoch_seconds == 0 -- the driver's own \
+         reward-slot backfill loop would never terminate on this value; refusing rather than \
+         hanging (#3313)"
+    )]
+    CommitIncentivesEpochSecondsZero,
+
+    /// `commit_incentives`'s non-adjacent-epoch backfill loop (see
+    /// [`RewardsError::CommitIncentivesEpochSecondsZero`]) pushes one reward slot per iteration of
+    /// `(epoch_start - slot_epoch_time) / epoch_seconds`, both `epoch_start` and `slot_epoch_time`
+    /// being attacker-supplied action-solution fields with `epoch_seconds > 0` but otherwise
+    /// unbounded in magnitude. Refusing once the derived iteration count exceeds
+    /// `max_backfill_slots` bounds this reader's own CPU and memory to a value derived from the
+    /// distributor's own declared `max_seconds_offset` tolerance — the same bound
+    /// `chia-sdk-driver` 0.36.0 curries into every other action that carries an epoch-time-like
+    /// field — rather than to a figure an attacker's own solution controls.
+    #[error(
+        "commit_incentives action would backfill {iterations} reward slots, exceeding the \
+         {max_backfill_slots} this reader will construct for one action -- refusing rather than \
+         risking unbounded CPU/memory (#3313)"
+    )]
+    CommitIncentivesBackfillBoundExceeded {
+        /// The derived backfill iteration count: `(epoch_start - slot_epoch_time) / epoch_seconds`.
+        iterations: u64,
+        /// The cap this reader enforces: `constants.max_seconds_offset / constants.epoch_seconds`.
+        max_backfill_slots: u64,
     },
 }
 

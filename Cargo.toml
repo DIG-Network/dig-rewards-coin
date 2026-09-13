@@ -53,6 +53,13 @@ chia-puzzle-types = "=0.36.1"
 # `action-layer` is what exposes the reward distributor at all; without it the crate cannot see it.
 chia-sdk-driver = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
 chia-sdk-types = { version = "=0.36.0", features = ["chip-0035", "action-layer"] }
+# Both were already reached transitively (via chia-sdk-driver/chia-sdk-types) at these exact
+# versions; the pre-screen (#3313) now names them directly to run the `unstake`/`stake` unlock and
+# lock puzzles (`ctx.run`) and build their solutions (`clvm_tuple!`), so they must be nameable from
+# this crate's own code, not only from its dev-only test harness. Versions match the dev-dependency
+# pins below (and this repo's `Cargo.lock`) exactly -- no new cohort member is introduced.
+clvm-traits = "0.36.1"
+clvmr = "0.16.4"
 hex = "0.4.3"
 thiserror = "2.0.20"
 
