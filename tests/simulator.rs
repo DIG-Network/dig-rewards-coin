@@ -2343,8 +2343,7 @@ fn a_distributor_launched_with_an_out_of_domain_bps_is_refused_by_the_reader() -
 fn a_distributor_launched_with_an_out_of_domain_max_seconds_offset_is_refused_by_the_reader(
 ) -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
-    let harness =
-        launch_harness_with_max_seconds_offset(ctx, MINTED_BASE_UNITS, u64::MAX)?;
+    let harness = launch_harness_with_max_seconds_offset(ctx, MINTED_BASE_UNITS, u64::MAX)?;
     let launcher_id = harness.distributor.info.constants.launcher_id;
 
     let members = vec![launcher_id, harness.distributor.coin.coin_id()];

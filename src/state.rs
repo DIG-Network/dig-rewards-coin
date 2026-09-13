@@ -49,7 +49,7 @@ pub const STALE_ENTRY_SET_SECONDS: u64 = 172_800;
 ///
 /// Fixed and independent of any distributor's own declared constants — never a ratio of
 /// `max_seconds_offset` to `epoch_seconds`, which produced `0` at DIG's own real launch constants
-/// (`604_800` / `300`) while an attacker's own `epoch_seconds = 1, max_seconds_offset = u64::MAX`
+/// (`300` / `604_800`) while an attacker's own `epoch_seconds = 1, max_seconds_offset = u64::MAX`
 /// inflated the same ratio past `1.8e19`, a bound in name only. See
 /// `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc for both failures.
 ///
@@ -648,7 +648,7 @@ fn refuse_unrepresentable_action_arithmetic(
                 // A FIXED cap, `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` -- never a ratio of the
                 // distributor's own declared constants. An earlier version of this bound divided
                 // `max_seconds_offset` by `epoch_seconds`, which was wrong in both directions at
-                // once: at DIG's own real launch constants (`604_800` / `300`) the quotient is
+                // once: at DIG's own real launch constants (`300` / `604_800`) the quotient is
                 // `0`, refusing every honest non-adjacent-epoch commit outright, while an
                 // attacker's own `epoch_seconds = 1, max_seconds_offset = u64::MAX` inflated the
                 // same quotient past `1.8e19`, no bound at all. `read_distributor` is
@@ -659,8 +659,13 @@ fn refuse_unrepresentable_action_arithmetic(
                 let max_backfill_slots = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
 
                 if params.epoch_start > start_epoch_time {
+                    // Upstream's loop is `while end_epoch_time > start_epoch_time { ...;
+                    // start_epoch_time += epoch_seconds }`, so the count is the CEILING of the gap
+                    // over the step, not the floor plus one -- floor-plus-one over-counts by
+                    // exactly one whenever the gap divides evenly, which would make the refusal's
+                    // own `iterations` figure a count no loop ever runs.
                     let iterations =
-                        (params.epoch_start - start_epoch_time) / constants.epoch_seconds + 1;
+                        (params.epoch_start - start_epoch_time).div_ceil(constants.epoch_seconds);
                     if iterations > max_backfill_slots {
                         return Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                             iterations,
@@ -1813,8 +1818,15 @@ mod tests {
         let ctx = &mut SpendContext::new();
         let launcher_id = some_identity();
         let refund_hash = some_identity();
-        let terms = crate::constants::dig_distributor_terms_for_testing();
-        let constants = crate::constants::dig_distributor_constants(&terms, refund_hash)
+        // DIG's OWN published launch terms, not a test-shaped stand-in: the retired ratio cap
+        // `max_seconds_offset / epoch_seconds` floors to zero at exactly these values
+        // (`300 / 604_800`), so the honest case has to be built from the real constructor for the
+        // test to be evidence about production.
+        let terms = crate::constants::DistributorLaunchTerms {
+            manager_singleton_launcher_id: some_identity(),
+            distributor_epoch_seconds: crate::constants::DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+        };
+        let constants = crate::constants::dig_distributor_constants(terms, refund_hash)
             .expect("DIG's own canonical constants must build")
             .with_launcher_id(launcher_id);
 
@@ -1850,12 +1862,14 @@ mod tests {
 
         let spend = single_action_spend(ctx, action_puzzle, action_solution);
 
-        assert_eq!(
-            refuse_unrepresentable_action_arithmetic(ctx, &spend, constants),
-            Ok(()),
-            "an honest two-epoch backfill under DIG's own real constants must be admitted, not \
-             refused by a cap that evaluates to zero at those exact constants"
-        );
+        // `RewardsError` is deliberately not `PartialEq` (it carries a `String`), so the admission
+        // is asserted by matching rather than comparing.
+        if let Err(refusal) = refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            panic!(
+                "an honest two-epoch backfill under DIG's own real constants must be admitted, \
+                 not refused by a cap that evaluates to zero at those exact constants: {refusal}"
+            );
+        }
     }
 
     /// `unstake.rs:235`: `entry_slot.shares - removed_shares` underflows when a solution names an
