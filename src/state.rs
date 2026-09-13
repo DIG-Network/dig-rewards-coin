@@ -629,7 +629,8 @@ fn refuse_unrepresentable_action_arithmetic(
                 let max_backfill_slots = constants.max_seconds_offset / constants.epoch_seconds;
 
                 if params.epoch_start > start_epoch_time {
-                    let iterations = (params.epoch_start - start_epoch_time) / constants.epoch_seconds + 1;
+                    let iterations =
+                        (params.epoch_start - start_epoch_time) / constants.epoch_seconds + 1;
                     if iterations > max_backfill_slots {
                         return Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                             iterations,
@@ -689,14 +690,12 @@ fn refuse_unrepresentable_action_arithmetic(
                 .map_err(RewardsError::from)?
                 .0;
 
-            params
-                .entry_slot
-                .shares
-                .checked_sub(removed_shares)
-                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+            params.entry_slot.shares.checked_sub(removed_shares).ok_or(
+                RewardsError::ActionArithmeticNotRepresentable {
                     action: "unstake",
                     operation: "entry_slot.shares - removed_shares",
-                })?;
+                },
+            )?;
         } else if raw_action_hash == stake_hash {
             let params = ctx
                 .extract::<chia_sdk_types::puzzles::RewardDistributorStakeActionSolution<NodePtr>>(
@@ -706,13 +705,12 @@ fn refuse_unrepresentable_action_arithmetic(
 
             // `stake.rs:326`: `u64::try_from(existing_slot_counter + 1)` -- the `+ 1` is
             // unchecked `i128` arithmetic and panics at `i128::MAX` before `try_from` ever runs.
-            params
-                .existing_slot_counter
-                .checked_add(1)
-                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+            params.existing_slot_counter.checked_add(1).ok_or(
+                RewardsError::ActionArithmeticNotRepresentable {
                     action: "stake",
                     operation: "existing_slot_counter + 1",
-                })?;
+                },
+            )?;
 
             // `stake.rs:322,329`: `new_shares` is the output of running the stake action's own
             // lock puzzle against `lock_puzzle_solution` -- no static bound on it in the solution,
@@ -745,13 +743,12 @@ fn refuse_unrepresentable_action_arithmetic(
                 .extract(lock_puzzle_output)
                 .map_err(RewardsError::from)?;
 
-            params
-                .existing_slot_shares
-                .checked_add(new_shares)
-                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+            params.existing_slot_shares.checked_add(new_shares).ok_or(
+                RewardsError::ActionArithmeticNotRepresentable {
                     action: "stake",
                     operation: "existing_slot_shares + new_shares",
-                })?;
+                },
+            )?;
         } else if raw_action_hash == new_epoch_hash
             || raw_action_hash == add_entry_hash
             || raw_action_hash == remove_entry_hash
@@ -1577,6 +1574,408 @@ mod tests {
                 assert_eq!(operation, "slot_total_rewards + rewards_to_add");
             }
             Ok(()) => panic!("the pre-screen let a commit solution through whose add overflows"),
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
+    }
+
+    /// Wraps one action puzzle+solution pair in the same `SingletonSolution` /
+    /// `RawActionLayerSolution` scaffolding every pre-screen test above builds by hand, so the
+    /// four hazard tests below don't have to repeat it a fourth and fifth time.
+    fn single_action_spend(
+        ctx: &mut SpendContext,
+        action_puzzle: NodePtr,
+        action_solution: NodePtr,
+    ) -> CoinSpend {
+        let raw_action_layer_solution = chia_sdk_types::puzzles::RawActionLayerSolution {
+            puzzles: vec![action_puzzle],
+            selectors_and_proofs: vec![(2, Some(chia_sdk_types::MerkleProof::new(0, vec![])))],
+            solutions: vec![action_solution],
+            finalizer_solution: ctx
+                .alloc(&())
+                .expect("the empty finalizer solution allocates"),
+        };
+        let singleton_solution = SingletonSolution {
+            lineage_proof: chia_puzzle_types::Proof::Eve(chia_puzzle_types::EveProof {
+                parent_parent_coin_info: some_identity(),
+                parent_amount: 1,
+            }),
+            amount: 1,
+            inner_solution: raw_action_layer_solution,
+        };
+        let solution = ctx
+            .serialize(&singleton_solution)
+            .expect("a well-formed singleton solution always serializes");
+        CoinSpend::new(
+            chia_protocol::Coin::new(some_identity(), some_identity(), 1),
+            solution.clone(),
+            solution,
+        )
+    }
+
+    /// `commit_incentives.rs:101`'s non-adjacent-epoch branch never terminates its backfill loop
+    /// if the distributor's own `epoch_seconds` constant is zero, since the loop steps by
+    /// `constants.epoch_seconds` -- refusing outright is the only sound response, not a checked
+    /// add on a step of zero (which would still loop forever, just without overflowing).
+    #[test]
+    fn a_commit_incentives_epoch_seconds_of_zero_is_refused_before_it_can_hang() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        // The hazard: a distributor launched with `epoch_seconds == 0`. `epoch_seconds` is
+        // curried into the action puzzle at launch (never a solution field), so an attacker who
+        // launches their own distributor can pick it freely.
+        let epoch_seconds = 0u64;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            1_000,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry even at epoch_seconds == 0");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                    slot_counter: 0,
+                    // Not equal to `epoch_start`, so the non-adjacent-epoch (backfill) branch is
+                    // the one this pre-screen must refuse in.
+                    slot_epoch_time: 0,
+                    slot_next_epoch_initialized: false,
+                    slot_total_rewards: 0,
+                    epoch_start: 5_000,
+                    clawback_ph: some_identity(),
+                    rewards_to_add: 1,
+                },
+            )
+            .expect("a well-formed commit solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::CommitIncentivesEpochSecondsZero) => {}
+            Ok(()) => panic!(
+                "the pre-screen let a commit_incentives backfill through with epoch_seconds == 0, \
+                 which is a non-terminating loop upstream, not merely an overflow"
+            ),
+            Err(other) => panic!("expected CommitIncentivesEpochSecondsZero, got: {other}"),
+        }
+    }
+
+    /// `commit_incentives.rs:103-112`'s backfill loop is bounded here by a DERIVED cap
+    /// (`max_seconds_offset / epoch_seconds`), never a decimal literal -- a solution whose
+    /// `epoch_start` is far enough past `slot_epoch_time` to need more iterations than that cap
+    /// must be refused before the (unbounded, from this reader's point of view) loop runs.
+    #[test]
+    fn a_commit_incentives_backfill_past_the_derived_cap_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let epoch_seconds = 1_000u64;
+        let max_seconds_offset = 1_000u64;
+        // `max_backfill_slots = max_seconds_offset / epoch_seconds` = 1: this distributor's own
+        // declared tolerance allows backfilling exactly one empty epoch, never two.
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            max_seconds_offset,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let slot_epoch_time = 0u64;
+        // Two epochs past `slot_epoch_time + epoch_seconds` (1_000): needs 3 backfill iterations,
+        // past the cap of 1 derived above.
+        let epoch_start = 3_000u64;
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                    slot_counter: 0,
+                    slot_epoch_time,
+                    slot_next_epoch_initialized: false,
+                    slot_total_rewards: 0,
+                    epoch_start,
+                    clawback_ph: some_identity(),
+                    rewards_to_add: 1,
+                },
+            )
+            .expect("a well-formed commit solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+                iterations,
+                max_backfill_slots,
+            }) => {
+                assert_eq!(
+                    max_backfill_slots, 1,
+                    "the cap must be derived, not hardcoded"
+                );
+                assert_eq!(
+                    iterations, 3,
+                    "the refusal must name the real iteration count"
+                );
+            }
+            Ok(()) => panic!(
+                "the pre-screen let a commit_incentives backfill through past its own derived cap"
+            ),
+            Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
+        }
+    }
+
+    /// `unstake.rs:235`: `entry_slot.shares - removed_shares` underflows when a solution names an
+    /// `entry_slot.shares` smaller than what the unstake action's own unlock puzzle actually
+    /// returns for `removed_shares` -- a shape only reachable by RUNNING that puzzle (its output
+    /// is not a static solution field), which is exactly what this test proves the pre-screen
+    /// does: a genuine, successfully-run CAT unlock puzzle whose real `cat_shares` output (5)
+    /// exceeds the solution's own claimed `entry_slot.shares` (1).
+    #[test]
+    fn an_unstake_subtract_that_would_underflow_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let max_second_offset = 1_000u64;
+        let precision = 1_000u64;
+        let asset_id = some_identity();
+        let distributor_type = RewardDistributorType::Cat {
+            asset_id,
+            hidden_puzzle_hash: None,
+        };
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            distributor_type,
+            some_identity(),
+            1_000,
+            precision,
+            max_second_offset,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let entry_slot = chia_sdk_types::puzzles::RewardDistributorEntrySlotValue {
+            counter: 0,
+            payout_puzzle_hash: some_identity(),
+            initial_cumulative_payout: 0,
+            // Smaller than the unlock puzzle's real output below -- the underflow.
+            shares: 1,
+        };
+        let removed_shares = 5u64;
+
+        let action_solution_value =
+            chia_sdk_types::puzzles::RewardDistributorUnstakeActionSolution {
+                entry_slot,
+                entry_payout_info: chia_sdk_types::puzzles::RewardDistributorEntryPayoutInfo {
+                    payout_amount: 0,
+                    payout_rounding_error: 0,
+                },
+                unlock_puzzle_solution:
+                    chia_sdk_types::puzzles::RewardDistributorCatUnlockingPuzzleSolution {
+                        cat_parent_id: some_identity(),
+                        cat_amount: removed_shares,
+                        cat_shares: removed_shares,
+                        cat_maker_solution_rest: (),
+                    },
+            };
+
+        let unstake_args = chia_sdk_driver::RewardDistributorUnstakeAction::new_args(
+            ctx,
+            launcher_id,
+            max_second_offset,
+            precision,
+            distributor_type,
+        )
+        .expect("unstake args always build for a Cat distributor");
+        let action_puzzle = ctx.curry(unstake_args).expect("unstake args always curry");
+        let action_solution = ctx
+            .alloc(&action_solution_value)
+            .expect("a well-formed unstake solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "unstake");
+                assert_eq!(operation, "entry_slot.shares - removed_shares");
+            }
+            Ok(()) => panic!(
+                "the pre-screen let an unstake solution through whose subtract underflows, \
+                 after actually running its unlock puzzle"
+            ),
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
+    }
+
+    /// `stake.rs:329`: `existing_slot_shares + new_shares` overflows when `new_shares` -- the
+    /// real output of running the stake action's own lock puzzle -- pushes the sum past
+    /// `u64::MAX`, a shape only reachable by running that puzzle, exactly as production's own
+    /// `created_slot_value` does.
+    #[test]
+    fn a_stake_add_that_would_overflow_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let max_second_offset = 1_000u64;
+        let asset_id = some_identity();
+        let distributor_type = RewardDistributorType::Cat {
+            asset_id,
+            hidden_puzzle_hash: None,
+        };
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            distributor_type,
+            some_identity(),
+            1_000,
+            1_000,
+            max_second_offset,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let new_shares = 5u64;
+        let action_solution_value = chia_sdk_types::puzzles::RewardDistributorStakeActionSolution {
+            lock_puzzle_solution:
+                chia_sdk_types::puzzles::RewardDistributorCatLockingPuzzleSolution {
+                    my_id: some_identity(),
+                    cat_amount: new_shares,
+                    cat_maker_solution_rest: (),
+                },
+            existing_slot_counter: 0,
+            entry_custody_puzzle_hash: some_identity(),
+            existing_slot_cumulative_payout: 0,
+            // `u64::MAX - (new_shares - 1)`, so `+ new_shares` overflows by exactly one.
+            existing_slot_shares: u64::MAX - (new_shares - 1),
+        };
+
+        let stake_args = chia_sdk_driver::RewardDistributorStakeAction::new_args(
+            ctx,
+            launcher_id,
+            max_second_offset,
+            distributor_type,
+        )
+        .expect("stake args always build for a Cat distributor");
+        let action_puzzle = ctx.curry(stake_args).expect("stake args always curry");
+        let action_solution = ctx
+            .alloc(&action_solution_value)
+            .expect("a well-formed stake solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "stake");
+                assert_eq!(operation, "existing_slot_shares + new_shares");
+            }
+            Ok(()) => panic!(
+                "the pre-screen let a stake solution through whose add overflows, after actually \
+                 running its lock puzzle"
+            ),
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
+    }
+
+    /// `stake.rs:326`: `u64::try_from(existing_slot_counter + 1)` where `existing_slot_counter`
+    /// is `i128` -- the `+ 1` is unchecked `i128` arithmetic and panics at `i128::MAX` before
+    /// `try_from` ever runs, independent of the `existing_slot_shares + new_shares` site above.
+    #[test]
+    fn a_stake_counter_at_i128_max_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let max_second_offset = 1_000u64;
+        let asset_id = some_identity();
+        let distributor_type = RewardDistributorType::Cat {
+            asset_id,
+            hidden_puzzle_hash: None,
+        };
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            distributor_type,
+            some_identity(),
+            1_000,
+            1_000,
+            max_second_offset,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let action_solution_value = chia_sdk_types::puzzles::RewardDistributorStakeActionSolution {
+            lock_puzzle_solution:
+                chia_sdk_types::puzzles::RewardDistributorCatLockingPuzzleSolution {
+                    my_id: some_identity(),
+                    cat_amount: 1,
+                    cat_maker_solution_rest: (),
+                },
+            existing_slot_counter: i128::MAX,
+            entry_custody_puzzle_hash: some_identity(),
+            existing_slot_cumulative_payout: 0,
+            existing_slot_shares: 0,
+        };
+
+        let stake_args = chia_sdk_driver::RewardDistributorStakeAction::new_args(
+            ctx,
+            launcher_id,
+            max_second_offset,
+            distributor_type,
+        )
+        .expect("stake args always build for a Cat distributor");
+        let action_puzzle = ctx.curry(stake_args).expect("stake args always curry");
+        let action_solution = ctx
+            .alloc(&action_solution_value)
+            .expect("a well-formed stake solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "stake");
+                assert_eq!(operation, "existing_slot_counter + 1");
+            }
+            Ok(()) => panic!(
+                "the pre-screen let a stake solution through whose counter increment panics at \
+                 i128::MAX"
+            ),
             Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
         }
     }
