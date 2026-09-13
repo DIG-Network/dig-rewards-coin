@@ -2391,3 +2391,272 @@ fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Res
 
     Ok(())
 }
+
+/// One-step composition, red-then-green regression for the triple gate's converged finding at
+/// PR #8 (`state.rs:433`): B2 must refuse a commitment above `MAX_REPORTABLE_COMMITMENT_BASE_UNITS`
+/// even when that commitment is created in the SAME distributor-coin spend as another
+/// reserve-affecting action -- never only across two separate, single-action generations, which is
+/// the shape `a_commitment_above_the_driver_bound_is_refused_by_the_reader` above uses and the
+/// shape that was never at risk (a commitment's own `rewards` is available to B2 the instant its
+/// CREATING generation is reconstructed, `state.rs:573`, regardless of what else shares that
+/// generation).
+///
+/// `chia-sdk-driver` 0.36.0's action layer batches any number of actions into one distributor-coin
+/// spend (`reward_distributor.rs:699-747`), and this crate's own `commit_incentives_for_...` and
+/// the raw `RewardDistributorWithdrawIncentivesAction` builder both leave `finish_spend` to the
+/// caller, so the composition below is directly constructible with this repo's own API -- exactly
+/// as the PR review at `state.rs:433` described.
+///
+/// Debug-safe on purpose: `committed_base_units` sits just above the READ bound
+/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`, `u64::MAX / 10_000`) but stays under the DRIVER's own
+/// overflow bound (`u64::MAX / WITHDRAWAL_SHARE_BPS`, i.e. `/ 9_000`), so the raw withdraw spend
+/// built here does not panic even without `--release` -- proving the generic B2 bound catches a
+/// commitment DIG's own 9_000 bps table could still have paid out, not merely one already broken
+/// by the driver's own overflow.
+#[test]
+fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::Result<()> {
+    // One base unit above the read bound; derived, never spelled, so a mutation of
+    // MAX_REPORTABLE_COMMITMENT_BASE_UNITS in src/ cannot survive unnoticed here.
+    let committed_base_units = MAX_REPORTABLE_COMMITMENT_BASE_UNITS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // CommitIncentives -- above the read bound -- built directly against `harness.distributor`,
+    // deliberately NOT finished yet: the withdraw below must land in the SAME pending spend.
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        harness.first_epoch_slot.clone(),
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        committed_base_units,
+    )?;
+
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - committed_base_units;
+    let source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    let reward_slots: Vec<Slot<RewardDistributorRewardSlotValue>> = harness
+        .distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
+        })
+        .collect();
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = harness
+        .distributor
+        .pending_spend
+        .created_commitment_slots
+        .first()
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::COMMITMENT)
+        })
+        .expect("the commit above created a commitment slot");
+
+    // WithdrawIncentives of that SAME just-created slot, built directly against the raw driver
+    // action -- deliberately bypassing `withdraw_committed_incentives`'s own pre-guard, because
+    // the question here is what B2 (the READER) does with a spend already on chain, not whether
+    // this crate's own clawback entry point would have refused first.
+    let mut distributor = harness.distributor.clone();
+    let (withdraw_conditions, driver_reported) = distributor
+        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
+        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
+    harness.distributor = distributor;
+
+    // Sanity: at this scale the driver's own multiply has NOT wrapped -- this composition proves
+    // B2 catches a commitment the driver itself could still pay correctly, not merely one already
+    // broken elsewhere.
+    let expected_share =
+        u64::try_from(u128::from(committed_base_units) * u128::from(WITHDRAWAL_SHARE_BPS) / 10_000)
+            .expect("stays in u64 at this scale");
+    assert_eq!(
+        driver_reported, expected_share,
+        "this fixture only proves what B2 alone catches if the driver has NOT already misreported"
+    );
+
+    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
+    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, withdraw_conditions)?;
+
+    harness.distributor = harness
+        .distributor
+        .clone()
+        .finish_spend(ctx, vec![source_cat_spend])?
+        .0;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::CommitmentRewardsTooLargeToRead {
+            rewards_base_units,
+            max_readable_base_units,
+        }) => {
+            assert_eq!(
+                max_readable_base_units, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+                "the refusal must name the derived bound"
+            );
+            assert_eq!(
+                rewards_base_units, committed_base_units,
+                "the refusal must name the commitment's own recorded rewards, even though this \
+                 generation ALSO contains a withdraw of that same slot"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "B2 let a same-generation commit+withdraw through: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => panic!("expected CommitmentRewardsTooLargeToRead, got: {other}"),
+    }
+
+    Ok(())
+}
+
+/// Path A (PR #8 review at `state.rs:433`): `withdraw_committed_incentives`'s pre-guard must judge
+/// the value upstream will ACTUALLY multiply -- the commitment slot `actual_commitment_slot_value`
+/// substitutes in, matching on `epoch_start` ALONE (`reward_distributor.rs:833-849`) -- never the
+/// stale slot the caller happened to pass in.
+///
+/// Constructed exactly as the review described: a small, real, ALREADY-ON-CHAIN commitment to
+/// `second_epoch_start` is clawed back in the SAME generation that commits a SECOND, much larger
+/// amount to that same `epoch_start` -- the caller passes the stale, small, safe slot, and the
+/// guard must still refuse on the large, substituted one.
+///
+/// The revert probe for this test is recorded on its own doc line at the bottom rather than run
+/// automatically: reverting `src/clawback.rs`'s `distributor.actual_commitment_slot_value(...)`
+/// call to a bare `commitment_slot` makes the pre-guard see the caller's stale, SAFE small figure
+/// and let the withdraw through -- at which point the driver's OWN internal resolution (
+/// `withdraw_incentives.rs:103`, unconditional) still substitutes the large value and the same
+/// multiply this crate's guard exists to pre-empt now runs unguarded, panicking under
+/// `debug_assertions` instead of returning a controlled `Err`. That is what "must go red" means
+/// here: not a different Err, but the test failing to reach its `assert_eq!` at all.
+#[test]
+fn withdraw_guards_the_substituted_commitment_not_the_callers_stale_one() -> anyhow::Result<()> {
+    const SMALL_COMMITMENT: u64 = 1_000;
+    // One base unit above the driver's own overflow bound, so the guard's `checked_mul` is what
+    // catches it -- derived, never spelled.
+    let large_commitment = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness_with(
+        ctx,
+        large_commitment + SMALL_COMMITMENT + headroom,
+        WITHDRAWAL_SHARE_BPS,
+    )?;
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // A small, real commitment to `second_epoch_start`, finished onto chain in its OWN generation
+    // -- this is the stale slot the caller below will pass to the guard.
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        second_epoch_start,
+        SMALL_COMMITMENT,
+    )?;
+    let stale_commitment_slot = harness
+        .last_commitment_slot
+        .clone()
+        .expect("the small commit created a commitment slot");
+    let reward_slot_for_second_epoch = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    // A second, much larger commitment to the SAME epoch_start, in a NEW generation deliberately
+    // left open: the withdraw below must land in this same pending spend.
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        reward_slot_for_second_epoch,
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        large_commitment,
+    )?;
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - large_commitment;
+    let _source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    let reward_slot_after_second_commit = harness
+        .distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .find(|value| value.epoch_start == second_epoch_start)
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::REWARD)
+        })
+        .expect("the second commit re-created a reward slot covering second_epoch_start");
+
+    // The caller passes the STALE, small, already-on-chain slot -- `epoch_start` is all
+    // `actual_commitment_slot_value` looks at when it substitutes.
+    let clawback = withdraw_committed_incentives(
+        ctx,
+        &mut harness.distributor,
+        stale_commitment_slot,
+        reward_slot_after_second_commit,
+        harness.funder.puzzle_hash,
+    );
+
+    match clawback {
+        Err(RewardsError::DriverShareNotRepresentable {
+            rewards_base_units,
+            withdrawal_share_bps,
+        }) => {
+            assert_eq!(
+                rewards_base_units, large_commitment,
+                "the guard must judge the SUBSTITUTED commitment upstream will actually multiply \
+                 ({large_commitment}), not the caller's stale slot ({SMALL_COMMITMENT})"
+            );
+            assert_eq!(withdrawal_share_bps, WITHDRAWAL_SHARE_BPS);
+        }
+        Ok(paid) => panic!(
+            "the guard used the caller's stale, safe slot instead of the substituted one: \
+             {paid:?}"
+        ),
+        Err(other) => panic!("expected DriverShareNotRepresentable, got: {other}"),
+    }
+
+    Ok(())
+}
