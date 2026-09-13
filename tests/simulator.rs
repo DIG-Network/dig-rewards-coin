@@ -2573,29 +2573,51 @@ fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Res
     Ok(())
 }
 
-/// One-step composition, red-then-green regression for the triple gate's converged finding at
-/// PR #8 (`state.rs:433`): B2 must refuse a commitment above `MAX_REPORTABLE_COMMITMENT_BASE_UNITS`
-/// even when that commitment is created in the SAME distributor-coin spend as another
-/// reserve-affecting action -- never only across two separate, single-action generations, which is
-/// the shape `a_commitment_above_the_driver_bound_is_refused_by_the_reader` above uses and the
-/// shape that was never at risk (a commitment's own `rewards` is available to B2 the instant its
-/// CREATING generation is reconstructed, `state.rs:573`, regardless of what else shares that
-/// generation).
+/// One-spend BATCH composition, and the discriminating regression the triple gate required at
+/// PR #8: B2 must refuse a commitment above `MAX_REPORTABLE_COMMITMENT_BASE_UNITS` even when that
+/// commitment is created in the SAME distributor-coin spend as another reserve-affecting action --
+/// not only across two separate, single-action generations, which is the shape
+/// `a_commitment_above_the_driver_bound_is_refused_by_the_reader` above uses and the shape that was
+/// never at risk.
+///
+/// **Why the second action is an `AddEntry`, and why that choice is the whole point.** An earlier
+/// version of this test batched the commit with a withdraw of that same just-created commitment
+/// slot, and could not discriminate the guard at all: this crate's own slot bookkeeping removes a
+/// generation's SPENT slots before extending with its CREATED ones
+/// (`DistributorSlots::apply_generation`, `src/state.rs`), so ANY same-generation
+/// create-then-spend of one slot is refused as `RewardsError::Malformed` by that ordering alone,
+/// at any magnitude, with or without B2. A silently loosened B2 still passed it, so the assertion
+/// was only ever about which error came back, never about accept-versus-refuse.
+///
+/// The same trap catches a second commit chained onto the first one's pending reward slot --
+/// measured, not assumed: that shape fails with "a generation spends a reward slot this walk never
+/// saw created". `AddEntry` avoids it structurally: it CREATES an entry slot and spends none, so
+/// the only slot this generation spends is the first epoch's reward slot, which predates the
+/// generation. The bookkeeping backstop cannot fire, and the accept/refuse decision belongs to B2
+/// alone. Commenting out B2's loop in `src/state.rs` turns this test red with `Ok(Some(..))` -- a
+/// reader that HANDED ON the unrepresentable commitment as authenticated state -- rather than
+/// merely changing which error is returned. Verified by doing exactly that.
+///
+/// The same-generation commit-and-withdraw-of-the-same-slot composition is still built, for the
+/// separate premise that upstream accepts it and keeps the created slot in
+/// `created_commitment_slots`, by
+/// `a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend`
+/// below.
 ///
 /// `chia-sdk-driver` 0.36.0's action layer batches any number of actions into one distributor-coin
-/// spend (`reward_distributor.rs:699-747`), and this crate's own `commit_incentives_for_...` and
-/// the raw `RewardDistributorWithdrawIncentivesAction` builder both leave `finish_spend` to the
-/// caller, so the composition below is directly constructible with this repo's own API -- exactly
-/// as the PR review at `state.rs:433` described.
+/// spend (`reward_distributor.rs:699-747`), and this crate's own
+/// `commit_incentives_for_distributor_epoch` and `add_entry` both leave `finish_spend` to the
+/// caller, so the composition below is directly constructible with this repo's own public API.
 ///
 /// Debug-safe on purpose: `committed_base_units` sits just above the READ bound
 /// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`, `u64::MAX / 10_000`) but stays under the DRIVER's own
-/// overflow bound (`u64::MAX / WITHDRAWAL_SHARE_BPS`, i.e. `/ 9_000`), so the raw withdraw spend
-/// built here does not panic even without `--release` -- proving the generic B2 bound catches a
-/// commitment DIG's own 9_000 bps table could still have paid out, not merely one already broken
-/// by the driver's own overflow.
+/// overflow bound (`u64::MAX / WITHDRAWAL_SHARE_BPS`, i.e. `/ 9_000`), so nothing in this fixture
+/// panics without `--release` -- proving the generic B2 bound catches a commitment DIG's own
+/// 9_000 bps table could still have paid out, not merely one already broken by the driver's own
+/// overflow.
 #[test]
-fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::Result<()> {
+fn a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader(
+) -> anyhow::Result<()> {
     // One base unit above the read bound; derived, never spelled, so a mutation of
     // MAX_REPORTABLE_COMMITMENT_BASE_UNITS in src/ cannot survive unnoticed here.
     let committed_base_units = MAX_REPORTABLE_COMMITMENT_BASE_UNITS + 1;
@@ -2613,9 +2635,9 @@ fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::R
 
     let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
 
-    // CommitIncentives -- above the read bound -- built directly against `harness.distributor`,
-    // deliberately NOT finished yet: the withdraw below must land in the SAME pending spend.
-    let secure_conditions = commit_incentives_for_distributor_epoch(
+    // Action 1 of the batch: the commitment above the read bound. Deliberately NOT finished --
+    // action 2 must land in the SAME pending spend.
+    let commit_conditions = commit_incentives_for_distributor_epoch(
         ctx,
         &mut harness.distributor,
         harness.first_epoch_slot.clone(),
@@ -2624,75 +2646,63 @@ fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::R
         committed_base_units,
     )?;
 
+    // Action 2: an entry-set write, in the SAME pending spend. It creates an entry slot and
+    // spends none, which is exactly what keeps the slot-bookkeeping backstop out of the case
+    // under test.
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write_time = last_update(&harness.distributor);
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        write_time,
+    )?;
+
+    assert_eq!(
+        harness.distributor.pending_spend.logs.len(),
+        2,
+        "the fixture only tests batching if BOTH actions landed in one pending spend"
+    );
+    assert!(
+        harness
+            .distributor
+            .pending_spend
+            .spent_commitment_slots
+            .is_empty()
+            && harness
+                .distributor
+                .pending_spend
+                .spent_entry_slots
+                .is_empty(),
+        "this generation must spend no slot it also creates, or the slot-bookkeeping backstop -- \
+         not B2 -- would be what refuses this read"
+    );
+
     let hint = ctx.hint(harness.funder.puzzle_hash)?;
     let change = harness.source_cat.coin.amount - committed_base_units;
     let source_cat_spend = CatSpend::new(
         harness.source_cat,
         StandardLayer::new(harness.funder.pk).spend_with_conditions(
             ctx,
-            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+            commit_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
         )?,
     );
     harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
-
-    let reward_slots: Vec<Slot<RewardDistributorRewardSlotValue>> = harness
-        .distributor
-        .pending_spend
-        .created_reward_slots
-        .iter()
-        .map(|value| {
-            harness
-                .distributor
-                .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
-        })
-        .collect();
-    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
-
-    let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = harness
-        .distributor
-        .pending_spend
-        .created_commitment_slots
-        .first()
-        .copied()
-        .map(|value| {
-            harness
-                .distributor
-                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::COMMITMENT)
-        })
-        .expect("the commit above created a commitment slot");
-
-    // WithdrawIncentives of that SAME just-created slot, built directly against the raw driver
-    // action -- deliberately bypassing `withdraw_committed_incentives`'s own pre-guard, because
-    // the question here is what B2 (the READER) does with a spend already on chain, not whether
-    // this crate's own clawback entry point would have refused first.
-    let mut distributor = harness.distributor.clone();
-    let (withdraw_conditions, driver_reported) = distributor
-        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
-        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
-    harness.distributor = distributor;
-
-    // Sanity: at this scale the driver's own multiply has NOT wrapped -- this composition proves
-    // B2 catches a commitment the driver itself could still pay correctly, not merely one already
-    // broken elsewhere.
-    let expected_share =
-        u64::try_from(u128::from(committed_base_units) * u128::from(WITHDRAWAL_SHARE_BPS) / 10_000)
-            .expect("stays in u64 at this scale");
-    assert_eq!(
-        driver_reported, expected_share,
-        "this fixture only proves what B2 alone catches if the driver has NOT already misreported"
-    );
-
-    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
-    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, withdraw_conditions)?;
 
     harness.distributor = harness
         .distributor
         .clone()
         .finish_spend(ctx, vec![source_cat_spend])?
         .0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
     harness
         .sim
         .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
     members.push(harness.distributor.coin.coin_id());
     extras.push(harness.distributor.reserve.coin.coin_id());
 
@@ -2709,12 +2719,13 @@ fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::R
             );
             assert_eq!(
                 rewards_base_units, committed_base_units,
-                "the refusal must name the commitment's own recorded rewards, even though this \
-                 generation ALSO contains a withdraw of that same slot"
+                "the refusal must name the commitment slot's own recorded rewards, read off the \
+                 generation that created it even though another action shares that generation"
             );
         }
         Ok(Some(snapshot)) => panic!(
-            "B2 let a same-generation commit+withdraw through: {:?}",
+            "B2 let an out-of-bounds commitment through when it shared a generation with a \
+             second action: {:?}",
             snapshot.rewards_per_distributor_epoch()
         ),
         Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
@@ -2727,7 +2738,8 @@ fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::R
 /// Discriminating regression for dig_ecosystem#3313's remedy: a one-spend commit+withdraw
 /// composition whose `committed_value` is above the DRIVER's OWN overflow bound
 /// (`u64::MAX / WITHDRAWAL_SHARE_BPS`) -- not merely the READ bound
-/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`) that `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`
+/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`) that
+/// `a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader`
 /// above already proves B2 catches. At THIS scale, `chia-sdk-driver` 0.36.0's own
 /// `committed_value * withdrawal_share_bps` multiply (`withdraw_incentives.rs:71`) overflows
 /// INSIDE `RewardDistributor::from_spend`, before B2 -- which only runs once `from_spend`

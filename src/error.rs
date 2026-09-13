@@ -156,7 +156,7 @@ pub enum RewardsError {
     /// slot shares it.** An earlier version of this doc claimed a slot could never be created and
     /// withdrawn in the same singleton spend; that is false (see `src/state.rs`'s
     /// `read_distributor` docs and `tests/simulator.rs`'s
-    /// `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`) — the two actions can
+    /// `a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader`) — the two actions can
     /// share one spend, and this check still catches it because it reads
     /// `created_commitment_slots` on `from_spend`'s return, before this walk advances to any later
     /// generation, independent of what else shared the spend. What this bound does NOT close is a

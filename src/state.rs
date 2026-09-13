@@ -862,18 +862,27 @@ fn refuse_unrepresentable_action_arithmetic(
 ///    boundaries. `CommitIncentives::get_log` performs no multiply at all, so the generation that
 ///    creates a commitment slot parses safely at any scale and hands this walk the slot's `rewards`
 ///    directly, with no risk of the panic B2 exists to avoid.
-/// 2. **B2 still catches a same-generation commit+withdraw, because it checks at the CREATING
-///    generation regardless of what else shares it -- not because that composition is impossible.**
-///    An earlier version of this doc-comment claimed a slot could never be created and withdrawn in
-///    the same distributor spend (reasoning from `assert_concurrent_puzzle`,
+/// 2. **B2 checks at the CREATING generation, so batching cannot hide a commitment from it.**
+///    B2 reads `created_commitment_slots[].rewards` as soon as a generation is reconstructed, on
+///    the RETURN path of `from_spend` and before this walk moves on, so it is indifferent to how
+///    many other actions share that generation. `tests/simulator.rs`'s
+///    `a_commitment_above_the_bound_batched_with_another_action_is_refused_by_the_reader` proves
+///    exactly that and nothing weaker: its generation carries the over-bound commit together with
+///    an entry-set write, spends no slot it also creates, and with B2 commented out the reader
+///    returns `Ok(Some(..))` carrying the unrepresentable commitment.
+///
+///    An earlier version of this doc-comment claimed a slot could never be created and withdrawn
+///    in the same distributor spend (reasoning from `assert_concurrent_puzzle`,
 ///    `withdraw_incentives.rs:120`, requiring the commitment slot to already exist as a spendable
-///    coin). That claim is false: upstream does not net a same-spend created-and-spent commitment
-///    slot out of `pending_spend.created_commitment_slots`, so the composition IS constructible and
-///    IS accepted on chain -- proved by `tests/simulator.rs`'s
-///    `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`. B2 still refuses it, because
-///    it reads `created_commitment_slots[].rewards` as soon as that generation is reconstructed,
-///    on the RETURN path of `from_spend` -- before this walk moves to any later generation --
-///    regardless of whether a withdraw of that same slot also shares the generation.
+///    coin). That claim is false: the composition IS constructible through this crate's own public
+///    API and IS accepted by the simulator --
+///    `a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend`
+///    builds and submits one. This reader refuses it either way, but note WHICH check does the
+///    refusing: `DistributorSlots::apply_generation` removes a generation's spent slots before
+///    extending with its created ones, so a create-then-spend of one commitment slot inside one
+///    generation is refused as `Malformed` by slot bookkeeping alone, at any magnitude. That
+///    backstop is orthogonal to B2's bound, which is why no test asserts B2's value on that
+///    shape -- a test in that shape could only ever discriminate which error came back.
 ///
 /// **Closed for the reachable sites (DIG-Network/dig_ecosystem#3313):** B2 only runs once
 /// `from_spend` RETURNS. `chia-sdk-driver` 0.36.0's withdraw action re-derives the share with a
@@ -896,7 +905,7 @@ fn refuse_unrepresentable_action_arithmetic(
 ///
 /// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
 /// the bound is checked against the slot bookkeeping this walk already reconstructs
-/// ([`DistributorSlots::apply_generation`]'s `created_commitments`), never against the reserve
+/// (`DistributorSlots::apply_generation`'s `created_commitments`), never against the reserve
 /// coin, so nothing about how many other actions share the generation changes what B2 sees.
 ///
 pub fn read_distributor(
