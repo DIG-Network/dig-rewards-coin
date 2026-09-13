@@ -702,11 +702,17 @@ fn refuse_unrepresentable_action_arithmetic(
             // own full-puzzle output). This pre-screen does not replay prior actions' full
             // puzzles -- doing so would duplicate `from_spend` itself -- so it always supplies
             // `NodePtr::NIL` here. For an unstake that is its generation's first (or only) action
-            // this is the exact correct value. For a later action, a wrong `ephemeral_state`
-            // makes the unlock puzzle's own internal checks fail, which this pre-screen maps to a
-            // refusal (`RewardsError::Driver`/`Malformed`) rather than a wrong `removed_shares` --
-            // an over-refusal on a legitimate multi-action generation, the only direction this
-            // reader may fail in, never an under-refusal.
+            // this is the exact correct value.
+            //
+            // For a later action the value is wrong, and the guard rests on a wrong value being
+            // FAIL-CLOSED. That is MEASURED, not argued:
+            // `a_non_nil_ephemeral_state_makes_the_unlock_puzzle_raise` runs the real CAT
+            // unlocking puzzle with a bare atom and with a `(state . conditions)` cons pair, and
+            // the puzzle RAISES on both -- reaching this reader as `RewardsError::Driver`, a
+            // refusal, never a different `removed_shares` silently believed. The residual, stated
+            // plainly: that is evidence for the shapes tested, not a proof over every possible
+            // ephemeral value. The failure direction it leaves is an over-refusal on a legitimate
+            // multi-action generation, which is the only direction this reader may fail in.
             let unlock_puzzle = RewardDistributorUnstakeAction::unlock_puzzle(
                 ctx,
                 constants.launcher_id,
@@ -1895,6 +1901,93 @@ mod tests {
             panic!(
                 "an honest two-epoch backfill under DIG's own real constants must be admitted, \
                  not refused by a cap that evaluates to zero at those exact constants: {refusal}"
+            );
+        }
+    }
+
+    /// The pre-screen supplies `NodePtr::NIL` as the unstake unlock puzzle's `ephemeral_state`
+    /// (`refuse_unrepresentable_action_arithmetic`), because replaying prior actions' full puzzles
+    /// would duplicate `from_spend` itself. For a generation's FIRST action that is the exact
+    /// value upstream seeds; for a later action it is wrong, and the whole guard rests on a wrong
+    /// value being FAIL-CLOSED -- a raise or an unchanged figure, never a different
+    /// `removed_shares` silently believed.
+    ///
+    /// This RUNS the real `chia-sdk-driver` 0.36.0 CAT unlocking puzzle to settle it, rather than
+    /// arguing from compiled bytes nobody in this repo can read. Two ephemeral values stand in for
+    /// a prior action's own output: a bare atom, and the `(state . conditions)` cons pair an
+    /// action's full-puzzle output actually has. Measured result: the puzzle RAISES on both. A
+    /// raise reaches this reader as `RewardsError::Driver`, which is a refusal.
+    ///
+    /// **What this proves and what it does not.** For the shapes exercised here the puzzle refuses
+    /// rather than returning a different `cat_shares`, so the pre-screen never screens a fabricated
+    /// figure. It is not a proof over every possible ephemeral value, and this crate does not claim
+    /// one -- an unstake that is not its generation's first action is over-refused, which is the
+    /// only direction this reader may fail in.
+    #[test]
+    fn a_non_nil_ephemeral_state_makes_the_unlock_puzzle_raise() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let payout_puzzle_hash = some_identity();
+        let distributor_type = RewardDistributorType::Cat {
+            asset_id: some_identity(),
+            hidden_puzzle_hash: None,
+        };
+        let removed_shares = 5u64;
+        let unlock_puzzle_solution =
+            chia_sdk_types::puzzles::RewardDistributorCatUnlockingPuzzleSolution {
+                cat_parent_id: some_identity(),
+                cat_amount: removed_shares,
+                cat_shares: removed_shares,
+                cat_maker_solution_rest: (),
+            };
+
+        let unlock_puzzle =
+            RewardDistributorUnstakeAction::unlock_puzzle(ctx, launcher_id, distributor_type)
+                .expect("the unlock puzzle always builds for a Cat distributor");
+
+        let solution_for = |ctx: &mut SpendContext, ephemeral_state: NodePtr| {
+            ctx.alloc(&clvm_tuple!(
+                ephemeral_state,
+                clvm_tuple!(payout_puzzle_hash, unlock_puzzle_solution.clone())
+            ))
+            .expect("a well-formed unlock solution always allocates")
+        };
+
+        // The baseline the pre-screen relies on: NIL is a generation's first action's real value,
+        // and the puzzle returns the solution's own `cat_shares` for it.
+        let nil_solution = solution_for(ctx, NodePtr::NIL);
+        let nil_output = ctx
+            .run(unlock_puzzle, nil_solution)
+            .expect("NIL is the correct ephemeral state for a generation's first action");
+        let (nil_shares, _) = ctx
+            .extract::<(u64, NodePtr)>(nil_output)
+            .expect("the unlock puzzle returns (removed_shares . rest)");
+        assert_eq!(
+            nil_shares, removed_shares,
+            "NIL must remain the correct ephemeral state for a generation's first action, or the \
+             pre-screen is screening the wrong number even in the case it is exactly right for"
+        );
+
+        let bare_atom = ctx.alloc(&1u64).expect("an atom always allocates");
+        let state_and_conditions = ctx
+            .alloc(&clvm_tuple!(NodePtr::NIL, NodePtr::NIL))
+            .expect("a cons pair always allocates");
+
+        for (label, ephemeral_state) in [
+            ("a bare atom", bare_atom),
+            ("a (state . conditions) cons pair", state_and_conditions),
+        ] {
+            let solution = solution_for(ctx, ephemeral_state);
+            let outcome = ctx
+                .run(unlock_puzzle, solution)
+                .ok()
+                .and_then(|output| ctx.extract::<(u64, NodePtr)>(output).ok())
+                .map(|(shares, _)| shares);
+            assert!(
+                outcome.is_none(),
+                "with {label} as the ephemeral state the unlock puzzle returned \
+                 {outcome:?} instead of raising -- the pre-screen's NIL would then be screening a \
+                 figure the real generation never produced"
             );
         }
     }
