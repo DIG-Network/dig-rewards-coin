@@ -195,7 +195,7 @@ pub enum RewardsError {
 
     /// One of the unchecked `u64` (or `i128`) arithmetic sites inside `chia-sdk-driver` 0.36.0's
     /// action `get_log` methods (`withdraw_incentives.rs:71`, `:89`, `commit_incentives.rs:85`,
-    /// `:101`, `unstake.rs:235`, `stake.rs:326`, `:329`) would overflow on the operands this
+    /// `:101`, `:111`, `unstake.rs:235`, `stake.rs:326`, `:329`) would overflow on the operands this
     /// generation's own action solution carries (or, for `unstake`/`stake`, on a value the
     /// solution's own locked/unlocked CAT or NFT commitment authenticates), before
     /// `RewardDistributor::from_spend` ever returns to let this crate's own B1/B2 guards run.
@@ -215,9 +215,9 @@ pub enum RewardsError {
         action: &'static str,
         /// Which operation would overflow (`"committed_value * withdrawal_share_bps"`,
         /// `"reward_slot_total_rewards - withdrawal_share"`, `"slot_total_rewards +
-        /// rewards_to_add"`, `"slot_epoch_time + epoch_seconds"`, `"entry_slot.shares -
-        /// removed_shares"`, `"existing_slot_counter + 1"` or `"existing_slot_shares +
-        /// new_shares"`).
+        /// rewards_to_add"`, `"slot_epoch_time + epoch_seconds"`, `"start_epoch_time +
+        /// iterations * epoch_seconds"`, `"entry_slot.shares - removed_shares"`,
+        /// `"existing_slot_counter + 1"` or `"existing_slot_shares + new_shares"`).
         operation: &'static str,
     },
 
@@ -274,17 +274,39 @@ pub enum RewardsError {
     /// hostile launcher supplies, large enough that no plausible honest gap in real incentive
     /// commitments comes close (at DIG's own one-week epoch it is roughly nineteen thousand
     /// years), while still bounding the `RewardDistributorRewardSlotValue` structs this reader's
-    /// own memory must hold for one action to a few tens of megabytes at most.
+    /// own memory must hold to a few tens of megabytes at most.
+    ///
+    /// **It is a budget for a whole generation, not a ceiling for one action.** A generation's
+    /// `ActionLayerSolution::action_spends` is a plain `Vec<Spend>`
+    /// (`chia-sdk-driver-0.36.0/src/layers/action_layer/action_layer.rs:42`) whose length nothing
+    /// bounds, here or upstream, and `ActionLayer::parse_solution` resolves repeated selectors
+    /// through one CACHED Merkle proof (`action_layer.rs:255-272`), so a single leaf can be spent
+    /// arbitrarily many times in one generation. A `commit_incentives` action's on-chain CLVM cost
+    /// does not scale with its backfill gap -- only the off-chain `get_log` reconstruction does --
+    /// so a per-action ceiling would let one cheaply-mined spend force every reader to materialise
+    /// `action_spends.len()` times the cap. This reader therefore CONSUMES the budget as it walks
+    /// the generation's actions and refuses when an action asks for more than is left, which is
+    /// why the refusal names the two operands of what remains rather than a single count.
+    ///
+    /// `action_spends.len()` itself is deliberately NOT refused separately: an action that
+    /// backfills nothing allocates nothing, so a length bound would name no hazard this budget
+    /// does not already cover, and would refuse honest callers for nothing.
     #[error(
-        "commit_incentives action would backfill {iterations} reward slots, exceeding the \
-         {max_backfill_slots} this reader will construct for one action -- refusing rather than \
-         risking unbounded CPU/memory (#3313)"
+        "a commit_incentives action would backfill {iterations} reward slots on top of the \
+         {already_committed} this generation's earlier actions already committed, exceeding \
+         the {max_backfill_slots} this reader will construct for one generation -- refusing \
+         rather than risking unbounded CPU/memory (#3313)"
     )]
     CommitIncentivesBackfillBoundExceeded {
-        /// The real backfill iteration count upstream's loop would run: the CEILING of
-        /// `epoch_start - (slot_epoch_time + epoch_seconds)` over `epoch_seconds`.
+        /// The real backfill iteration count upstream's loop would run for THIS action: the
+        /// CEILING of `epoch_start - (slot_epoch_time + epoch_seconds)` over `epoch_seconds`.
         iterations: u64,
-        /// The fixed cap this reader enforces, independent of any distributor's own constants:
+        /// How much of the budget the same generation's EARLIER `commit_incentives` actions have
+        /// already consumed. Zero when this action is the generation's first backfilling one, so
+        /// a single-action refusal reads exactly as it did when the cap was per-action.
+        already_committed: u64,
+        /// The fixed per-generation budget this reader enforces, independent of any distributor's
+        /// own constants:
         /// [`MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS`](crate::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS).
         max_backfill_slots: u64,
     },

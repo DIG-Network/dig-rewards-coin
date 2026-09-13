@@ -579,6 +579,17 @@ fn refuse_unrepresentable_action_arithmetic(
     .ok()
     .map(|args| args.curry_tree_hash());
 
+    // `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` is a budget for the WHOLE generation, consumed as
+    // this walk goes, never a ceiling re-offered to every action in turn. `action_spends` is a
+    // plain `Vec<Spend>` (`action_layer.rs:42`) whose length nothing bounds here or upstream, and
+    // `parse_solution` resolves repeated selectors through one CACHED Merkle proof
+    // (`action_layer.rs:255-272`), so one leaf can be spent arbitrarily many times in a single
+    // generation. A `commit_incentives` action's on-chain CLVM cost does not scale with its
+    // backfill gap -- only the off-chain `get_log` reconstruction this pre-screen is protecting
+    // does -- so a per-action ceiling would let one cheaply-mined spend force every reader to
+    // materialise `action_spends.len()` times the cap. See
+    // `RewardsError::CommitIncentivesBackfillBoundExceeded`'s doc.
+    let mut backfill_slots_committed: u64 = 0;
     for action_spend in &action_layer_solution.action_spends {
         let raw_action_hash = ctx.tree_hash(action_spend.puzzle);
 
@@ -664,12 +675,42 @@ fn refuse_unrepresentable_action_arithmetic(
                     // own `iterations` figure a count no loop ever runs.
                     let iterations =
                         (params.epoch_start - start_epoch_time).div_ceil(constants.epoch_seconds);
-                    if iterations > max_backfill_slots {
+
+                    // The budget is consumed, not re-offered: what is left after the earlier
+                    // actions of THIS generation is what this action may spend. The subtraction
+                    // cannot underflow because the assignment below runs only when
+                    // `iterations <= budget_remaining`, so `backfill_slots_committed` is never
+                    // above `max_backfill_slots`.
+                    let budget_remaining = max_backfill_slots - backfill_slots_committed;
+                    if iterations > budget_remaining {
                         return Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                             iterations,
+                            already_committed: backfill_slots_committed,
                             max_backfill_slots,
                         });
                     }
+                    // Bounded above by `max_backfill_slots` by the refusal directly above, so this
+                    // add is representable without a check in every profile.
+                    backfill_slots_committed += iterations;
+
+                    // A count bound says nothing about the value being counted. Upstream's
+                    // `start_epoch_time += epoch_seconds` runs once per pass
+                    // (`commit_incentives.rs:101-111`) and nothing screens that addition, so the
+                    // loop's TERMINAL accumulator value must be representable as well as its
+                    // length. No iteration cap can stand in for this, because the count is
+                    // smallest exactly when the step is largest: at `epoch_seconds = u64::MAX / 2
+                    // + 1` a gap of one makes `iterations == 1`, passing any cap, while that
+                    // single advance overflows `u64` -- a panic where overflow checks are on
+                    // (`dig-node`, `dig-relay`) and, where they are off, a wrap to a value below
+                    // `end_epoch_time`, after which the loop never terminates and its `Vec` grows
+                    // without bound.
+                    iterations
+                        .checked_mul(constants.epoch_seconds)
+                        .and_then(|total_advance| start_epoch_time.checked_add(total_advance))
+                        .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                            action: "commit_incentives",
+                            operation: "start_epoch_time + iterations * epoch_seconds",
+                        })?;
                 }
             }
         } else if raw_action_hash == unstake_hash {
@@ -1642,15 +1683,34 @@ mod tests {
     /// Wraps one action puzzle+solution pair in the same `SingletonSolution` /
     /// `RawActionLayerSolution` scaffolding every pre-screen test above builds by hand, so the
     /// four hazard tests below don't have to repeat it a fourth and fifth time.
+    /// A coin spend whose action-layer solution carries ONE action spend. The one-element case of
+    /// [`repeated_action_spend`].
     fn single_action_spend(
         ctx: &mut SpendContext,
         action_puzzle: NodePtr,
         action_solution: NodePtr,
     ) -> CoinSpend {
+        repeated_action_spend(ctx, action_puzzle, vec![action_solution])
+    }
+
+    /// A coin spend whose action-layer solution carries one action spend per entry in
+    /// `action_solutions`, every one of them selecting the SAME action puzzle through the SAME
+    /// Merkle leaf. `ActionLayer::parse_solution` caches a selector's proof the first time it sees
+    /// it and reuses it for every later occurrence (`action_layer.rs:255-262`), so repeating one
+    /// leaf across a generation is something a real solution can do -- which is exactly why the
+    /// backfill bound has to be a per-generation budget rather than a per-action ceiling.
+    fn repeated_action_spend(
+        ctx: &mut SpendContext,
+        action_puzzle: NodePtr,
+        action_solutions: Vec<NodePtr>,
+    ) -> CoinSpend {
         let raw_action_layer_solution = chia_sdk_types::puzzles::RawActionLayerSolution {
             puzzles: vec![action_puzzle],
-            selectors_and_proofs: vec![(2, Some(chia_sdk_types::MerkleProof::new(0, vec![])))],
-            solutions: vec![action_solution],
+            selectors_and_proofs: action_solutions
+                .iter()
+                .map(|_| (2, Some(chia_sdk_types::MerkleProof::new(0, vec![]))))
+                .collect(),
+            solutions: action_solutions,
             finalizer_solution: ctx
                 .alloc(&())
                 .expect("the empty finalizer solution allocates"),
@@ -1803,8 +1863,14 @@ mod tests {
         match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
             Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
                 iterations,
+                already_committed,
                 max_backfill_slots,
             }) => {
+                assert_eq!(
+                    already_committed, 0,
+                    "one action in this generation, so no earlier action can have consumed \
+                     any of the per-generation budget"
+                );
                 assert_eq!(
                     max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
                     "the cap must be the fixed, named constant, not a re-derived value"
@@ -1817,6 +1883,201 @@ mod tests {
             }
             Ok(()) => panic!(
                 "the pre-screen let a commit_incentives backfill through past its own fixed cap"
+            ),
+            Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
+        }
+    }
+
+    /// `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` bounds the backfill loop's ITERATION COUNT. It does
+    /// not bound that loop's ACCUMULATOR: upstream advances `start_epoch_time += epoch_seconds`
+    /// once per pass (`commit_incentives.rs:101-111`) and nothing screens that addition. The count
+    /// is smallest exactly when the step is largest, so the fixed cap is no protection at all in
+    /// the dangerous direction.
+    ///
+    /// This input has `iterations == 1`, so it passes the fixed cap untouched -- which is
+    /// precisely what makes it discriminate the accumulator bound from the count bound; the cap
+    /// test above cannot reach it. With a step of `u64::MAX / 2 + 1` the single advance carries
+    /// `start_epoch_time` to `2^64`: a PANIC in an overflow-checked build (dig-node, dig-relay)
+    /// and, with overflow checks off (dig-app, release), a wrap to `0` after which
+    /// `end_epoch_time > start_epoch_time` holds forever -- a non-terminating loop growing an
+    /// unbounded `Vec`. The refusal must therefore bound the accumulator's TERMINAL value,
+    /// `start_epoch_time + iterations * epoch_seconds`, not merely the number of advances.
+    #[test]
+    fn a_commit_incentives_backfill_whose_accumulator_overflows_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        // Written as a derivation from `u64::MAX`, never a decimal literal (SPEC 0.1 clause 5e):
+        // the largest step for which the pre-screen's own initial `slot_epoch_time +
+        // epoch_seconds` is still representable from `slot_epoch_time = 0`, so the input reaches
+        // the iteration count at all instead of being stopped by the earlier add.
+        let epoch_seconds = u64::MAX / 2 + 1;
+        let max_seconds_offset = 300u64;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            max_seconds_offset,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let slot_epoch_time = 0u64;
+        // `start_epoch_time = 0 + epoch_seconds`; one past it, so the gap is `1` and
+        // `1.div_ceil(epoch_seconds) == 1` -- a single loop pass, far under the fixed cap.
+        let epoch_start = epoch_seconds
+            .checked_add(1)
+            .expect("one past the step is representable while the step is under u64::MAX");
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                    slot_counter: 0,
+                    slot_epoch_time,
+                    slot_next_epoch_initialized: false,
+                    slot_total_rewards: 0,
+                    epoch_start,
+                    clawback_ph: some_identity(),
+                    rewards_to_add: 1,
+                },
+            )
+            .expect("a well-formed commit solution always allocates");
+
+        let spend = single_action_spend(ctx, action_puzzle, action_solution);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "commit_incentives");
+                assert_eq!(operation, "start_epoch_time + iterations * epoch_seconds");
+            }
+            Ok(()) => panic!(
+                "the pre-screen admitted a backfill whose one advance overflows the loop's own \
+                 accumulator -- a panic in a checked build, a non-terminating loop in release"
+            ),
+            Err(RewardsError::CommitIncentivesBackfillBoundExceeded { iterations, .. }) => panic!(
+                "the ITERATION cap fired ({iterations} iterations), so this input no longer \
+                 discriminates the accumulator bound from the count bound"
+            ),
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
+    }
+
+    /// The backfill bound has to be a per-generation BUDGET, not a per-action ceiling. A
+    /// generation's `action_spends` is a plain `Vec<Spend>` with no length bound in this crate or
+    /// in `chia-sdk-driver` 0.36.0, and the same Merkle leaf may be selected repeatedly
+    /// (`action_layer.rs:255-272` caches a selector's proof), while a `commit_incentives` action's
+    /// on-chain CLVM cost does not scale with its backfill gap -- so a ceiling re-offered to every
+    /// action lets one cheaply-mined spend force this reader to materialise `action_spends.len()`
+    /// times the cap in `RewardDistributorRewardSlotValue` structs.
+    ///
+    /// Every action here is individually WELL under the cap, so the per-action form of this check
+    /// admits all of them; only a consumed budget refuses. That is what makes this discriminate
+    /// the aggregate guard from the count guard.
+    #[test]
+    fn commit_incentives_actions_summing_past_the_budget_are_refused_even_though_each_fits() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        // `epoch_seconds = 1` only so a large iteration count is reachable with small solution
+        // fields; the budget is absolute, so no distributor constant moves it.
+        let epoch_seconds = 1u64;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            300,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        // Derived from the budget, never spelled as a literal (SPEC 0.1 clause 5e): just over
+        // half of it, so ONE action is admitted and TWO are not.
+        let iterations_per_action = MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS / 2 + 1;
+        let slot_epoch_time = 0u64;
+        // `start_epoch_time = slot_epoch_time + epoch_seconds = 1`, and with a step of `1` the gap
+        // IS the iteration count.
+        let epoch_start = slot_epoch_time
+            .checked_add(epoch_seconds)
+            .and_then(|start| start.checked_add(iterations_per_action))
+            .expect("a gap just over half the budget is representable");
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+        let action_solutions = (0..2)
+            .map(|_| {
+                ctx.alloc(
+                    &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                        slot_counter: 0,
+                        slot_epoch_time,
+                        slot_next_epoch_initialized: false,
+                        slot_total_rewards: 0,
+                        epoch_start,
+                        clawback_ph: some_identity(),
+                        rewards_to_add: 1,
+                    },
+                )
+                .expect("a well-formed commit solution always allocates")
+            })
+            .collect::<Vec<_>>();
+
+        let spend = repeated_action_spend(ctx, action_puzzle, action_solutions);
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::CommitIncentivesBackfillBoundExceeded {
+                iterations,
+                already_committed,
+                max_backfill_slots,
+            }) => {
+                assert_eq!(
+                    max_backfill_slots, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS,
+                    "the budget must be the fixed, named constant, not a re-derived value"
+                );
+                assert_eq!(
+                    iterations, iterations_per_action,
+                    "the refusal must name the real iteration count of the refused action"
+                );
+                assert_eq!(
+                    already_committed, iterations_per_action,
+                    "the refusal must name what the generation's earlier action already spent -- \
+                     a non-zero figure here is the whole point of a budget"
+                );
+                assert!(
+                    iterations < max_backfill_slots,
+                    "each action must be individually UNDER the budget, or this test cannot tell \
+                     an aggregate bound from a per-action ceiling"
+                );
+            }
+            Ok(()) => panic!(
+                "the pre-screen admitted a generation whose commit_incentives actions sum past \
+                 the budget -- one cheap spend, unbounded reward-slot allocation"
             ),
             Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
         }
