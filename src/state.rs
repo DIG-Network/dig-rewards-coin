@@ -665,17 +665,24 @@ fn refuse_unrepresentable_action_arithmetic(
 ///    on the RETURN path of `from_spend` -- before this walk moves to any later generation --
 ///    regardless of whether a withdraw of that same slot also shares the generation.
 ///
-/// **Known residual, not yet closed (tracked live, not a debug-only footnote): DIG-Network/dig_ecosystem#3313.**
-/// B2 only runs once `from_spend` RETURNS. `chia-sdk-driver` 0.36.0's withdraw action re-derives the
-/// share with a plain, unchecked `u64` multiply (`withdraw_incentives.rs:71`) that runs INSIDE
-/// `from_spend`, ahead of B2. For a one-spend commit+withdraw composition whose `committed_value`
-/// exceeds the driver's OWN overflow bound (`u64::MAX / withdrawal_share_bps` -- a narrower bound
-/// than [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] whenever `withdrawal_share_bps > 10_000`
-/// is not in play, and reachable well below it too for large `withdrawal_share_bps`), that multiply
-/// overflows before B2 ever runs. Both `dig-node` and `dig-relay` ship `overflow-checks = true` in
-/// their release profile, so this is a live remote denial of service on `read_distributor` in
-/// production, not merely in `cargo test`. See #3313 for the reachability argument and remedy
-/// options; this doc will be updated once a fix lands.
+/// **Closed for the reachable sites (DIG-Network/dig_ecosystem#3313):** B2 only runs once
+/// `from_spend` RETURNS. `chia-sdk-driver` 0.36.0's withdraw action re-derives the share with a
+/// plain, unchecked `u64` multiply (`withdraw_incentives.rs:71`) that runs INSIDE `from_spend`,
+/// ahead of B2. For a one-spend commit+withdraw composition whose `committed_value` exceeds the
+/// driver's OWN overflow bound (`u64::MAX / withdrawal_share_bps` -- a narrower bound than
+/// [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] whenever `withdrawal_share_bps > 10_000` is not
+/// in play, and reachable well below it too for large `withdrawal_share_bps`), that multiply would
+/// overflow before B2 ever runs. `refuse_unrepresentable_action_arithmetic` closes exactly this
+/// gap: it screens every generation's action-layer solution BEFORE `from_spend` is called on it,
+/// at the three sites `chia-sdk-driver` 0.36.0 computes from an action solution's own fields ahead
+/// of B1/B2 (`withdraw_incentives.rs:71,89`, `commit_incentives.rs:85`), and refuses outright on an
+/// action puzzle hash it does not recognise. It is a shim with an exit, not a permanent restatement
+/// of upstream's arithmetic (see its own doc comment, and
+/// <https://github.com/xch-dev/chia-wallet-sdk/issues/436> for the durable fix), and it makes no
+/// claim about `commit_incentives.rs:82` or `new_epoch.rs:124` -- see that doc comment for why.
+/// Both `dig-node` and `dig-relay` ship `overflow-checks = true` in their release profile, so before
+/// this pre-screen existed, a generation at this scale was a live remote denial of service on
+/// `read_distributor` in production, not merely in `cargo test`.
 ///
 /// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
 /// the bound is checked against the slot bookkeeping this walk already reconstructs
