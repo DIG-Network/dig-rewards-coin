@@ -415,9 +415,7 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 ///   reconstructed, if that slot's own recorded `rewards` exceeds
 ///   [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] (`u64::MAX / 10_000`).
 ///
-/// Together they make `committed_value * withdrawal_share_bps <= u64::MAX` for every withdraw
-/// action `from_spend` reconstructs, and the subtraction at `withdraw_incentives.rs:89` safe with
-/// it, because:
+/// Together they keep a wrong figure from ever being RETURNED to a caller of this walk, because:
 ///
 /// 1. **B2 bounds the quantity itself, not a proxy for it.** An earlier version of this guard
 ///    bounded a high-water mark of the reserve COIN's amount instead, on the premise that a
@@ -430,13 +428,30 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 ///    boundaries. `CommitIncentives::get_log` performs no multiply at all, so the generation that
 ///    creates a commitment slot parses safely at any scale and hands this walk the slot's `rewards`
 ///    directly, with no risk of the panic B2 exists to avoid.
-/// 2. A withdraw is always in a **strictly later** generation than the slot it withdraws: upstream's
-///    withdraw action asserts `assert_concurrent_puzzle(commitment_slot.coin.puzzle_hash)`
-///    (`withdraw_incentives.rs:120`), so the commitment slot must already exist on chain as a
-///    spendable coin. A slot created in the same distributor spend does not, so commit and
-///    withdraw of one commitment can never share a generation -- meaning B2, checked at the
-///    creating generation, is always ahead of any generation that could reach the unchecked
-///    multiply for that slot.
+/// 2. **B2 still catches a same-generation commit+withdraw, because it checks at the CREATING
+///    generation regardless of what else shares it -- not because that composition is impossible.**
+///    An earlier version of this doc-comment claimed a slot could never be created and withdrawn in
+///    the same distributor spend (reasoning from `assert_concurrent_puzzle`,
+///    `withdraw_incentives.rs:120`, requiring the commitment slot to already exist as a spendable
+///    coin). That claim is false: upstream does not net a same-spend created-and-spent commitment
+///    slot out of `pending_spend.created_commitment_slots`, so the composition IS constructible and
+///    IS accepted on chain -- proved by `tests/simulator.rs`'s
+///    `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`. B2 still refuses it, because
+///    it reads `created_commitment_slots[].rewards` as soon as that generation is reconstructed,
+///    on the RETURN path of `from_spend` -- before this walk moves to any later generation --
+///    regardless of whether a withdraw of that same slot also shares the generation.
+///
+/// **Known residual, not yet closed (tracked live, not a debug-only footnote): DIG-Network/dig_ecosystem#3313.**
+/// B2 only runs once `from_spend` RETURNS. `chia-sdk-driver` 0.36.0's withdraw action re-derives the
+/// share with a plain, unchecked `u64` multiply (`withdraw_incentives.rs:71`) that runs INSIDE
+/// `from_spend`, ahead of B2. For a one-spend commit+withdraw composition whose `committed_value`
+/// exceeds the driver's OWN overflow bound (`u64::MAX / withdrawal_share_bps` -- a narrower bound
+/// than [`crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS`] whenever `withdrawal_share_bps > 10_000`
+/// is not in play, and reachable well below it too for large `withdrawal_share_bps`), that multiply
+/// overflows before B2 ever runs. Both `dig-node` and `dig-relay` ship `overflow-checks = true` in
+/// their release profile, so this is a live remote denial of service on `read_distributor` in
+/// production, not merely in `cargo test`. See #3313 for the reachability argument and remedy
+/// options; this doc will be updated once a fix lands.
 ///
 /// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
 /// the bound is checked against the slot bookkeeping this walk already reconstructs
@@ -565,11 +580,15 @@ pub fn read_distributor(
         };
 
         // B2 (scale domain), composed with B1 above: refuse as soon as a commitment slot's own
-        // `rewards` is observed being created, rather than waiting for a later generation to name
-        // it in a withdraw -- the generation that WOULD reach the unchecked multiply is always
-        // strictly later (see this function's docs, point 2), so this refusal always lands first.
-        // `CommitIncentives::get_log` performs no multiply, so reading `rewards` here risks no
-        // panic of its own.
+        // `rewards` is observed being created -- whether a withdraw of that same slot shares this
+        // generation or waits for a later one (see this function's docs, point 2: a same-generation
+        // commit+withdraw IS constructible, and this check still catches it because it reads
+        // `created_commitment_slots` on the RETURN path, before this walk advances). Reading
+        // `rewards` here risks no panic of its own, because `CommitIncentives::get_log` performs no
+        // multiply -- but a same-generation WITHDRAW's own multiply can still run, and overflow,
+        // BEFORE this check gets a chance to refuse, if `rewards` exceeds the driver's own bound
+        // (`u64::MAX / withdrawal_share_bps`). That residual is open, not closed here: see this
+        // function's docs and DIG-Network/dig_ecosystem#3313.
         for created_commitment in &reconstructed.pending_spend.created_commitment_slots {
             if created_commitment.rewards > crate::MAX_REPORTABLE_COMMITMENT_BASE_UNITS {
                 return Err(RewardsError::CommitmentRewardsTooLargeToRead {

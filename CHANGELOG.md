@@ -34,11 +34,15 @@ This project adheres to [Semantic Versioning](https://semver.org) and
     returned figure against `recoverable_base_units`, refusing on disagreement
     (`DriverShareDisagrees`).
   - `read_distributor` refuses `withdrawal_share_bps > 10_000` read off the launch constants
-    (`UnreadableDistributorConstants`) and refuses a generation whose reserve high-water mark
-    exceeds `u64::MAX / 10_000` (`DistributorReserveTooLargeToRead`). Both are **errors**, never
-    `Ok(None)`. Without them a read panicked in a checked build -- a remote denial of service on
-    every caller of the public reader, reachable from unauthenticated chain input with DIG's own
-    9_000 bps and a large enough commitment -- or, in release, reconstructed a fabricated
+    (`UnreadableDistributorConstants`), and refuses a generation as soon as it CREATES a commitment
+    slot whose own recorded `rewards` exceeds `MAX_REPORTABLE_COMMITMENT_BASE_UNITS`
+    (`u64::MAX / 10_000`, `CommitmentRewardsTooLargeToRead`) -- bounding the committed value
+    directly, not the reserve coin's amount, because upstream can batch a `CommitIncentives` with
+    other reserve-affecting actions into one distributor-coin spend, so the reserve amount after a
+    generation reflects only that generation's net effect. Both are **errors**, never `Ok(None)`.
+    Without them a read panicked in a checked build -- a remote denial of service on every caller
+    of the public reader, reachable from unauthenticated chain input with DIG's own 9_000 bps and a
+    large enough commitment -- or, in release, reconstructed a fabricated
     `created_reward_slot.rewards` as authenticated distributor state.
 
 ### Documentation
