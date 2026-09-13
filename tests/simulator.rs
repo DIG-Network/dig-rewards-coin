@@ -50,7 +50,8 @@ use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
 use dig_rewards_coin::{
-    read_distributor, DistributorSnapshot, RewardsError, STALE_ENTRY_SET_SECONDS,
+    read_distributor, DistributorSnapshot, RewardsError, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
+    STALE_ENTRY_SET_SECONDS,
 };
 
 /// The first distributor epoch starts here. Small on purpose: the simulator's clock starts at zero,
@@ -2365,18 +2366,19 @@ fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Res
     let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
 
     match read_distributor(&chain, launcher_id) {
-        Err(RewardsError::DistributorReserveTooLargeToRead {
-            reserve_base_units,
+        Err(RewardsError::CommitmentRewardsTooLargeToRead {
+            rewards_base_units,
             max_readable_base_units,
         }) => {
             assert_eq!(
-                max_readable_base_units,
-                u64::MAX / 10_000,
+                max_readable_base_units, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
                 "the refusal must name the derived bound"
             );
-            assert!(
-                reserve_base_units > max_readable_base_units,
-                "the refusal must name a reserve that actually exceeds the bound, not any reserve"
+            assert_eq!(
+                rewards_base_units, committed_base_units,
+                "the refusal must name the commitment slot's own recorded rewards, caught at the \
+                 generation that CREATED it -- strictly earlier than the withdraw generation this \
+                 fixture goes on to build"
             );
         }
         Ok(Some(snapshot)) => panic!(
@@ -2384,7 +2386,7 @@ fn a_commitment_above_the_driver_bound_is_refused_by_the_reader() -> anyhow::Res
             snapshot.rewards_per_distributor_epoch()
         ),
         Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
-        Err(other) => panic!("expected DistributorReserveTooLargeToRead, got: {other}"),
+        Err(other) => panic!("expected CommitmentRewardsTooLargeToRead, got: {other}"),
     }
 
     Ok(())
