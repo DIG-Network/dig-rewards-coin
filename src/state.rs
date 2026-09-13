@@ -14,14 +14,25 @@
 //! network fee for a chain rejection. This module never calls it; see [`read_distributor`]'s doc
 //! for the recipe it uses instead (`SPEC.md` §12.1 clause 1, #3267).
 
-use chia_protocol::Bytes32;
+use chia_protocol::{Bytes32, CoinSpend};
+use chia_puzzle_types::singleton::SingletonSolution;
 use chia_sdk_driver::{
-    RewardDistributor, RewardDistributorActionLog, RewardDistributorType, SpendContext,
+    ActionLayer, HashedPtr, Layer, RewardDistributor, RewardDistributorActionLog,
+    RewardDistributorAddEntryAction, RewardDistributorAddIncentivesAction,
+    RewardDistributorCommitIncentivesAction, RewardDistributorConstants,
+    RewardDistributorInitiatePayoutAction, RewardDistributorNewEpochAction,
+    RewardDistributorRefreshAction, RewardDistributorRemoveEntryAction,
+    RewardDistributorStakeAction, RewardDistributorState, RewardDistributorType,
+    RewardDistributorUnstakeAction, RewardDistributorWithdrawIncentivesAction, SingletonAction,
+    Slot, SpendContext,
 };
 use chia_sdk_types::puzzles::{
-    RewardDistributorCommitmentSlotValue, RewardDistributorEntrySlotValue,
-    RewardDistributorRewardSlotValue,
+    RewardDistributorAddIncentivesActionArgs, RewardDistributorCommitmentSlotValue,
+    RewardDistributorEntrySlotValue, RewardDistributorInitiatePayoutWithApprovalActionArgs,
+    RewardDistributorInitiatePayoutWithoutApprovalActionArgs, RewardDistributorRewardSlotValue,
+    RewardDistributorSlotNonce, RewardDistributorSyncActionArgs,
 };
+use chia_sdk_types::Mod;
 use dig_chainsource_interface::ChainSource;
 
 use crate::RewardsError;
@@ -375,6 +386,219 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
     identity == Bytes32::default()
 }
 
+/// A fail-closed pre-screen ahead of `chia-sdk-driver` 0.36.0's unchecked action arithmetic
+/// (DIG-Network/dig_ecosystem#3313).
+///
+/// **This is a shim with an exit, not a durable fix.** The durable fix belongs upstream, in
+/// `chia-sdk-driver`'s own `get_log` methods
+/// (<https://github.com/xch-dev/chia-wallet-sdk/issues/436>); this function exists only because
+/// this crate cannot patch a pinned dependency and must not ship a reader that panics or
+/// fabricates a figure in the meantime. Delete it the day the pin cohort carries the fix.
+///
+/// Three of the eleven reward-distributor actions perform unchecked `u64` arithmetic on their own
+/// solution's fields, inside `get_log`, which runs INSIDE `RewardDistributor::from_spend` --
+/// before this crate's own B1/B2 guards ever get a chance to run on `from_spend`'s return:
+/// - `withdraw_incentives.rs:71` -- `committed_value * withdrawal_share_bps`
+/// - `withdraw_incentives.rs:89` -- `reward_slot_total_rewards - withdrawal_share`
+/// - `commit_incentives.rs:85` -- `slot_total_rewards + rewards_to_add` (only when
+///   `slot_epoch_time == epoch_start`; the other branch performs no such add)
+///
+/// `commit_incentives.rs:82`'s `slot_counter + 1` is deliberately NOT checked here: it is bounded
+/// by the slot's own real on-chain counter (a small, monotonically-incrementing value), not by an
+/// attacker-supplied solution field, so it is not a vector this pre-screen needs to close.
+/// `new_epoch.rs:124`'s `epoch_total_rewards * fee_bps / 10000` is also NOT checked here: that
+/// multiply lives only in `NewEpochAction::spend` (the write-side builder), never in `get_log`,
+/// and `from_spend`/this reader's walk calls only `get_log` -- see dig-rewards-coin#10, which
+/// stays deferred on that ground and is not closed by this pre-screen.
+///
+/// Two fail-closed rules, checked for every action spend in the generation's inner solution,
+/// BEFORE `from_spend` is called on that generation at all:
+///
+/// 1. **Refuse on any action solution this pre-screen cannot parse** (an unparseable inner
+///    solution, or an unparseable solution for one of the three screened actions once its puzzle
+///    hash is recognised).
+/// 2. **Refuse on any action puzzle hash this pre-screen does not recognise as one of the eleven
+///    reward-distributor actions `chia-sdk-driver` 0.36.0 defines**
+///    (`chia-sdk-driver-0.36.0/src/primitives/action_layer/reward_distributor.rs:131-166`
+///    enumerates the same eleven). This is deliberately NOT "skip unknown": a future pin bump that
+///    changes, adds or removes an action puzzle makes every read refuse here, loudly, on the
+///    first test that exercises it -- instead of silently walking past an action this pre-screen
+///    was never taught to screen for its own unchecked-arithmetic hazard. Over-refusing on drift
+///    is the only direction a refuse-don't-serve reader may fail in.
+fn refuse_unrepresentable_action_arithmetic(
+    ctx: &mut SpendContext,
+    spend: &CoinSpend,
+    constants: RewardDistributorConstants,
+) -> Result<(), RewardsError> {
+    let solution_ptr = ctx.alloc(&spend.solution).map_err(RewardsError::from)?;
+    let singleton_solution = ctx
+        .extract::<SingletonSolution<_>>(solution_ptr)
+        .map_err(RewardsError::from)?;
+
+    let action_layer_solution = ActionLayer::<RewardDistributorState, HashedPtr>::parse_solution(
+        ctx,
+        singleton_solution.inner_solution,
+    )
+    .map_err(RewardsError::from)?;
+
+    // The same eleven action puzzle hashes upstream itself precomputes for its own dispatch
+    // (`reward_distributor.rs:131-166`), derived the same way it derives them: curry the action's
+    // own constants-derived arguments and hash, never running any CLVM.
+    let withdraw_incentives_hash = RewardDistributorWithdrawIncentivesAction::new_args(
+        constants.launcher_id,
+        constants.withdrawal_share_bps,
+    )
+    .curry_tree_hash();
+    let commit_incentives_hash = RewardDistributorCommitIncentivesAction::new_args(
+        constants.launcher_id,
+        constants.epoch_seconds,
+    )
+    .curry_tree_hash();
+    let new_epoch_action = RewardDistributorNewEpochAction::from_constants(&constants);
+    let new_epoch_hash = RewardDistributorNewEpochAction::new_args(
+        new_epoch_action.launcher_id,
+        new_epoch_action.fee_payout_puzzle_hash,
+        new_epoch_action.fee_bps,
+        new_epoch_action.epoch_seconds,
+        new_epoch_action.precision,
+    )
+    .curry_tree_hash();
+    let add_entry_action = RewardDistributorAddEntryAction::from_constants(&constants);
+    let add_entry_hash = RewardDistributorAddEntryAction::new_args(
+        add_entry_action.launcher_id,
+        add_entry_action.manager_launcher_id,
+        add_entry_action.max_second_offset,
+    )
+    .curry_tree_hash();
+    let remove_entry_action = RewardDistributorRemoveEntryAction::from_constants(&constants);
+    let remove_entry_hash = RewardDistributorRemoveEntryAction::new_args(
+        remove_entry_action.launcher_id,
+        remove_entry_action.manager_launcher_id,
+        remove_entry_action.max_seconds_offset,
+        remove_entry_action.precision,
+    )
+    .curry_tree_hash();
+    let stake_action = RewardDistributorStakeAction::from_constants(&constants);
+    let stake_hash = RewardDistributorStakeAction::new_args_treehash(
+        stake_action.launcher_id,
+        stake_action.max_second_offset,
+        stake_action.distributor_type,
+    )
+    .curry_tree_hash();
+    let unstake_action = RewardDistributorUnstakeAction::from_constants(&constants);
+    let unstake_hash = RewardDistributorUnstakeAction::new_args_treehash(
+        unstake_action.launcher_id,
+        unstake_action.max_second_offset,
+        unstake_action.precision,
+        unstake_action.distributor_type,
+    )
+    .curry_tree_hash();
+    let initiate_payout_action = RewardDistributorInitiatePayoutAction::from_constants(&constants);
+    let entry_slot_1st_curry_hash: Bytes32 = Slot::<()>::first_curry_hash(
+        initiate_payout_action.launcher_id,
+        RewardDistributorSlotNonce::ENTRY.to_u64(),
+    )
+    .into();
+    let initiate_payout_hash = if initiate_payout_action.require_approval {
+        RewardDistributorInitiatePayoutWithApprovalActionArgs {
+            entry_slot_1st_curry_hash,
+            payout_threshold: initiate_payout_action.payout_threshold,
+            precision: initiate_payout_action.precision,
+        }
+        .curry_tree_hash()
+    } else {
+        RewardDistributorInitiatePayoutWithoutApprovalActionArgs {
+            entry_slot_1st_curry_hash,
+            payout_threshold: initiate_payout_action.payout_threshold,
+            precision: initiate_payout_action.precision,
+        }
+        .curry_tree_hash()
+    };
+    let add_incentives_action = RewardDistributorAddIncentivesAction::from_constants(&constants);
+    let add_incentives_hash = RewardDistributorAddIncentivesActionArgs {
+        fee_payout_puzzle_hash: add_incentives_action.fee_payout_puzzle_hash,
+        fee_bps: add_incentives_action.fee_bps,
+        precision: add_incentives_action.precision,
+    }
+    .curry_tree_hash();
+    let sync_hash = RewardDistributorSyncActionArgs::curry_tree_hash();
+    // Refresh is only a legal action puzzle for a refreshable curated-NFT distributor; for every
+    // other distributor type its own `new_args` refuses to build one, so there is no puzzle hash
+    // to recognise -- narrowing rule 2 correctly rather than weakening it.
+    let refresh_action = RewardDistributorRefreshAction::from_constants(&constants);
+    let refresh_hash = RewardDistributorRefreshAction::new_args(
+        refresh_action.launcher_id,
+        refresh_action.max_second_offset,
+        refresh_action.distributor_type,
+        refresh_action.precision,
+    )
+    .ok()
+    .map(|args| args.curry_tree_hash());
+
+    for action_spend in &action_layer_solution.action_spends {
+        let raw_action_hash = ctx.tree_hash(action_spend.puzzle);
+
+        if raw_action_hash == withdraw_incentives_hash {
+            let params = ctx
+                .extract::<chia_sdk_types::puzzles::RewardDistributorWithdrawIncentivesActionSolution>(
+                    action_spend.solution,
+                )
+                .map_err(RewardsError::from)?;
+
+            let raw_share = params
+                .committed_value
+                .checked_mul(constants.withdrawal_share_bps)
+                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                    action: "withdraw_incentives",
+                    operation: "committed_value * withdrawal_share_bps",
+                })?;
+            let withdrawal_share = raw_share / 10_000;
+
+            params
+                .reward_slot_total_rewards
+                .checked_sub(withdrawal_share)
+                .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                    action: "withdraw_incentives",
+                    operation: "reward_slot_total_rewards - withdrawal_share",
+                })?;
+        } else if raw_action_hash == commit_incentives_hash {
+            let params = ctx
+                .extract::<chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution>(
+                    action_spend.solution,
+                )
+                .map_err(RewardsError::from)?;
+
+            if params.slot_epoch_time == params.epoch_start {
+                params
+                    .slot_total_rewards
+                    .checked_add(params.rewards_to_add)
+                    .ok_or(RewardsError::ActionArithmeticNotRepresentable {
+                        action: "commit_incentives",
+                        operation: "slot_total_rewards + rewards_to_add",
+                    })?;
+            }
+        } else if raw_action_hash == new_epoch_hash
+            || raw_action_hash == add_entry_hash
+            || raw_action_hash == remove_entry_hash
+            || raw_action_hash == stake_hash
+            || raw_action_hash == unstake_hash
+            || raw_action_hash == initiate_payout_hash
+            || raw_action_hash == add_incentives_hash
+            || raw_action_hash == sync_hash
+            || refresh_hash == Some(raw_action_hash)
+        {
+            // Recognised, and no unchecked-arithmetic hazard reachable via `get_log` for this
+            // action (rule 2 satisfied; nothing to screen further).
+        } else {
+            return Err(RewardsError::UnrecognisedActionPuzzle {
+                action_puzzle_hash: raw_action_hash.into(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Rebuilds a distributor's full state from the chain, from its launcher id alone.
 ///
 /// `SPEC.md` §12.1 clause 1's recipe:
@@ -457,6 +681,7 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// the bound is checked against the slot bookkeeping this walk already reconstructs
 /// ([`DistributorSlots::apply_generation`]'s `created_commitments`), never against the reserve
 /// coin, so nothing about how many other actions share the generation changes what B2 sees.
+///
 pub fn read_distributor(
     source: &impl ChainSource,
     launcher_id: Bytes32,
@@ -563,6 +788,15 @@ pub fn read_distributor(
             // Unspent: this generation is the tip.
             break;
         };
+
+        // Fail-closed pre-screen (DIG-Network/dig_ecosystem#3313): a shim with an exit, not a
+        // durable fix -- the durable fix is upstream
+        // (https://github.com/xch-dev/chia-wallet-sdk/issues/436). Runs BEFORE `from_spend`
+        // because three of `chia-sdk-driver` 0.36.0's action `get_log` methods do unchecked
+        // `u64` arithmetic on solution fields inside that call, ahead of this crate's own B1/B2
+        // guards, which only run once `from_spend` returns. See
+        // `refuse_unrepresentable_action_arithmetic`'s own doc for the two fail-closed rules.
+        refuse_unrepresentable_action_arithmetic(&mut ctx, &spend, constants)?;
 
         let reserve_lineage_proof = distributor.reserve.child_lineage_proof();
         let Some(reconstructed) = chia_sdk_driver::RewardDistributor::from_spend(
@@ -911,5 +1145,259 @@ mod tests {
             asset_id: some_identity(),
             hidden_puzzle_hash: None
         }));
+    }
+
+    /// Fail-closed rule 2: an action-layer solution naming a puzzle this reader does not recognise
+    /// as one of the eleven known reward-distributor actions must refuse the read, never be
+    /// silently skipped -- exactly the case a future upstream pin bump that changes an action
+    /// puzzle would produce.
+    ///
+    /// Built directly against `refuse_unrepresentable_action_arithmetic`, at the unit level: a
+    /// real, valid `ActionLayerSolution` (via `RawActionLayerSolution`, the same shape
+    /// `ActionLayer::parse_solution` decodes) whose one action puzzle is an ordinary CLVM atom --
+    /// guaranteed to match none of the eleven curried action puzzle hashes this pre-screen
+    /// computes from `constants`, since none of those eleven is ever a bare atom.
+    #[test]
+    fn an_unrecognised_action_puzzle_hash_is_refused() {
+        let ctx = &mut SpendContext::new();
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            1_000,
+            10_000,
+            1_000,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(some_identity());
+
+        // An ordinary atom: not a curried puzzle, so it cannot possibly equal any of the eleven
+        // curried action-puzzle hashes the pre-screen enumerates from `constants`.
+        let unknown_action_puzzle = ctx.alloc(&42u64).expect("an atom always allocates");
+        let unknown_action_solution = ctx.alloc(&()).expect("the empty solution always allocates");
+
+        let raw_action_layer_solution = chia_sdk_types::puzzles::RawActionLayerSolution {
+            puzzles: vec![unknown_action_puzzle],
+            selectors_and_proofs: vec![(2, Some(chia_sdk_types::MerkleProof::new(0, vec![])))],
+            solutions: vec![unknown_action_solution],
+            finalizer_solution: ctx
+                .alloc(&())
+                .expect("the empty finalizer solution allocates"),
+        };
+
+        let singleton_solution = SingletonSolution {
+            lineage_proof: chia_puzzle_types::Proof::Eve(chia_puzzle_types::EveProof {
+                parent_parent_coin_info: some_identity(),
+                parent_amount: 1,
+            }),
+            amount: 1,
+            inner_solution: raw_action_layer_solution,
+        };
+
+        let solution = ctx
+            .serialize(&singleton_solution)
+            .expect("a well-formed singleton solution always serializes");
+
+        let spend = CoinSpend::new(
+            chia_protocol::Coin::new(some_identity(), some_identity(), 1),
+            solution.clone(),
+            solution,
+        );
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::UnrecognisedActionPuzzle { action_puzzle_hash }) => {
+                assert_eq!(
+                    action_puzzle_hash,
+                    ctx.tree_hash(unknown_action_puzzle).into(),
+                    "the refusal must name the actual unrecognised hash, not a placeholder"
+                );
+            }
+            Ok(()) => panic!(
+                "rule 2 must refuse an action puzzle hash outside the eleven known actions, not \
+                 silently skip it"
+            ),
+            Err(other) => panic!("expected UnrecognisedActionPuzzle, got: {other}"),
+        }
+    }
+
+    /// Site 2 of 3 (`withdraw_incentives.rs:89`): `reward_slot_total_rewards - withdrawal_share`
+    /// underflows when a withdraw action's solution names a `reward_slot_total_rewards` smaller
+    /// than the share its own `committed_value` computes -- a shape the multiply guard above
+    /// (site 1) does not catch, since the multiply itself stays in range here.
+    #[test]
+    fn a_withdraw_subtract_that_would_underflow_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let withdrawal_share_bps = 9_000;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            1_000,
+            10_000,
+            1_000,
+            0,
+            false,
+            0,
+            withdrawal_share_bps,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let committed_value = 1_000u64;
+        // `withdrawal_share = committed_value * bps / 10_000` = 900 here -- larger than the
+        // slot's own recorded total, so the subtract underflows even though the multiply above it
+        // stayed in range.
+        let reward_slot_total_rewards = 1u64;
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorWithdrawIncentivesAction::new_args(
+                    launcher_id,
+                    withdrawal_share_bps,
+                ),
+            )
+            .expect("withdraw args always curry");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorWithdrawIncentivesActionSolution {
+                    reward_slot_counter: 0,
+                    reward_slot_epoch_time: 0,
+                    clawback_ph: some_identity(),
+                    committed_value,
+                    reward_slot_total_rewards,
+                    reward_slot_next_epoch_initialized: false,
+                },
+            )
+            .expect("a well-formed withdraw solution always allocates");
+
+        let raw_action_layer_solution = chia_sdk_types::puzzles::RawActionLayerSolution {
+            puzzles: vec![action_puzzle],
+            selectors_and_proofs: vec![(2, Some(chia_sdk_types::MerkleProof::new(0, vec![])))],
+            solutions: vec![action_solution],
+            finalizer_solution: ctx
+                .alloc(&())
+                .expect("the empty finalizer solution allocates"),
+        };
+        let singleton_solution = SingletonSolution {
+            lineage_proof: chia_puzzle_types::Proof::Eve(chia_puzzle_types::EveProof {
+                parent_parent_coin_info: some_identity(),
+                parent_amount: 1,
+            }),
+            amount: 1,
+            inner_solution: raw_action_layer_solution,
+        };
+        let solution = ctx
+            .serialize(&singleton_solution)
+            .expect("a well-formed singleton solution always serializes");
+        let spend = CoinSpend::new(
+            chia_protocol::Coin::new(some_identity(), some_identity(), 1),
+            solution.clone(),
+            solution,
+        );
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "withdraw_incentives");
+                assert_eq!(operation, "reward_slot_total_rewards - withdrawal_share");
+            }
+            Ok(()) => {
+                panic!("the pre-screen let a withdraw solution through whose subtract underflows")
+            }
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
+    }
+
+    /// Site 3 of 3 (`commit_incentives.rs:85`): `slot_total_rewards + rewards_to_add` overflows
+    /// when `slot_epoch_time == epoch_start` (the branch upstream takes when the commitment adds
+    /// to an already-initialized slot for the SAME epoch it targets) -- never screened when the
+    /// two differ, matching upstream's own guard.
+    #[test]
+    fn a_commit_add_that_would_overflow_is_refused() {
+        let ctx = &mut SpendContext::new();
+        let launcher_id = some_identity();
+        let epoch_seconds = 1_000;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: some_identity(),
+            },
+            some_identity(),
+            epoch_seconds,
+            10_000,
+            1_000,
+            0,
+            false,
+            0,
+            9_000,
+            some_identity(),
+        )
+        .with_launcher_id(launcher_id);
+
+        let epoch_start = 5_000u64;
+
+        let action_puzzle = ctx
+            .curry(
+                chia_sdk_driver::RewardDistributorCommitIncentivesAction::new_args(
+                    launcher_id,
+                    epoch_seconds,
+                ),
+            )
+            .expect("commit args always curry");
+        let action_solution = ctx
+            .alloc(
+                &chia_sdk_types::puzzles::RewardDistributorCommitIncentivesActionSolution {
+                    slot_counter: 0,
+                    slot_epoch_time: epoch_start,
+                    slot_next_epoch_initialized: false,
+                    slot_total_rewards: u64::MAX,
+                    epoch_start,
+                    clawback_ph: some_identity(),
+                    rewards_to_add: 1,
+                },
+            )
+            .expect("a well-formed commit solution always allocates");
+
+        let raw_action_layer_solution = chia_sdk_types::puzzles::RawActionLayerSolution {
+            puzzles: vec![action_puzzle],
+            selectors_and_proofs: vec![(2, Some(chia_sdk_types::MerkleProof::new(0, vec![])))],
+            solutions: vec![action_solution],
+            finalizer_solution: ctx
+                .alloc(&())
+                .expect("the empty finalizer solution allocates"),
+        };
+        let singleton_solution = SingletonSolution {
+            lineage_proof: chia_puzzle_types::Proof::Eve(chia_puzzle_types::EveProof {
+                parent_parent_coin_info: some_identity(),
+                parent_amount: 1,
+            }),
+            amount: 1,
+            inner_solution: raw_action_layer_solution,
+        };
+        let solution = ctx
+            .serialize(&singleton_solution)
+            .expect("a well-formed singleton solution always serializes");
+        let spend = CoinSpend::new(
+            chia_protocol::Coin::new(some_identity(), some_identity(), 1),
+            solution.clone(),
+            solution,
+        );
+
+        match refuse_unrepresentable_action_arithmetic(ctx, &spend, constants) {
+            Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+                assert_eq!(action, "commit_incentives");
+                assert_eq!(operation, "slot_total_rewards + rewards_to_add");
+            }
+            Ok(()) => panic!("the pre-screen let a commit solution through whose add overflows"),
+            Err(other) => panic!("expected ActionArithmeticNotRepresentable, got: {other}"),
+        }
     }
 }

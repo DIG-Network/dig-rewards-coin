@@ -4,6 +4,7 @@
 //! no"** and **"the chain did not say"**: a read that could not be established must fail closed,
 //! never degrade into an empty or default answer.
 
+use chia_protocol::Bytes32;
 use chia_sdk_driver::DriverError;
 use thiserror::Error;
 
@@ -149,10 +150,19 @@ pub enum RewardsError {
     /// *amount* after any given generation reflects only the net of that generation's actions and
     /// can never be trusted to have seen a transient peak. A commitment slot's own `rewards`
     /// field has no such blind spot: `CommitIncentives::get_log` performs no multiply, so it
-    /// parses safely at any scale, and a slot cannot be created and withdrawn in the same
-    /// singleton spend (`assert_concurrent_puzzle` requires the slot coin to already exist), so
-    /// bounding it here is always ahead of the generation that could reach the unchecked
-    /// multiply.
+    /// parses safely at any scale.
+    ///
+    /// **This check runs at the CREATING generation regardless of whether a withdraw of the same
+    /// slot shares it.** An earlier version of this doc claimed a slot could never be created and
+    /// withdrawn in the same singleton spend; that is false (see `src/state.rs`'s
+    /// `read_distributor` docs and `tests/simulator.rs`'s
+    /// `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`) — the two actions can
+    /// share one spend, and this check still catches it because it reads
+    /// `created_commitment_slots` on `from_spend`'s return, before this walk advances to any later
+    /// generation, independent of what else shared the spend. What this bound does NOT close is a
+    /// same-generation withdraw whose multiply overflows the driver's OWN `u64` arithmetic before
+    /// `from_spend` returns at all — see `RewardsError::UnrecognisedActionPuzzle` and
+    /// `RewardsError::ActionArithmeticNotRepresentable`, and DIG-Network/dig_ecosystem#3313.
     #[error(
         "commitment slot rewards of {rewards_base_units} base units exceeds the \
          {max_readable_base_units} base units this reader can safely carry through to a later \
@@ -163,6 +173,49 @@ pub enum RewardsError {
         rewards_base_units: u64,
         /// The largest commitment-slot `rewards` this reader will carry through to a withdraw.
         max_readable_base_units: u64,
+    },
+
+    /// A generation's inner solution names an action-layer puzzle this reader does not
+    /// recognise as one of the 11 reward-distributor actions `chia-sdk-driver` 0.36.0 defines.
+    ///
+    /// This is a fail-closed pre-screen, not a fail-open skip (DIG-Network/dig_ecosystem#3313): a
+    /// future pin bump that changes, adds or removes an action puzzle makes every read refuse
+    /// loudly here, rather than silently walking an action this reader never checked for an
+    /// unchecked-arithmetic hazard. Refusing on drift is the only direction a refuse-don't-serve
+    /// reader may fail in.
+    #[error(
+        "action-layer puzzle at generation carries hash {action_puzzle_hash} which is not one of \
+         the 11 reward-distributor actions this reader enumerates -- refusing rather than walking \
+         an action this reader never screened for an unchecked-arithmetic hazard (#3313)"
+    )]
+    UnrecognisedActionPuzzle {
+        /// The tree hash of the action puzzle this reader could not match to a known action.
+        action_puzzle_hash: Bytes32,
+    },
+
+    /// One of the three practically-reachable unchecked `u64` sites inside `chia-sdk-driver`
+    /// 0.36.0's action `get_log` methods (`withdraw_incentives.rs:71`, `:89`,
+    /// `commit_incentives.rs:85`) would overflow on the operands this generation's own action
+    /// solution carries, before `RewardDistributor::from_spend` ever returns to let this crate's
+    /// own B1/B2 guards run.
+    ///
+    /// Refused BEFORE calling `from_spend` on this generation, because a checked-arithmetic build
+    /// (`dig-node` and `dig-relay` both ship `overflow-checks = true` in release) panics inside the
+    /// driver with no chance to report anything at all, and a wrapping build would hand back a
+    /// fabricated figure as authenticated distributor state (DIG-Network/dig_ecosystem#3313).
+    #[error(
+        "action {action} solution's {operation} would overflow chia-sdk-driver 0.36.0's unchecked \
+         u64 arithmetic before RewardDistributor::from_spend can return -- refusing rather than \
+         risking a panic (checked build) or a fabricated figure (wrapping build) (#3313)"
+    )]
+    ActionArithmeticNotRepresentable {
+        /// Which of the three screened actions this came from (`"withdraw_incentives"` or
+        /// `"commit_incentives"`).
+        action: &'static str,
+        /// Which operation would overflow (`"committed_value * withdrawal_share_bps"`,
+        /// `"reward_slot_total_rewards - withdrawal_share"`, or
+        /// `"slot_total_rewards + rewards_to_add"`).
+        operation: &'static str,
     },
 }
 

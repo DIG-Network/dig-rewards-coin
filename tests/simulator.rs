@@ -2543,6 +2543,144 @@ fn a_same_generation_commit_and_withdraw_is_refused_by_the_reader() -> anyhow::R
     Ok(())
 }
 
+/// Discriminating regression for dig_ecosystem#3313's remedy: a one-spend commit+withdraw
+/// composition whose `committed_value` is above the DRIVER's OWN overflow bound
+/// (`u64::MAX / WITHDRAWAL_SHARE_BPS`) -- not merely the READ bound
+/// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`) that `a_same_generation_commit_and_withdraw_is_refused_by_the_reader`
+/// above already proves B2 catches. At THIS scale, `chia-sdk-driver` 0.36.0's own
+/// `committed_value * withdrawal_share_bps` multiply (`withdraw_incentives.rs:71`) overflows
+/// INSIDE `RewardDistributor::from_spend`, before B2 -- which only runs once `from_spend`
+/// RETURNS -- ever gets a chance to refuse. The fail-closed pre-screen
+/// (`refuse_unrepresentable_action_arithmetic`) must catch it first, from the action's own
+/// solution fields alone, without ever calling `from_spend` on this generation.
+///
+/// **Release-only, by necessity** (same reason as `a_commitment_above_the_driver_bound_is_refused_by_the_reader`
+/// above): building this fixture calls upstream's withdraw action `.spend()` directly, which
+/// performs the same unchecked multiply while constructing the spend -- panicking under
+/// `debug_assertions` before the coin ever reaches simulated chain state to read back.
+///
+/// Before the pre-screen (this PR), this generation would have reached `from_spend`, and the
+/// wrapped multiply would have flowed through B2 unguarded (B2 only checks the recorded
+/// commitment `rewards`, never re-derives the withdraw share itself).
+#[cfg(not(debug_assertions))]
+#[test]
+fn a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend(
+) -> anyhow::Result<()> {
+    // One base unit above the driver's own overflow bound; derived, never spelled.
+    let committed_base_units = u64::MAX / WITHDRAWAL_SHARE_BPS + 1;
+    let headroom = 1_000;
+
+    let ctx = &mut SpendContext::new();
+    let mut harness =
+        launch_harness_with(ctx, committed_base_units + headroom, WITHDRAWAL_SHARE_BPS)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let mut members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let mut extras = vec![
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+
+    let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
+
+    // CommitIncentives -- above the driver's own overflow bound -- deliberately NOT finished yet:
+    // the withdraw below must land in the SAME pending spend.
+    let secure_conditions = commit_incentives_for_distributor_epoch(
+        ctx,
+        &mut harness.distributor,
+        harness.first_epoch_slot.clone(),
+        second_epoch_start,
+        harness.funder.puzzle_hash,
+        committed_base_units,
+    )?;
+
+    let hint = ctx.hint(harness.funder.puzzle_hash)?;
+    let change = harness.source_cat.coin.amount - committed_base_units;
+    let source_cat_spend = CatSpend::new(
+        harness.source_cat,
+        StandardLayer::new(harness.funder.pk).spend_with_conditions(
+            ctx,
+            secure_conditions.create_coin(harness.funder.puzzle_hash, change, hint),
+        )?,
+    );
+    harness.source_cat = harness.source_cat.child(harness.funder.puzzle_hash, change);
+
+    let reward_slots: Vec<Slot<RewardDistributorRewardSlotValue>> = harness
+        .distributor
+        .pending_spend
+        .created_reward_slots
+        .iter()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
+        })
+        .collect();
+    let reward_slot = pick_reward_slot(&reward_slots, second_epoch_start);
+
+    let commitment_slot: Slot<RewardDistributorCommitmentSlotValue> = harness
+        .distributor
+        .pending_spend
+        .created_commitment_slots
+        .first()
+        .copied()
+        .map(|value| {
+            harness
+                .distributor
+                .created_slot_value_to_slot(value, RewardDistributorSlotNonce::COMMITMENT)
+        })
+        .expect("the commit above created a commitment slot");
+
+    // WithdrawIncentives of that SAME just-created slot, built directly against the raw driver
+    // action -- deliberately bypassing this crate's own pre-guard, because the question here is
+    // what the PRE-SCREEN does with a spend already on chain, not whether
+    // `withdraw_committed_incentives`'s own entry-point guard would have refused first.
+    let mut distributor = harness.distributor.clone();
+    let (withdraw_conditions, _driver_reported) = distributor
+        .new_action::<chia_sdk_driver::RewardDistributorWithdrawIncentivesAction>()
+        .spend(ctx, &mut distributor, commitment_slot, reward_slot)?;
+    harness.distributor = distributor;
+
+    let authority_coin = harness.sim.new_coin(harness.funder.puzzle_hash, 1);
+    StandardLayer::new(harness.funder.pk).spend(ctx, authority_coin, withdraw_conditions)?;
+
+    harness.distributor = harness
+        .distributor
+        .clone()
+        .finish_spend(ctx, vec![source_cat_spend])?
+        .0;
+    harness
+        .sim
+        .spend_coins(ctx.take(), std::slice::from_ref(&harness.funder.sk))?;
+    members.push(harness.distributor.coin.coin_id());
+    extras.push(harness.distributor.reserve.coin.coin_id());
+
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras);
+
+    match read_distributor(&chain, launcher_id) {
+        Err(RewardsError::ActionArithmeticNotRepresentable { action, operation }) => {
+            assert_eq!(
+                action, "withdraw_incentives",
+                "the multiply that overflows here belongs to the withdraw action, not the commit"
+            );
+            assert_eq!(
+                operation, "committed_value * withdrawal_share_bps",
+                "this composition overflows the multiply itself, before any subtraction runs"
+            );
+        }
+        Ok(Some(snapshot)) => panic!(
+            "the pre-screen let a generation through whose withdraw multiply overflows the \
+             driver's own u64 bound: {:?}",
+            snapshot.rewards_per_distributor_epoch()
+        ),
+        Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
+        Err(other) => {
+            panic!("expected ActionArithmeticNotRepresentable from the pre-screen, got: {other}")
+        }
+    }
+
+    Ok(())
+}
+
 /// Path A (PR #8 review at `state.rs:433`): `withdraw_committed_incentives`'s pre-guard must judge
 /// the value upstream will ACTUALLY multiply -- the commitment slot `actual_commitment_slot_value`
 /// substitutes in, matching on `epoch_start` ALONE (`reward_distributor.rs:833-849`) -- never the
