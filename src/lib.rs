@@ -58,12 +58,14 @@
 pub mod clawback;
 pub mod comment;
 pub mod constants;
+pub mod discovery;
 pub mod eligibility;
 pub mod entries;
 pub mod epoch;
 mod error;
 pub mod fund;
 pub mod launch;
+pub mod manager;
 pub mod payout;
 pub mod state;
 
@@ -76,6 +78,9 @@ pub use constants::{
     FIRST_EPOCH_START_LEAD_SECONDS, MAX_ENTRIES_PER_DISTRIBUTOR, MAX_SECONDS_OFFSET,
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
 };
+pub use discovery::{
+    discover_distributor, discovered_distributors_in_spend, DiscoveredDistributor,
+};
 pub use eligibility::{
     judge_candidate, judge_candidate_for_epoch, EligibilityQuestion, EligiblePayoutHash,
     Ineligible, MirrorCoinFacts,
@@ -83,6 +88,10 @@ pub use eligibility::{
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;
 pub use launch::{funder_refund_puzzle_hash, launch_dig_distributor, LaunchedDistributor};
+pub use manager::{
+    launch_manager_singleton, LaunchedManagerSingleton, ManagerInnerPuzzle,
+    MANAGER_SINGLETON_AMOUNT_MOJOS,
+};
 pub use state::{
     read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot,
     STALE_ENTRY_SET_SECONDS,
