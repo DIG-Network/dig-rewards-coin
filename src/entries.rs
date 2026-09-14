@@ -219,6 +219,15 @@ pub fn entry_count(distributor: &RewardDistributor) -> u64 {
 /// `ASSERT_BEFORE_SECONDS_ABSOLUTE` of that moment. A `Sync` can only move `last_update` strictly
 /// forward and never past the current epoch's end, so once `last_update` has reached `epoch_end`
 /// there is no sync to emit and the epoch has to be rolled first.
+///
+/// `max_seconds_offset` is a distributor-supplied constant with no domain bound this crate
+/// enforces (`read_distributor` is deliberately distributor-agnostic), so the two window
+/// boundaries below are computed with `checked_add` and fail **closed** on overflow: at a
+/// saturating value the write window is CLOSED, never permanently open (#3321). A `saturating_add`
+/// here previously made `now_unix_seconds < window_closes_at` true for every representable clock
+/// once `max_seconds_offset` saturated, which read as "the window never closes" -- exactly the
+/// opposite of a fail-closed refusal, and it made
+/// [`RewardsError::EntrySetWriteWindowClosed`] unreachable from either caller.
 fn sync_if_the_window_needs_it(
     ctx: &mut SpendContext,
     distributor: &mut RewardDistributor,
@@ -227,8 +236,17 @@ fn sync_if_the_window_needs_it(
     let state = distributor.pending_spend.latest_state.1;
     let last_update = state.round_time_info.last_update;
     let epoch_end = state.round_time_info.epoch_end;
-    let window_closes_at =
-        last_update.saturating_add(distributor.info.constants.max_seconds_offset);
+    let max_seconds_offset = distributor.info.constants.max_seconds_offset;
+
+    let window_closed_err = || RewardsError::EntrySetWriteWindowClosed {
+        last_update,
+        epoch_end,
+        now_unix_seconds,
+    };
+
+    let Some(window_closes_at) = last_update.checked_add(max_seconds_offset) else {
+        return Err(window_closed_err());
+    };
 
     if now_unix_seconds < window_closes_at {
         return Ok(None);
@@ -244,12 +262,12 @@ fn sync_if_the_window_needs_it(
     // refusals: when `sync_to <= last_update` (the epoch has ended, so no forward sync exists) the
     // window already closed at `last_update + max_seconds_offset`, which is at or before
     // `sync_to + max_seconds_offset`, so it fires there too.
-    if sync_to.saturating_add(distributor.info.constants.max_seconds_offset) <= now_unix_seconds {
-        return Err(RewardsError::EntrySetWriteWindowClosed {
-            last_update,
-            epoch_end,
-            now_unix_seconds,
-        });
+    let Some(post_sync_closes_at) = sync_to.checked_add(max_seconds_offset) else {
+        return Err(window_closed_err());
+    };
+
+    if post_sync_closes_at <= now_unix_seconds {
+        return Err(window_closed_err());
     }
 
     let conditions = distributor
@@ -269,5 +287,73 @@ mod tests {
 
         let authority = ManagerAuthority::new(Bytes32::new([5; 32])).unwrap();
         assert_eq!(authority.inner_puzzle_hash(), Bytes32::new([5; 32]));
+    }
+
+    /// A distributor's own `max_seconds_offset` has no domain bound this reader enforces, so a
+    /// hostile or corrupt launch can set it to a saturating value. Before the fix,
+    /// `saturating_add` made `last_update + max_seconds_offset` read as `u64::MAX`, which is
+    /// greater than every representable `now_unix_seconds` -- so the write window read as
+    /// PERMANENTLY OPEN instead of closed, and `RewardsError::EntrySetWriteWindowClosed` could
+    /// never fire. This test fails under that defect and passes once overflow fails closed (#3321).
+    #[test]
+    fn a_saturating_max_seconds_offset_closes_the_window_instead_of_leaving_it_open_forever() {
+        use chia_puzzle_types::{EveProof, LineageProof, Proof};
+        use chia_sdk_driver::{
+            Reserve, RewardDistributorConstants, RewardDistributorInfo, RewardDistributorState,
+            RewardDistributorType,
+        };
+        use chia_protocol::Coin;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: Bytes32::new([1; 32]),
+            },
+            Bytes32::new([2; 32]),
+            604_800,
+            u64::MAX,
+            u64::MAX, // max_seconds_offset: a distributor-supplied constant, no domain bound here
+            1_000,
+            false,
+            0,
+            9_000,
+            Bytes32::new([3; 32]),
+        )
+        .with_launcher_id(Bytes32::new([4; 32]));
+
+        let mut state = RewardDistributorState::initial(1);
+        state.round_time_info.last_update = 1;
+        state.round_time_info.epoch_end = 2;
+
+        let info = RewardDistributorInfo::new(state, constants);
+        let mut distributor = RewardDistributor::new(
+            Coin::new(Bytes32::default(), Bytes32::default(), 1),
+            Proof::Eve(EveProof {
+                parent_parent_coin_info: Bytes32::default(),
+                parent_amount: 1,
+            }),
+            info,
+            Reserve::new(
+                Bytes32::default(),
+                LineageProof {
+                    parent_parent_coin_info: Bytes32::default(),
+                    parent_inner_puzzle_hash: Bytes32::default(),
+                    parent_amount: 0,
+                },
+                Bytes32::new([3; 32]),
+                Bytes32::default(),
+                0,
+                0,
+            ),
+        );
+
+        let mut ctx = SpendContext::new();
+
+        let result = sync_if_the_window_needs_it(&mut ctx, &mut distributor, 100);
+
+        assert!(
+            matches!(result, Err(RewardsError::EntrySetWriteWindowClosed { .. })),
+            "a saturating max_seconds_offset must close the window, not leave it open forever: \
+             got {result:?}"
+        );
     }
 }
