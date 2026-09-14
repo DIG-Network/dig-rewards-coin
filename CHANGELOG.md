@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-09-13
+
+### Features
+- Launch the manager singleton (`launch_manager_singleton`, SPEC.md §7.2a) (#3308)
+- On-chain discovery: decode a launch comment from an observed spend (`discover_distributor`,
+  `discovered_distributors_in_spend`, SPEC.md §13.1) (#3308, #3249)
+
+### Bug Fixes
+- Fail closed on a saturating `max_seconds_offset` instead of leaving the entry-set write window
+  permanently open (#3321)
+
+### Tests
+- End-to-end mint + discovery coverage through the simulator, plus #3309's discovery negatives
+
 ## [0.5.0] - 2026-09-13
 
 ### Bug Fixes

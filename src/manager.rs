@@ -94,7 +94,6 @@ impl LaunchedManagerSingleton {
     /// The conditions the **parent** coin's spend must carry — a `CREATE_COIN` of the launcher
     /// coin plus an `ASSERT_COIN_ANNOUNCEMENT` over the launcher solution (§7.2a clause 6). This
     /// crate never signs or spends the parent; the caller's own key does.
-    #[must_use]
     pub const fn parent_conditions(&self) -> &Conditions {
         &self.parent_conditions
     }
@@ -220,7 +219,10 @@ mod tests {
 
         assert_ne!(launched.launcher_id(), Bytes32::default());
         assert_eq!(launched.inner_puzzle_hash(), Bytes32::new([9; 32]));
-        assert_eq!(launched.singleton_coin().amount, MANAGER_SINGLETON_AMOUNT_MOJOS);
+        assert_eq!(
+            launched.singleton_coin().amount,
+            MANAGER_SINGLETON_AMOUNT_MOJOS
+        );
         assert!(matches!(launched.eve_proof(), Proof::Eve(_)));
 
         let terms = launched.distributor_launch_terms(604_800);

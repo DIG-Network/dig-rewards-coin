@@ -2155,7 +2155,7 @@ clause quietly deleted to make the MVP look complete, are both the failure this 
 | §10 Identity binding | **ships** | it is §4's mechanism; there is nothing separate to build |
 | §11 Shares policy | **ships** | `shares = 1`, refused otherwise |
 | §12 Recovery | **ships** | §12.4's chain-derived `EntrySetStale` included; it is what a mirror reads instead of trusting an operator |
-| §13.1 On-chain discovery | **specified, NOT implemented at 0.4.1** | On-chain discovery by `storeId:root` is unimplemented as of 0.4.1: `LaunchComment` is encoded at launch and never decoded from a chain-observed spend. Implementation is tracked by dig_ecosystem#3249 |
+| §13.1 On-chain discovery | **ships at 0.6.0** | `discover_distributor` / `discovered_distributors_in_spend` (`src/discovery.rs`) decode the launch comment from the `CREATE_COIN` that creates a distributor's launcher coin, emitted by that coin's parent spend; landed for dig_ecosystem#3249 |
 | §13.2 Off-chain discovery | **specified, deferred** | **#3252**. Safe to defer only because §13.2 clause 2 holds |
 | §13.3 `Refresh` | **specified, not used** | inapplicable in `Managed` mode; nothing to defer |
 | metrics presentation beyond the §2.3 counters | **specified, deferred** | **#3253** ships create-with-warning, refill, clawback (per epoch, fed by §2.6's `dig.listRewardDistributorCommitments`) and prover health; per-epoch payout history and charting follow |
@@ -2313,18 +2313,27 @@ An implementation conforms when all of the following hold.
 
 ### 15.2 Status of this document
 
-Every clause above is **specified, not yet implemented**: at the time of writing, `main` of
-`dig-rewards-coin` holds only the repository bootstrap and the crate scaffold
-(DIG-Network/dig_ecosystem#3247). Every `file:line` citation in this document is to the **pinned
-upstream SDK** (`chia-sdk-driver-0.36.0`, `chia-sdk-types-0.36.0`) or to an **existing sibling crate**
-in `dig_ecosystem`, measured on 2026-09-08. No citation is to code this specification introduces.
+This section was written when `main` of `dig-rewards-coin` held only the repository bootstrap and
+the crate scaffold (DIG-Network/dig_ecosystem#3247); that is no longer true. As of **v0.6.0**, `main`
+ships the mint (`launch_dig_distributor`), the manager-singleton launch (§7.2a,
+`launch_manager_singleton`), fund/clawback, the entry set and its eligibility judgement, epoch
+mechanics, payout, the chain reader (`read_distributor`, #3267), and on-chain discovery (§13.1,
+`discover_distributor` / `discovered_distributors_in_spend`). Every `file:line` citation in this
+document is still to the **pinned upstream SDK** (`chia-sdk-driver-0.36.0`, `chia-sdk-types-0.36.0`)
+or to an **existing sibling crate** in `dig_ecosystem`, measured on 2026-09-08; no citation is to code
+this specification introduces, even though most of what it specifies has since shipped.
 
-**One exception, as of v0.11.0.** §2.6's four methods and their param/result types are no longer
-"specified, not yet implemented": they shipped in `dig-rpc-protocol` v0.11.0, and §2.6's citations
-are to that released version rather than to the pinned SDK. What is not implemented there is the
-**responder** — the code that fills the types and computes `recoverable_base_units` — which is
-#3250's. Every other clause here remains unimplemented, and `main` of `dig-rewards-coin` still
-holds only the bootstrap and the scaffold.
+**Two exceptions, as of v0.11.0 and v0.6.0.** §2.6's four methods and their param/result types
+shipped in `dig-rpc-protocol` v0.11.0, and §2.6's citations are to that released version rather than
+to the pinned SDK; what is not implemented there is the **responder** — the code that fills the
+types and computes `recoverable_base_units` — which is #3250's. §13.1 shipped in this crate's own
+v0.6.0 (`src/discovery.rs`); its citations remain to the pinned SDK because the decode is built
+entirely from the SDK's own `SpendContext` primitives, not from a new dependency.
+
+What remains genuinely unimplemented is narrower than it once was: §13.2 (off-chain discovery,
+#3252, deferred), §13.3 (`Refresh`, inapplicable in `Managed` mode), and the metrics presentation
+beyond the §2.3 counters (#3253) — see the table in §14 above for the authoritative per-clause
+status, which this prose summarises rather than duplicates.
 
 **Citation discipline, after one failure.** A first revision cited a doc comment's illustrative ratio
 as if it defined a constant (§0.3), and it was propping up an immutable curried value. Two rules
