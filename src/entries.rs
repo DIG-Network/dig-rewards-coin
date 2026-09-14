@@ -356,4 +356,90 @@ mod tests {
              got {result:?}"
         );
     }
+
+    /// The first `checked_add` (`last_update + max_seconds_offset`) guards a DIFFERENT clock than
+    /// the second (`sync_to + max_seconds_offset`): the first bounds where the window closes
+    /// BEFORE any sync; the second bounds where it closes AFTER the caller's clock has been synced
+    /// forward. This fixture keeps the first sum small enough to never overflow -- so the first
+    /// `checked_add` is a no-op here -- while the caller's clock and `epoch_end` are large enough
+    /// that `sync_to` (`= now_unix_seconds.min(epoch_end)`) pushed through the second `checked_add`
+    /// overflows. A `saturating_add` at that second site clamps `post_sync_closes_at` to `u64::MAX`,
+    /// which is never `<= now_unix_seconds`, so the write window reads as reachable and the sync
+    /// spend proceeds -- exactly the "window never closes" defect #3321 fixed, just moved to the
+    /// second site. This test fails under that defect and passes once the second site also fails
+    /// closed on overflow.
+    #[test]
+    fn a_saturating_post_sync_closes_at_leaves_the_window_open_when_the_synced_clock_would_overflow_it(
+    ) {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::{EveProof, LineageProof, Proof};
+        use chia_sdk_driver::{
+            Reserve, RewardDistributorConstants, RewardDistributorInfo, RewardDistributorState,
+            RewardDistributorType,
+        };
+
+        let max_seconds_offset = u64::MAX - 1_000;
+
+        let constants = RewardDistributorConstants::without_launcher_id(
+            RewardDistributorType::Managed {
+                manager_singleton_launcher_id: Bytes32::new([1; 32]),
+            },
+            Bytes32::new([2; 32]),
+            604_800,
+            u64::MAX,
+            max_seconds_offset,
+            1_000,
+            false,
+            0,
+            9_000,
+            Bytes32::new([3; 32]),
+        )
+        .with_launcher_id(Bytes32::new([4; 32]));
+
+        let mut state = RewardDistributorState::initial(1);
+        // `last_update = 0` keeps the FIRST `checked_add` (`last_update + max_seconds_offset`)
+        // well inside `u64::MAX`, so it never overflows and never errors on its own.
+        state.round_time_info.last_update = 0;
+        // `epoch_end = u64::MAX` so `sync_to = now_unix_seconds.min(epoch_end)` is not capped by
+        // the epoch boundary -- the caller's clock alone must drive `sync_to` toward overflow.
+        state.round_time_info.epoch_end = u64::MAX;
+
+        let info = RewardDistributorInfo::new(state, constants);
+        let mut distributor = RewardDistributor::new(
+            Coin::new(Bytes32::default(), Bytes32::default(), 1),
+            Proof::Eve(EveProof {
+                parent_parent_coin_info: Bytes32::default(),
+                parent_amount: 1,
+            }),
+            info,
+            Reserve::new(
+                Bytes32::default(),
+                LineageProof {
+                    parent_parent_coin_info: Bytes32::default(),
+                    parent_inner_puzzle_hash: Bytes32::default(),
+                    parent_amount: 0,
+                },
+                Bytes32::new([3; 32]),
+                Bytes32::default(),
+                0,
+                0,
+            ),
+        );
+
+        let mut ctx = SpendContext::new();
+
+        // `now_unix_seconds = u64::MAX - 500` clears the first window
+        // (`window_closes_at = last_update + max_seconds_offset = u64::MAX - 1_000`), forcing a
+        // sync attempt, and makes `sync_to = u64::MAX - 500` -- which, added to
+        // `max_seconds_offset = u64::MAX - 1_000`, overflows `u64` by a wide margin.
+        let now_unix_seconds = u64::MAX - 500;
+
+        let result = sync_if_the_window_needs_it(&mut ctx, &mut distributor, now_unix_seconds);
+
+        assert!(
+            matches!(result, Err(RewardsError::EntrySetWriteWindowClosed { .. })),
+            "an overflowing post-sync window must close, not read as reachable forever: \
+             got {result:?}"
+        );
+    }
 }

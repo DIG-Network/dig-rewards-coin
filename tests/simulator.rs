@@ -996,32 +996,63 @@ fn empty_first_epoch_settles_where() -> anyhow::Result<()> {
     ensure_conditions_met(ctx, &mut harness.sim, conditions)?;
     harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
     harness.sim.spend_coins(ctx.take(), &[])?;
+    let reserve_after_claim = harness.distributor.info.state.total_reserves;
 
-    let if_carried_forward = (first_epoch_commitment + second_epoch_commitment) / 2;
-    let if_stranded = second_epoch_commitment / 2;
     println!(
-        "the sole entry, added AFTER the empty epoch, claimed {amount_base_units} base units \
-         at the halfway point of the second epoch. \
-         Half of BOTH commitments would be {if_carried_forward}; \
-         half of the SECOND alone would be {if_stranded}."
+        "the sole entry, added AFTER the empty epoch, claimed {amount_base_units} base units at \
+         the halfway point of the second epoch, leaving {reserve_after_claim} in the reserve. \
+         first_epoch_commitment={first_epoch_commitment} second_epoch_commitment={second_epoch_commitment}"
     );
 
-    // This is SPEC.md §15 clause 9a's open money question, and this is its answer: the value
-    // committed to an epoch that ran with nobody in the set is NOT stranded. It stays in
+    // SPEC.md §15 clause 9a's open money question, settled by measurement rather than inference:
+    // the value committed to an epoch that ran with nobody in the set is NOT stranded. It stays in
     // `remaining_rewards` untouched -- an empty epoch distributes nothing and pays nothing out --
     // and `NewEpoch` adds the next epoch's commitment on top of it, so the whole balance accrues
     // to whoever is in the set once somebody is. A funder who launches with a `first_epoch_start`
     // before its prover is ready loses nothing; the money simply waits.
-    let tolerance = if_carried_forward / 100;
-    assert!(
-        amount_base_units.abs_diff(if_carried_forward) <= tolerance,
-        "the empty epoch's value carried forward: expected about {if_carried_forward}, \
-         got {amount_base_units} (stranded would have been about {if_stranded})"
+    //
+    // Clause 9a bans an approximate assertion, a value the test recomputes from the same
+    // commitments the puzzle's own arithmetic consumes, and a bare `>` inequality standing in for
+    // a value -- so (a) and (b) below are EXACT base-unit LITERALS, measured once by running this
+    // harness (`first_epoch_commitment = 1_000_000`, `second_epoch_commitment = 400_000`,
+    // `TEST_EPOCH_SECONDS = 1_000`) and printed above, not derived here from those commitments. A
+    // literal can only match one arithmetic: if the empty epoch's value were stranded, `(a)` would
+    // read `200_000` and this assertion would fail; if it carried forward wrongly (e.g. double
+    // counted), `(a)` would read something other than `700_000` and still fail. Only the actual,
+    // correct carry-forward arithmetic passes.
+    assert_eq!(
+        amount_base_units, 700_000,
+        "(a) SPEC.md §15 clause 9a: the entry's claim at the second epoch's halfway point must \
+         pay out the empty epoch's value carried forward (700_000 = half of both commitments), \
+         never the stranded reading (200_000 = half of the second commitment alone): \
+         got {amount_base_units}"
     );
-    assert!(
-        amount_base_units > if_stranded * 2,
-        "the claim is far more than the second epoch alone could account for, so the first \
-         epoch's value was included"
+
+    // (b) the reserve's remaining base units after that claim -- clause 9a requires this figure
+    // as a literal too, independently of (a).
+    assert_eq!(
+        reserve_after_claim, 700_000,
+        "(b) SPEC.md §15 clause 9a: the reserve must hold exactly the funded total minus what was \
+         just claimed (1_400_000 funded - 700_000 claimed = 700_000): got {reserve_after_claim}"
+    );
+
+    // (c) conservation identity: the claim, the remaining reserve, and every base unit already
+    // paid out or skimmed as fee must together equal every base unit funded. Nothing had been
+    // fee'd or paid out anywhere earlier in this test (both rolls asserted `fee_base_units == 0`
+    // above, SPEC.md §7.3, and this is the entry's first claim), so that third term is 0 here --
+    // it is named rather than omitted so a future fee or an earlier payout in this test would be
+    // caught by the identity instead of silently passing under it.
+    let already_paid_out_or_skimmed_as_fee: u64 = 0;
+    let funded_total = first_epoch_commitment + second_epoch_commitment;
+    assert_eq!(
+        funded_total, 1_400_000,
+        "the harness commits 1_000_000 + 400_000 = 1_400_000 base units across the two epochs"
+    );
+    assert_eq!(
+        amount_base_units + reserve_after_claim + already_paid_out_or_skimmed_as_fee,
+        funded_total,
+        "(c) SPEC.md §15 clause 9a conservation: claimed + reserve remainder + already paid out \
+         or skimmed as fee must equal every base unit funded"
     );
 
     Ok(())
