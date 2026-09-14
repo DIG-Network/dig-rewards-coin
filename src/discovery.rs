@@ -220,4 +220,109 @@ mod tests {
         let result = discovered_distributors_in_spend(&observed);
         assert!(matches!(result, Err(RewardsError::Malformed(_))));
     }
+
+    #[test]
+    fn an_unparseable_solution_is_malformed_not_absent() {
+        let mut ctx = SpendContext::new();
+
+        // A well-formed puzzle reveal (quotes an empty condition list), but a solution that is
+        // not valid CLVM at all -- the solution-deserialise arm, distinct from the puzzle-reveal
+        // arm covered above.
+        let puzzle_ptr = clvm_quote!(Conditions::<NodePtr>::new())
+            .to_clvm(&mut ctx)
+            .unwrap();
+        let puzzle_reveal = ctx.serialize(&puzzle_ptr).unwrap();
+        let coin = Coin::new(Bytes32::new([1; 32]), ctx.tree_hash(puzzle_ptr).into(), 0);
+
+        let observed = CoinSpend::new(coin, puzzle_reveal, Program::from(vec![0xff]));
+
+        let result = discovered_distributors_in_spend(&observed);
+        assert!(matches!(result, Err(RewardsError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_puzzle_that_does_not_run_is_malformed_not_absent() {
+        // `(x)` -- CLVM opcode 8 applied to no arguments -- is valid CLVM that always raises when
+        // run, distinct from the puzzle-reveal and solution deserialise arms covered above.
+        let mut ctx = SpendContext::new();
+        let raising_puzzle = ctx.alloc(&(8, ())).unwrap();
+        let raising_reveal = ctx.serialize(&raising_puzzle).unwrap();
+
+        let coin = Coin::new(
+            Bytes32::new([1; 32]),
+            ctx.tree_hash(raising_puzzle).into(),
+            0,
+        );
+        let solution = ctx.serialize(&NodePtr::NIL).unwrap();
+        let observed = CoinSpend::new(coin, raising_reveal, solution);
+
+        let result = discovered_distributors_in_spend(&observed);
+        assert!(matches!(result, Err(RewardsError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_hint_that_does_not_match_the_dig_rewards_hint_yields_nothing() {
+        let mut ctx = SpendContext::new();
+
+        // Well-formed memos -- a hint atom and a comment string -- but the hint is some other
+        // string, not "Reward Distributor v1" (§13.1 clause 8: an absent/mismatched hint
+        // contributes no result rather than a defaulted one).
+        let other_hint_ptr = ctx.alloc(&"Some Other Hint").unwrap();
+        let comment_ptr = ctx.alloc(&"storeId:root").unwrap();
+        let memos = ctx.memos(&(other_hint_ptr, (comment_ptr, ()))).unwrap();
+
+        let parent_coin_id = Bytes32::new([3; 32]);
+        let launcher = Launcher::new(parent_coin_id, 1);
+        let conditions = Conditions::new().create_coin(launcher.coin().puzzle_hash, 1, memos);
+        let observed = quoted_puzzle_spend(&mut ctx, conditions);
+        let observed = CoinSpend::new(
+            Coin::new(
+                parent_coin_id,
+                observed.coin.puzzle_hash,
+                observed.coin.amount,
+            ),
+            observed.puzzle_reveal,
+            observed.solution,
+        );
+
+        let discoveries = discovered_distributors_in_spend(&observed).unwrap();
+        assert!(discoveries.is_empty());
+    }
+
+    #[test]
+    fn a_comment_that_does_not_parse_as_a_generation_yields_nothing() {
+        let mut ctx = SpendContext::new();
+
+        // The real DIG rewards hint, but a comment that is not a `storeId:root` pair -- §13.1
+        // clause 8's "malformed comment contributes no result" arm.
+        let hint_ptr = ctx.alloc(&"Reward Distributor v1").unwrap();
+        let comment_ptr = ctx.alloc(&"not-a-generation").unwrap();
+        let memos = ctx.memos(&(hint_ptr, (comment_ptr, ()))).unwrap();
+
+        let parent_coin_id = Bytes32::new([4; 32]);
+        let launcher = Launcher::new(parent_coin_id, 1);
+        let conditions = Conditions::new().create_coin(launcher.coin().puzzle_hash, 1, memos);
+        let observed = quoted_puzzle_spend(&mut ctx, conditions);
+        let observed = CoinSpend::new(
+            Coin::new(
+                parent_coin_id,
+                observed.coin.puzzle_hash,
+                observed.coin.amount,
+            ),
+            observed.puzzle_reveal,
+            observed.solution,
+        );
+
+        let discoveries = discovered_distributors_in_spend(&observed).unwrap();
+        assert!(discoveries.is_empty());
+    }
+
+    #[test]
+    fn discover_distributor_returns_none_when_the_chain_has_no_parent_spend() {
+        let launcher_id = Bytes32::new([5; 32]);
+        let chain = dig_chainsource_interface::MockChainSource::new();
+
+        let result = discover_distributor(&chain, launcher_id).unwrap();
+        assert!(result.is_none());
+    }
 }
