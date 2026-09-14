@@ -3154,7 +3154,11 @@ fn launch_manager_and_distributor_in_one_bundle(
         manager_parent.coin.coin_id(),
         ManagerInnerPuzzle::HashSuppliedByCaller(Bytes32::new([0x42; 32])),
     )?;
-    manager_p2.spend(ctx, manager_parent.coin, launched_manager.parent_conditions().clone())?;
+    manager_p2.spend(
+        ctx,
+        manager_parent.coin,
+        launched_manager.parent_conditions().clone(),
+    )?;
 
     // Mint the reward CAT and build the launch offer, exactly as `launch_harness` does.
     let funder = sim.bls(MINTED_BASE_UNITS);
@@ -3323,8 +3327,8 @@ fn mint_end_to_end_is_recoverable_by_discovery() -> anyhow::Result<()> {
 /// §13.1 clause 6: a `CREATE_COIN` to some OTHER puzzle hash, even carrying memos shaped exactly
 /// like a real DIG rewards comment, must not be mistaken for a launcher creation.
 #[test]
-fn a_create_coin_with_dig_shaped_memos_but_the_wrong_puzzle_hash_yields_nothing() -> anyhow::Result<()>
-{
+fn a_create_coin_with_dig_shaped_memos_but_the_wrong_puzzle_hash_yields_nothing(
+) -> anyhow::Result<()> {
     let mut ctx = SpendContext::new();
 
     let hint_ptr = ctx.alloc(&"Reward Distributor v1")?;
@@ -3334,8 +3338,7 @@ fn a_create_coin_with_dig_shaped_memos_but_the_wrong_puzzle_hash_yields_nothing(
 
     // Not the launcher puzzle hash `Launcher::new(coin_id, amount)` would derive for this parent
     // and amount -- an ordinary puzzle hash that happens to receive well-formed memos.
-    let conditions =
-        Conditions::new().create_coin(Bytes32::new([0x99; 32]), 1, memos);
+    let conditions = Conditions::new().create_coin(Bytes32::new([0x99; 32]), 1, memos);
     let puzzle_ptr = clvm_quote!(conditions).to_clvm(&mut ctx)?;
     let puzzle_reveal = ctx.serialize(&puzzle_ptr)?;
     let solution = ctx.serialize(&NodePtr::NIL)?;
@@ -3392,7 +3395,11 @@ fn two_launchers_in_one_spend_yield_two_distinct_results() -> anyhow::Result<()>
 
     let discoveries = discovered_distributors_in_spend(&observed)?;
 
-    assert_eq!(discoveries.len(), 2, "both launcher creations must contribute a result");
+    assert_eq!(
+        discoveries.len(),
+        2,
+        "both launcher creations must contribute a result"
+    );
     assert!(discoveries
         .iter()
         .any(|d| d.launcher_id() == expected_launcher_a_id && d.generation() == generation_a));

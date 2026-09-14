@@ -22,9 +22,9 @@
 //! distributor as its own.
 
 use chia_protocol::{Bytes32, CoinSpend};
+use chia_puzzle_types::Memos;
 use chia_sdk_driver::{Launcher, SpendContext};
 use chia_sdk_types::{Condition, Conditions};
-use chia_puzzle_types::Memos;
 use clvmr::NodePtr;
 use dig_chainsource_interface::ChainSource;
 
@@ -98,7 +98,9 @@ pub fn discovered_distributors_in_spend(
         })?;
 
     // The hint atom, recomputed rather than written as a hash literal (§13.1 clause 5).
-    let hint_ptr = ctx.alloc(&"Reward Distributor v1").map_err(RewardsError::from)?;
+    let hint_ptr = ctx
+        .alloc(&"Reward Distributor v1")
+        .map_err(RewardsError::from)?;
     let hint: Bytes32 = ctx.tree_hash(hint_ptr).into();
 
     let mut discoveries = Vec::new();
@@ -120,8 +122,7 @@ pub fn discovered_distributors_in_spend(
             continue;
         };
 
-        let Ok((memo_hint, (comment, ()))) =
-            ctx.extract::<(Bytes32, (String, ()))>(memos_ptr)
+        let Ok((memo_hint, (comment, ()))) = ctx.extract::<(Bytes32, (String, ()))>(memos_ptr)
         else {
             continue;
         };
