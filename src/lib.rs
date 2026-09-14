@@ -64,6 +64,7 @@ pub mod epoch;
 mod error;
 pub mod fund;
 pub mod launch;
+pub mod manager;
 pub mod payout;
 pub mod state;
 
@@ -83,6 +84,10 @@ pub use eligibility::{
 pub use entries::ManagerAuthority;
 pub use error::RewardsError;
 pub use launch::{funder_refund_puzzle_hash, launch_dig_distributor, LaunchedDistributor};
+pub use manager::{
+    launch_manager_singleton, LaunchedManagerSingleton, ManagerInnerPuzzle,
+    MANAGER_SINGLETON_AMOUNT_MOJOS,
+};
 pub use state::{
     read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot,
     STALE_ENTRY_SET_SECONDS,
