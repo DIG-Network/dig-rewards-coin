@@ -297,12 +297,12 @@ mod tests {
     /// never fire. This test fails under that defect and passes once overflow fails closed (#3321).
     #[test]
     fn a_saturating_max_seconds_offset_closes_the_window_instead_of_leaving_it_open_forever() {
+        use chia_protocol::Coin;
         use chia_puzzle_types::{EveProof, LineageProof, Proof};
         use chia_sdk_driver::{
             Reserve, RewardDistributorConstants, RewardDistributorInfo, RewardDistributorState,
             RewardDistributorType,
         };
-        use chia_protocol::Coin;
 
         let constants = RewardDistributorConstants::without_launcher_id(
             RewardDistributorType::Managed {
