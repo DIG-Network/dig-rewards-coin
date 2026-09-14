@@ -30,8 +30,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Tests
 - End-to-end mint + discovery coverage through the simulator, plus #3309's discovery negatives
-- A cost-bound regression for the discovery decode: a puzzle whose run would exceed
-  `DECODE_MAX_COST` is refused, not executed to completion (#11)
+- A cost-bound regression for the discovery decode: a puzzle whose charged cost would exceed
+  `DECODE_MAX_COST` is refused (#11)
 
 ## [0.5.0] - 2026-09-13
 

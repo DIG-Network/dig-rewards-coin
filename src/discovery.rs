@@ -46,6 +46,11 @@ use crate::RewardsError;
 /// comfortably admits every real spend this crate needs to decode while refusing one shaped to
 /// exhaust the block's whole budget. This is a bound this crate chose, not one upstream imposes;
 /// nothing in `chia-sdk-driver` 0.36.0 supplies a smaller default for a spend read off the chain.
+///
+/// This bound limits the summed *charged* cost of the operations `run_puzzle_with_cost` completes,
+/// not the work performed by any single one of them: `clvmr` 0.16.4 charges most operators (for
+/// example `op_multiply`) only after they finish, so one pair of very large atoms can still cost a
+/// decoding peer real CPU before the accumulated charge trips this ceiling.
 const DECODE_MAX_COST: u64 = 10_000_000;
 
 /// A distributor discovered from an observed spend -- private fields, no public constructor.
@@ -353,18 +358,18 @@ mod tests {
     }
 
     /// `observed`'s puzzle is attacker-chosen (`DECODE_MAX_COST`'s doc), so this decode MUST
-    /// refuse a puzzle whose run would exceed the declared cost bound rather than execute it to
-    /// completion. `(18 (1 . N) (1 . N))` -- opcode 18 is `*` -- multiplies two ~60 KB atoms
-    /// against each other; `clvmr`'s own cost model for `*` is roughly `len(N)^2 / 128`
-    /// (`more_ops.rs`'s `MUL_SQUARE_COST_PER_BYTE_DIVIDER`), so this run costs on the order of
-    /// 28,000,000 -- comfortably past `DECODE_MAX_COST`'s 10,000,000 -- while the two atoms
-    /// themselves are cheap to allocate (two flat byte buffers) and the interpreter itself stops
-    /// as soon as the declared bound is crossed, never actually finishing the multiplication.
-    /// This is deliberately NOT a 500,000-scale fixture: the cost wall this crate must respect is
-    /// a property of the numbers' BYTE LENGTH, not of a loop count, so a cheap, small-in-wall-time
-    /// construction is enough to cross it.
+    /// refuse a puzzle whose *charged* cost would exceed the declared bound. `(18 (1 . N) (1 . N))`
+    /// -- opcode 18 is `*` -- multiplies two ~60 KB atoms against each other; `clvmr`'s own cost
+    /// model for `*` is roughly `len(N)^2 / 128` (`more_ops.rs`'s `MUL_SQUARE_COST_PER_BYTE_DIVIDER`),
+    /// so this run costs on the order of 28,000,000 -- comfortably past `DECODE_MAX_COST`'s
+    /// 10,000,000 -- while the two atoms themselves are cheap to allocate (two flat byte buffers).
+    /// `clvmr` 0.16.4 completes this multiply in full and charges its cost afterward, so the
+    /// refusal here comes from the accumulated charge crossing the bound, not from the operation
+    /// being interrupted mid-run. This is deliberately NOT a 500,000-scale fixture: the cost wall
+    /// this crate must respect is a property of the numbers' BYTE LENGTH, not of a loop count, so a
+    /// cheap, small-in-wall-time construction is enough to cross it.
     #[test]
-    fn a_puzzle_over_the_decode_cost_bound_is_refused_not_run_to_completion() {
+    fn a_puzzle_over_the_decode_cost_bound_is_refused() {
         let mut ctx = SpendContext::new();
 
         let quote_op = ctx.new_small_number(1).unwrap();

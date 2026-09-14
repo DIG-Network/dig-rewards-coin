@@ -127,9 +127,9 @@ impl LaunchedManagerSingleton {
 ///
 /// The launcher id this call derives is curried into the distributor's action puzzles and can
 /// never be rotated. If the manager key (or the inner puzzle's recovery path, if any) is later
-/// lost, the entry set is frozen forever — no [`crate::add_entry`] and no
-/// [`crate::remove_entry`] ever again — while accrual and payouts to the already-frozen set keep
-/// running permissionlessly. This function's `inner_puzzle` argument is the **only** point at
+/// lost, the entry set is frozen forever — no [`crate::entries::add_entry`] and no
+/// [`crate::entries::remove_entry`] ever again — while accrual and payouts to the already-frozen
+/// set keep running permissionlessly. This function's `inner_puzzle` argument is the **only** point at
 /// which that risk can be mitigated: choosing [`ManagerInnerPuzzle::HashSuppliedByCaller`] with a
 /// multisig or other recovery-capable puzzle hash is the sole defense, and it is only available
 /// here, at launch. Once this call returns, the choice cannot be changed.
