@@ -40,6 +40,7 @@ use dig_rewards_coin::constants::{
     dig_distributor_constants, DistributorLaunchTerms, ENTRY_SHARES, MAX_SECONDS_OFFSET,
     PAYOUT_THRESHOLD_BASE_UNITS, WITHDRAWAL_SHARE_BPS,
 };
+use dig_rewards_coin::discovery::{discover_distributor, discovered_distributors_in_spend};
 use dig_rewards_coin::eligibility::{
     judge_candidate, EligibilityQuestion, EligiblePayoutHash, MirrorCoinFacts,
 };
@@ -49,6 +50,7 @@ use dig_rewards_coin::epoch::{
 };
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
+use dig_rewards_coin::manager::{launch_manager_singleton, ManagerInnerPuzzle};
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
 use dig_rewards_coin::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
 use dig_rewards_coin::{
@@ -3115,6 +3117,326 @@ fn a_backfill_forged_past_the_whole_budget_is_refused_with_the_earlier_generatio
         Ok(None) => panic!("Ok(None) is forbidden here (SPEC.md 0.1 clause 5d)"),
         Err(other) => panic!("expected CommitIncentivesBackfillBoundExceeded, got: {other}"),
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Manager-singleton launch (§7.2a) and on-chain discovery (§13.1) -- both driven end to end
+// through the real simulator, so a decode here is a decode of the actual CLVM output rather than
+// a hand-built `CoinSpend`.
+// ---------------------------------------------------------------------------------------------
+
+/// Launch a *real* manager singleton via [`launch_manager_singleton`] (§7.2a) and, in the SAME
+/// spend bundle, a DIG distributor naming it (§13.1's launch comment lives in the distributor's
+/// own launcher-creating spend, never the manager's). Returns the manager's derived launcher id,
+/// the distributor's launcher id, the generation the launch advertised, and every `CoinSpend` the
+/// bundle produced -- captured before `Simulator::spend_coins` consumes them, so a caller can
+/// decode the bundle exactly as a chain reader would see it and still finalise it afterwards.
+#[allow(clippy::type_complexity)]
+fn launch_manager_and_distributor_in_one_bundle(
+    ctx: &mut SpendContext,
+) -> anyhow::Result<(
+    Simulator,
+    Bytes32,
+    Bytes32,
+    LaunchComment,
+    Vec<chia_protocol::CoinSpend>,
+)> {
+    let mut sim = Simulator::new();
+
+    // §7.2a: the manager singleton, launched for real -- never `sim.new_coin`'s synthetic coin,
+    // which would leave no parent spend for discovery to decode.
+    let manager_parent = sim.bls(1);
+    let manager_p2 = StandardLayer::new(manager_parent.pk);
+    let launched_manager = launch_manager_singleton(
+        ctx,
+        manager_parent.coin.coin_id(),
+        ManagerInnerPuzzle::HashSuppliedByCaller(Bytes32::new([0x42; 32])),
+    )?;
+    manager_p2.spend(ctx, manager_parent.coin, launched_manager.parent_conditions().clone())?;
+
+    // Mint the reward CAT and build the launch offer, exactly as `launch_harness` does.
+    let funder = sim.bls(MINTED_BASE_UNITS);
+    let funder_p2 = StandardLayer::new(funder.pk);
+    let (issue_cat, source_cats) = Cat::single_issuance(
+        ctx,
+        funder.coin.coin_id(),
+        None,
+        MINTED_BASE_UNITS,
+        Conditions::new().create_coin(funder.puzzle_hash, MINTED_BASE_UNITS, Memos::None),
+    )?;
+    funder_p2.spend(ctx, funder.coin, issue_cat)?;
+    let source_cat = source_cats[0];
+
+    let offer_amount = 1;
+    let launcher_bls = sim.bls(offer_amount);
+    let offer_spend = StandardLayer::new(launcher_bls.pk).spend_with_conditions(
+        ctx,
+        Conditions::new().create_coin(SETTLEMENT_PAYMENT_HASH.into(), offer_amount, Memos::None),
+    )?;
+    let puzzle_reveal = ctx.serialize(&offer_spend.puzzle)?;
+    let solution = ctx.serialize(&offer_spend.solution)?;
+
+    let cat_inner_puzzle = clvm_quote!(Conditions::new().create_coin(
+        SETTLEMENT_PAYMENT_HASH.into(),
+        source_cat.coin.amount,
+        Memos::None
+    ))
+    .to_clvm(ctx)?;
+    let cat_inner_spend = funder_p2.delegated_inner_spend(
+        ctx,
+        Spend {
+            puzzle: cat_inner_puzzle,
+            solution: NodePtr::NIL,
+        },
+    )?;
+    source_cat.spend(
+        ctx,
+        SingleCatSpend {
+            prev_coin_id: source_cat.coin.coin_id(),
+            next_coin_proof: CoinProof {
+                parent_coin_info: source_cat.coin.parent_coin_info,
+                inner_puzzle_hash: funder.puzzle_hash,
+                amount: source_cat.coin.amount,
+            },
+            prev_subtotal: 0,
+            extra_delta: 0,
+            p2_spend: cat_inner_spend,
+            revoke: false,
+        },
+    )?;
+
+    let spends = ctx.take();
+    let cat_offer_spend = spends
+        .iter()
+        .find(|spend| spend.coin.coin_id() == source_cat.coin.coin_id())
+        .expect("the CAT offer spend")
+        .clone();
+    for spend in spends {
+        if spend.coin.coin_id() != source_cat.coin.coin_id() {
+            ctx.insert(spend);
+        }
+    }
+
+    let signature = sign_standard_transaction(
+        ctx,
+        launcher_bls.coin,
+        offer_spend,
+        &launcher_bls.sk,
+        &TESTNET11_CONSTANTS,
+    )?;
+    let offer = Offer::from_spend_bundle(
+        ctx,
+        &SpendBundle {
+            coin_spends: vec![
+                chia_protocol::CoinSpend::new(launcher_bls.coin, puzzle_reveal, solution),
+                cat_offer_spend,
+            ],
+            aggregated_signature: signature,
+        },
+    )?;
+
+    let constants = test_constants(
+        launched_manager.launcher_id(),
+        funder.puzzle_hash,
+        source_cat.info.asset_id,
+    );
+    let generation = LaunchComment::new(Bytes32::new([0x11; 32]), Bytes32::new([0x22; 32]));
+    let launched = launch_dig_distributor(
+        ctx,
+        &offer,
+        FIRST_EPOCH_START,
+        constants,
+        &TESTNET11_CONSTANTS,
+        generation,
+        0,
+    )?;
+
+    let distributor_launcher_id = launched.distributor.info.constants.launcher_id;
+
+    // Captured before `spend_coins` drains `ctx` -- this is the whole bundle: the manager's
+    // launch, the CAT issuance, the offer settlement, and the distributor's launch, all in one.
+    let all_spends = ctx.take();
+
+    sim.spend_coins(
+        all_spends.clone(),
+        &[
+            manager_parent.sk.clone(),
+            launcher_bls.sk.clone(),
+            launched.security_coin_secret_key.clone(),
+            funder.sk.clone(),
+        ],
+    )?;
+
+    Ok((
+        sim,
+        launched_manager.launcher_id(),
+        distributor_launcher_id,
+        generation,
+        all_spends,
+    ))
+}
+
+/// §7.2a + §13.1 end to end: mint a manager singleton and a DIG distributor in one bundle, then
+/// recover the distributor's generation from nothing but the bundle's own `CoinSpend`s -- the
+/// same shape a chain reader decodes from.
+#[test]
+fn mint_end_to_end_is_recoverable_by_discovery() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, manager_launcher_id, distributor_launcher_id, generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    // Every spend in the bundle is a candidate parent -- decode each and keep whatever a real
+    // `discover_distributor` walk over `parent_spend(distributor_launcher_id)` would find.
+    let mut discovered = Vec::new();
+    for spend in &all_spends {
+        discovered.extend(discovered_distributors_in_spend(spend)?);
+    }
+
+    assert_eq!(
+        discovered.len(),
+        1,
+        "exactly one CREATE_COIN in the whole bundle carries a well-formed DIG rewards comment \
+         -- the manager singleton's own launcher-creating CREATE_COIN has no memo at all \
+         (`Launcher::new`, not `Launcher::with_memos`) and must not contribute a result"
+    );
+    assert_eq!(
+        discovered[0].launcher_id(),
+        distributor_launcher_id,
+        "the decoded launcher id must be the DISTRIBUTOR's, never the manager's"
+    );
+    assert_ne!(
+        discovered[0].launcher_id(),
+        manager_launcher_id,
+        "the manager singleton and the distributor are different launches with different ids"
+    );
+    assert_eq!(
+        discovered[0].generation(),
+        generation,
+        "the decoded generation must be exactly what the launch advertised"
+    );
+
+    Ok(())
+}
+
+/// §13.1 clause 6: a `CREATE_COIN` to some OTHER puzzle hash, even carrying memos shaped exactly
+/// like a real DIG rewards comment, must not be mistaken for a launcher creation.
+#[test]
+fn a_create_coin_with_dig_shaped_memos_but_the_wrong_puzzle_hash_yields_nothing() -> anyhow::Result<()>
+{
+    let mut ctx = SpendContext::new();
+
+    let hint_ptr = ctx.alloc(&"Reward Distributor v1")?;
+    let hint: Bytes32 = ctx.tree_hash(hint_ptr).into();
+    let generation = LaunchComment::new(Bytes32::new([0x33; 32]), Bytes32::new([0x44; 32]));
+    let memos = ctx.memos(&(hint, (generation.to_string(), ())))?;
+
+    // Not the launcher puzzle hash `Launcher::new(coin_id, amount)` would derive for this parent
+    // and amount -- an ordinary puzzle hash that happens to receive well-formed memos.
+    let conditions =
+        Conditions::new().create_coin(Bytes32::new([0x99; 32]), 1, memos);
+    let puzzle_ptr = clvm_quote!(conditions).to_clvm(&mut ctx)?;
+    let puzzle_reveal = ctx.serialize(&puzzle_ptr)?;
+    let solution = ctx.serialize(&NodePtr::NIL)?;
+    let coin = Coin::new(
+        Bytes32::new([0x01; 32]),
+        ctx.tree_hash(puzzle_ptr).into(),
+        0,
+    );
+    let observed = chia_protocol::CoinSpend::new(coin, puzzle_reveal, solution);
+
+    let discoveries = discovered_distributors_in_spend(&observed)?;
+    assert!(
+        discoveries.is_empty(),
+        "well-formed memos on the wrong puzzle hash must not be mistaken for a launcher creation"
+    );
+
+    Ok(())
+}
+
+/// §13.1 clause 7: a spend that creates TWO launchers, each with its own well-formed comment,
+/// yields two distinct results -- not one, and not a merge of the two.
+#[test]
+fn two_launchers_in_one_spend_yield_two_distinct_results() -> anyhow::Result<()> {
+    let mut ctx = SpendContext::new();
+
+    let parent_coin_id = Bytes32::new([0x01; 32]);
+    let hint_ptr = ctx.alloc(&"Reward Distributor v1")?;
+    let hint: Bytes32 = ctx.tree_hash(hint_ptr).into();
+
+    let generation_a = LaunchComment::new(Bytes32::new([0xa1; 32]), Bytes32::new([0xa2; 32]));
+    let generation_b = LaunchComment::new(Bytes32::new([0xb1; 32]), Bytes32::new([0xb2; 32]));
+
+    let launcher_a = Launcher::new(parent_coin_id, 7);
+    let launcher_b = Launcher::new(parent_coin_id, 9);
+
+    let memos_a = ctx.memos(&(hint, (generation_a.to_string(), ())))?;
+    let memos_b = ctx.memos(&(hint, (generation_b.to_string(), ())))?;
+
+    let conditions = Conditions::new()
+        .create_coin(launcher_a.coin().puzzle_hash, 7, memos_a)
+        .create_coin(launcher_b.coin().puzzle_hash, 9, memos_b);
+    let puzzle_ptr = clvm_quote!(conditions).to_clvm(&mut ctx)?;
+    let puzzle_reveal = ctx.serialize(&puzzle_ptr)?;
+    let solution = ctx.serialize(&NodePtr::NIL)?;
+    let coin = Coin::new(parent_coin_id, ctx.tree_hash(puzzle_ptr).into(), 0);
+    let observed = chia_protocol::CoinSpend::new(coin, puzzle_reveal, solution);
+
+    // The discovered launcher id is re-derived from the SPENT coin's own id (`observed.coin`),
+    // never from `parent_coin_id` -- the spent coin, not its parent, is the launcher's actual
+    // parent on chain.
+    let expected_launcher_a_id = Launcher::new(coin.coin_id(), 7).coin().coin_id();
+    let expected_launcher_b_id = Launcher::new(coin.coin_id(), 9).coin().coin_id();
+    let _ = (launcher_a, launcher_b);
+
+    let discoveries = discovered_distributors_in_spend(&observed)?;
+
+    assert_eq!(discoveries.len(), 2, "both launcher creations must contribute a result");
+    assert!(discoveries
+        .iter()
+        .any(|d| d.launcher_id() == expected_launcher_a_id && d.generation() == generation_a));
+    assert!(discoveries
+        .iter()
+        .any(|d| d.launcher_id() == expected_launcher_b_id && d.generation() == generation_b));
+    assert_ne!(
+        discoveries[0].launcher_id(),
+        discoveries[1].launcher_id(),
+        "two distinct launches must never collapse into one result"
+    );
+
+    Ok(())
+}
+
+/// [`discover_distributor`] over a real `ChainSource`: given the distributor's launcher id alone,
+/// it must recover the same generation the launch advertised -- §13.1 clause 2's whole claim,
+/// exercised through the trait boundary a real caller uses rather than the pure decode directly.
+#[test]
+fn discover_distributor_recovers_the_generation_via_a_real_chain_source() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (sim, _manager_launcher_id, distributor_launcher_id, generation, _all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    // `parent_spend` resolves the launcher coin's OWN record to find its parent (the security
+    // coin), then reads that parent's spend -- so both the launcher's record and the security
+    // coin's spend must be loaded, not just the launcher's.
+    let security_coin_id = sim
+        .coin_state(distributor_launcher_id)
+        .expect("the launcher coin was recorded")
+        .coin
+        .parent_coin_info;
+    let chain = mock_chain_source(
+        &sim,
+        distributor_launcher_id,
+        &[distributor_launcher_id],
+        &[security_coin_id],
+    );
+
+    let discovered = discover_distributor(&chain, distributor_launcher_id)?
+        .expect("the distributor's launch is in the chain source");
+
+    assert_eq!(discovered.launcher_id(), distributor_launcher_id);
+    assert_eq!(discovered.generation(), generation);
 
     Ok(())
 }
