@@ -14,9 +14,24 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Bug Fixes
 - Fail closed on a saturating `max_seconds_offset` instead of leaving the entry-set write window
   permanently open (#3321)
+- Bound `discovered_distributors_in_spend`'s CLVM run of an observed (attacker-chosen) spend to an
+  explicit `DECODE_MAX_COST`, rather than relying on `ctx.run`'s implicit full-block-cost ceiling
+  (`src/discovery.rs`) (#11)
+- Mark `ManagerInnerPuzzle` `#[non_exhaustive]`, matching `RewardsError` and this crate's other
+  enums, since a `MultisigBuiltHere` arm is the most likely future addition and this is a published
+  crate consumers pin (`src/manager.rs`) (#11)
+
+### Documentation
+- Qualify SPEC.md's §13.1 status: only clauses 4-10 (the decode) ship at 0.6.0; clauses 1-3 (the
+  scan) remain #3250's, corrected everywhere the row previously read as "ships" without that split
+  (§14, §15.2) (#11)
+- Document `launch_manager_singleton`'s permanent-freeze risk and the one-bundle requirement for
+  the parent spend and the distributor launch (SPEC.md §7.2 clause 3, §7.2a clause 9) (#11)
 
 ### Tests
 - End-to-end mint + discovery coverage through the simulator, plus #3309's discovery negatives
+- A cost-bound regression for the discovery decode: a puzzle whose run would exceed
+  `DECODE_MAX_COST` is refused, not executed to completion (#11)
 
 ## [0.5.0] - 2026-09-13
 

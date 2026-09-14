@@ -24,12 +24,29 @@
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
 use chia_sdk_driver::{Launcher, SpendContext};
-use chia_sdk_types::{Condition, Conditions};
+use chia_sdk_types::{run_puzzle_with_cost, Condition, Conditions};
 use clvmr::NodePtr;
 use dig_chainsource_interface::ChainSource;
 
 use crate::comment::LaunchComment;
 use crate::RewardsError;
+
+/// The CLVM cost budget this decode allows itself to spend running `observed`'s puzzle.
+///
+/// `observed` is a spend this crate did not build -- a peer scanning the chain for distributors
+/// hands this function whatever parent spend a `launcher_id` names, and that spend's puzzle is
+/// attacker-chosen (SPEC.md §13.1 clause 2, §1.3). `SpendContext::run` alone bounds cost only to
+/// `chia_sdk_types::MAINNET_CONSTANTS.max_block_cost_clvm` (`11_000_000_000`) -- the cost of an
+/// entire block, not of one coin spend -- so calling it directly here would let a single crafted
+/// spend force every peer that decodes it to burn close to a full block's CPU budget on one
+/// decode. `10_000_000` is three orders of magnitude below that ceiling while remaining three
+/// orders of magnitude above what an ordinary standard-puzzle or singleton-launcher spend costs
+/// to run (the spends this crate's own `launch_dig_distributor` / `launch_manager_singleton`
+/// produce, and the only shapes a well-formed launcher-creating parent spend takes), so it
+/// comfortably admits every real spend this crate needs to decode while refusing one shaped to
+/// exhaust the block's whole budget. This is a bound this crate chose, not one upstream imposes;
+/// nothing in `chia-sdk-driver` 0.36.0 supplies a smaller default for a spend read off the chain.
+const DECODE_MAX_COST: u64 = 10_000_000;
 
 /// A distributor discovered from an observed spend -- private fields, no public constructor.
 ///
@@ -86,9 +103,18 @@ pub fn discovered_distributors_in_spend(
             "observed spend's solution could not be deserialised: {error}"
         ))
     })?;
-    let output_ptr = ctx.run(puzzle_ptr, solution_ptr).map_err(|error| {
-        RewardsError::Malformed(format!("observed spend's puzzle did not run: {error}"))
-    })?;
+    // Bounded explicitly to `DECODE_MAX_COST` rather than via `ctx.run` (§13.1's decode runs
+    // attacker-chosen CLVM -- see `DECODE_MAX_COST`'s doc for why `ctx.run`'s own implicit
+    // full-block bound is not tight enough here).
+    let clvmr::reduction::Reduction(_cost, output_ptr) =
+        run_puzzle_with_cost(&mut ctx, puzzle_ptr, solution_ptr, DECODE_MAX_COST, false).map_err(
+            |error| {
+                RewardsError::Malformed(format!(
+                    "observed spend's puzzle did not run within the decode's {DECODE_MAX_COST} \
+                     cost bound: {error}"
+                ))
+            },
+        )?;
     let conditions = ctx
         .extract::<Conditions<NodePtr>>(output_ptr)
         .map_err(|error| {
@@ -324,5 +350,49 @@ mod tests {
 
         let result = discover_distributor(&chain, launcher_id).unwrap();
         assert!(result.is_none());
+    }
+
+    /// `observed`'s puzzle is attacker-chosen (`DECODE_MAX_COST`'s doc), so this decode MUST
+    /// refuse a puzzle whose run would exceed the declared cost bound rather than execute it to
+    /// completion. `(18 (1 . N) (1 . N))` -- opcode 18 is `*` -- multiplies two ~60 KB atoms
+    /// against each other; `clvmr`'s own cost model for `*` is roughly `len(N)^2 / 128`
+    /// (`more_ops.rs`'s `MUL_SQUARE_COST_PER_BYTE_DIVIDER`), so this run costs on the order of
+    /// 28,000,000 -- comfortably past `DECODE_MAX_COST`'s 10,000,000 -- while the two atoms
+    /// themselves are cheap to allocate (two flat byte buffers) and the interpreter itself stops
+    /// as soon as the declared bound is crossed, never actually finishing the multiplication.
+    /// This is deliberately NOT a 500,000-scale fixture: the cost wall this crate must respect is
+    /// a property of the numbers' BYTE LENGTH, not of a loop count, so a cheap, small-in-wall-time
+    /// construction is enough to cross it.
+    #[test]
+    fn a_puzzle_over_the_decode_cost_bound_is_refused_not_run_to_completion() {
+        let mut ctx = SpendContext::new();
+
+        let quote_op = ctx.new_small_number(1).unwrap();
+        let multiply_op = ctx.new_small_number(18).unwrap();
+        let big_atom = ctx.new_atom(&vec![0x7f_u8; 60_000]).unwrap();
+        let quoted_big_atom = ctx.new_pair(quote_op, big_atom).unwrap();
+        let nil = ctx.nil();
+        let second_arg = ctx.new_pair(quoted_big_atom, nil).unwrap();
+        let arg_list = ctx.new_pair(quoted_big_atom, second_arg).unwrap();
+        let expensive_puzzle = ctx.new_pair(multiply_op, arg_list).unwrap();
+
+        let puzzle_reveal = ctx.serialize(&expensive_puzzle).unwrap();
+        let solution = ctx.serialize(&NodePtr::NIL).unwrap();
+        let coin = Coin::new(
+            Bytes32::new([1; 32]),
+            ctx.tree_hash(expensive_puzzle).into(),
+            0,
+        );
+        let observed = CoinSpend::new(coin, puzzle_reveal, solution);
+
+        match discovered_distributors_in_spend(&observed) {
+            Err(RewardsError::Malformed(message)) => assert!(
+                message.contains(&DECODE_MAX_COST.to_string()),
+                "the refusal must name the cost bound it enforced, got: {message}"
+            ),
+            other => panic!(
+                "expected a Malformed refusal naming the decode's cost bound, got: {other:?}"
+            ),
+        }
     }
 }

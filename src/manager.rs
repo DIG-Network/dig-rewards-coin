@@ -37,6 +37,7 @@ pub const MANAGER_SINGLETON_AMOUNT_MOJOS: u64 = 1;
 /// fail to compile, never receive a silent default for the one choice that is permanent after
 /// launch (§7.2 clause 1a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManagerInnerPuzzle {
     /// A `p2_delegated_puzzle_or_hidden_puzzle` this crate curries to one public key.
     ///
@@ -121,6 +122,28 @@ impl LaunchedManagerSingleton {
 /// whose spend will create the launcher coin. This function inserts the launcher coin's own spend
 /// into `ctx` and returns the conditions the **parent** spend must carry (§7.2a clause 6); it signs
 /// and spends nothing itself (§0.1 clause 2).
+///
+/// # This choice is permanent (`SPEC.md` §7.2 clause 3, §7.2a)
+///
+/// The launcher id this call derives is curried into the distributor's action puzzles and can
+/// never be rotated. If the manager key (or the inner puzzle's recovery path, if any) is later
+/// lost, the entry set is frozen forever — no [`crate::add_entry`] and no
+/// [`crate::remove_entry`] ever again — while accrual and payouts to the already-frozen set keep
+/// running permissionlessly. This function's `inner_puzzle` argument is the **only** point at
+/// which that risk can be mitigated: choosing [`ManagerInnerPuzzle::HashSuppliedByCaller`] with a
+/// multisig or other recovery-capable puzzle hash is the sole defense, and it is only available
+/// here, at launch. Once this call returns, the choice cannot be changed.
+///
+/// # The parent spend and this launch MUST land together (§7.2a clause 9)
+///
+/// This call only builds the launcher coin's own spend; the **parent** coin spend that actually
+/// creates that launcher coin is the caller's, built from the conditions this call returns. A
+/// distributor launched against this launcher id before the parent spend confirms — or when it
+/// never confirms at all — is live, fundable and **permanently unwritable**: the id is not zero,
+/// so [`RewardsError::InvalidLaunchTerms`]'s zero-launcher-id refusal cannot catch it, and it
+/// names a coin that was never created. A creation surface built on this function SHOULD place
+/// this call's parent-spend conditions and the distributor launch in **one spend bundle**, so the
+/// two either both land or neither does.
 ///
 /// # Errors
 ///
