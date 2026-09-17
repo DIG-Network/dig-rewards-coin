@@ -389,6 +389,18 @@ fn entry_set_is_stale(
         return true;
     };
 
+    // `last_write > peak_timestamp` is a clock inconsistency -- a reorg, out-of-order block
+    // timestamps, or an inconsistent chain source -- not a valid "the write is in the future"
+    // reading. `saturating_sub` alone turns that inconsistency into `0`, which reads as freshly
+    // written; §12.4's whole point is a signal a funder cannot flatter, so an unanswerable
+    // comparison must report the SAFE direction (stale) rather than silently read healthy
+    // (DIG-Network/dig_ecosystem#3304 item 1). This needs no return-type change: `entry_set_stale`
+    // already returns a bool with no way for a caller to distinguish "fresh" from "unknown", so
+    // reporting `true` here is the only direction that cannot be misread as reassurance.
+    if last_write > peak_timestamp {
+        return true;
+    }
+
     peak_timestamp.saturating_sub(last_write) >= STALE_ENTRY_SET_SECONDS
 }
 
@@ -1411,6 +1423,21 @@ mod tests {
         assert!(
             entry_set_is_stale(1, last_write + STALE_ENTRY_SET_SECONDS, Some(last_write)),
             "the threshold itself is stale (§12.4 says `>=`)"
+        );
+    }
+
+    /// DIG-Network/dig_ecosystem#3304 item 1: `last_entry_write_unix > peak_timestamp` -- a
+    /// reorg, out-of-order block timestamps, or an inconsistent chain source -- must report
+    /// STALE, not fresh. `saturating_sub` alone yields `0` here, which reads as freshly written;
+    /// this test fails if only that guard (the `last_write > peak_timestamp` check) is reverted.
+    #[test]
+    fn an_inconsistent_clock_where_the_write_is_after_the_peak_reports_stale() {
+        let peak_timestamp = 1_000_000;
+        let last_write = peak_timestamp + 1;
+
+        assert!(
+            entry_set_is_stale(1, peak_timestamp, Some(last_write)),
+            "an unanswerable clock comparison must report the safe direction (stale), not fresh"
         );
     }
 
