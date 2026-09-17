@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.7.0] - 2026-09-16
+
+### Security
+- Bound `puzzle_reveal`/`solution` size before decode in on-chain discovery, independent of the
+  existing CLVM cost bound (#3333, `DECODE_MAX_SERIALIZED_BYTES = 65_536`)
+- Report an entry set as stale, not fresh, when its last-write timestamp is inverted relative to the
+  observed peak (#3304 item 1)
+- Authenticate every zero-amount eve-era reserve candidate as a genuine CAT child of the reserve
+  asset id before selecting one, closing a decoy read-DoS on `find_eve_reserve_provenance` (#3304
+  item 2)
+
+### Documentation
+- Cross-reference the two same-named "base units of reward" quantities in `recoverable_base_units`
+  and `rewards_per_distributor_epoch` (#3304 item 3)
+- `RUSTDOCFLAGS=-D warnings` on the doc gate, `--locked` on every resolving CI step (#3335, #3304
+  item 4)
+
+### Tests
+- Assert the real launch spend's discarded CLVM decode cost as a measured literal, `55_338` (#3334)
+
 ## [0.6.0] - 2026-09-14
 
 ### Features
