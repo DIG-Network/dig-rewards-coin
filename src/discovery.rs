@@ -77,12 +77,19 @@ const DECODE_MAX_COST: u64 = 10_000_000;
 /// 0.6.0) gave a largest observed `puzzle_reveal` of **2,060 bytes** and a largest observed
 /// `solution` of **387 bytes** -- both on the order of 1-2 KB, as an ordinary standard-puzzle or
 /// singleton-launcher spend is. Sixteen times the larger of the two is 32,960 bytes, and the
-/// smallest power of two at or above that is 65,536 (64 KiB) -- which is also this bound's cap, so
-/// the measurement and the cap agree: 64 KiB is roughly **32x** headroom over the largest spend
-/// this crate's own launches produce, comfortable room for a real spend while still refusing the
-/// multi-megabyte blob DIG-Network/dig_ecosystem#3333 is about.
+/// smallest power of two at or above that is 65,536 (64 KiB) -- comfortable room for a real spend
+/// while still refusing the multi-megabyte blob DIG-Network/dig_ecosystem#3333 is about. This
+/// derivation is pinned by `tests/simulator.rs`'s
+/// `the_real_launch_spends_observed_sizes_are_measured_literals`, the same way the neighbouring
+/// `DECODE_MAX_COST` literal is pinned by `the_real_launch_spends_decode_cost_is_a_measured_literal`
+/// -- an unpinned "measured" number is silent drift the moment the fixture it was measured from
+/// changes shape.
 ///
 /// # What this bound does NOT cover
+///
+/// Scoped to [`discovered_distributors_in_spend`] only -- [`crate::state::find_eve_reserve_provenance`]
+/// performs its own, separate per-candidate size check against this same constant (see that
+/// function's doc), and is not covered by the list below.
 ///
 /// A screen that reads as complete and is not is worse than no screen at all -- 0.5.0 shipped
 /// exactly that shape once already (`commit_incentives.rs` hanging at `epoch_seconds == 0` while
@@ -93,10 +100,11 @@ const DECODE_MAX_COST: u64 = 10_000_000;
 ///    *evaluation cost* of a spend under 64 KiB is bounded only by `DECODE_MAX_COST`, which is
 ///    itself charged post-hoc (see that constant's own doc) -- a small puzzle can still be a slow
 ///    one to run.
-/// 2. **Everything the run produces is unbounded by this check.** `ctx.extract::<Conditions<..>>`,
-///    the `tree_hash` computed over the hint, and the per-`CREATE_COIN` memo extraction all
-///    execute *after* this gate and are bounded only by however many conditions the run
-///    produced -- a small serialized input can still unpack into a large condition list.
+/// 2. **Everything the run produces is unbounded by this check.** `ctx.extract::<Conditions<..>>`
+///    and the per-`CREATE_COIN` memo extraction execute *after* this gate and are bounded only by
+///    however many conditions the run produced -- a small serialized input can still unpack into a
+///    large condition list. (The hint `tree_hash` is computed once, over the fixed literal
+///    `"Reward Distributor v1"`, and does not scale with the run's output at all.)
 /// 3. **In-memory amplification is untouched.** This bounds bytes *received*, not bytes *held*: a
 ///    small serialized atom can still expand into a far larger `NodePtr` tree once allocated.
 /// 4. **This is a per-spend bound, not a per-scan one.** N spends each one byte under the limit

@@ -37,6 +37,7 @@ use clvm_traits::clvm_tuple;
 use clvmr::NodePtr;
 use dig_chainsource_interface::ChainSource;
 
+use crate::discovery::DECODE_MAX_SERIALIZED_BYTES;
 use crate::RewardsError;
 
 /// A distributor's entry set has not changed in this long, while its reserve is non-zero, is
@@ -1268,6 +1269,13 @@ pub fn read_distributor(
 /// authentication failure is not itself grounds for refusal. Two or more candidates that DO
 /// authenticate at the same lowest height still refuse -- a wrong read is worse than a DoS, so
 /// no tiebreak heuristic is added here.
+///
+/// Each candidate's parent spend is also checked against
+/// [`crate::discovery::DECODE_MAX_SERIALIZED_BYTES`] before either of its fields is allocated --
+/// this loop runs once per candidate, over parent spends an attacker can plant (any number of
+/// zero-amount decoys at `reserve_full_puzzle_hash`), so an unbounded allocation here is
+/// per-candidate amplification of exactly the shape `discovery.rs`'s own size bound exists to
+/// close on its own read path; the same limit is reused rather than a second one invented.
 fn find_eve_reserve_provenance(
     ctx: &mut SpendContext,
     source: &impl ChainSource,
@@ -1299,9 +1307,24 @@ fn find_eve_reserve_provenance(
         };
         let candidate_coin_id = candidate.coin.coin_id();
 
-        let Ok(Some(parent_spend)) = source.parent_spend(candidate_coin_id) else {
-            continue;
+        // `Err` and `Ok(None)` are NOT the same signal: `Ok(None)` is a decoy whose parent was
+        // never registered (the natural "fails authentication" shape), but `Err` is the chain
+        // source itself failing -- e.g. a transient RPC error on the one candidate that IS
+        // genuine. Collapsing both into "continue" would make a transient failure on the real
+        // reserve read as "no candidate authenticates", i.e. malformed chain data, when the
+        // honest answer is "try again". That is exactly the absence-vs-failure defect #3304 item
+        // 1 exists to close, reintroduced on this neighbouring path if collapsed.
+        let parent_spend = match source.parent_spend(candidate_coin_id) {
+            Ok(Some(parent_spend)) => parent_spend,
+            Ok(None) => continue,
+            Err(err) => return Err(chain_unavailable(err)),
         };
+
+        if parent_spend.puzzle_reveal.len() > DECODE_MAX_SERIALIZED_BYTES
+            || parent_spend.solution.len() > DECODE_MAX_SERIALIZED_BYTES
+        {
+            continue;
+        }
 
         let Ok(parent_puzzle_ptr) = ctx.alloc(&parent_spend.puzzle_reveal) else {
             continue;

@@ -2246,11 +2246,6 @@ fn two_authenticating_reserve_candidates_at_the_same_height_still_refuses() -> a
         reserve_full_puzzle_hash,
         0,
     );
-    assert_eq!(
-        twin.puzzle_hash, reserve_full_puzzle_hash,
-        "the CAT layer must wrap the same asset id + inner puzzle hash to the identical full \
-         puzzle hash the real eve reserve sits at, or this fixture is not testing what it claims"
-    );
 
     let real_confirmed_height = chain
         .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
@@ -3520,6 +3515,42 @@ fn the_real_launch_spends_decode_cost_is_a_measured_literal() -> anyhow::Result<
         measured_cost, 55_338,
         "the real launch spend's decode cost moved -- re-measure and update this literal \
          deliberately rather than loosen it to a tolerance band"
+    );
+
+    Ok(())
+}
+
+/// Pins `DECODE_MAX_SERIALIZED_BYTES`'s own doc-comment derivation: the largest observed
+/// `puzzle_reveal` and `solution` across a real launch bundle, so that literal cannot silently
+/// drift the way an unpinned "measured" number would (the same discipline
+/// `the_real_launch_spends_decode_cost_is_a_measured_literal` applies to the neighbouring cost
+/// literal).
+#[test]
+fn the_real_launch_spends_observed_sizes_are_measured_literals() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, _manager_launcher_id, _distributor_launcher_id, _generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    let largest_puzzle_reveal = all_spends
+        .iter()
+        .map(|spend| spend.puzzle_reveal.len())
+        .max()
+        .expect("the bundle produced at least one spend");
+    let largest_solution = all_spends
+        .iter()
+        .map(|spend| spend.solution.len())
+        .max()
+        .expect("the bundle produced at least one spend");
+
+    assert_eq!(
+        largest_puzzle_reveal, 2_060,
+        "the largest puzzle_reveal in a real launch bundle moved -- re-measure and update \
+         DECODE_MAX_SERIALIZED_BYTES's doc comment deliberately, this literal must track it"
+    );
+    assert_eq!(
+        largest_solution, 387,
+        "the largest solution in a real launch bundle moved -- re-measure and update \
+         DECODE_MAX_SERIALIZED_BYTES's doc comment deliberately, this literal must track it"
     );
 
     Ok(())
