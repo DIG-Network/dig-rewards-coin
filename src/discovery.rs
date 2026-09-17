@@ -510,7 +510,9 @@ mod tests {
                 assert_eq!(actual_len, DECODE_MAX_SERIALIZED_BYTES + 1);
                 assert_eq!(limit_bytes, DECODE_MAX_SERIALIZED_BYTES);
             }
-            other => panic!("expected ObservedSpendFieldTooLarge naming puzzle_reveal, got: {other:?}"),
+            other => {
+                panic!("expected ObservedSpendFieldTooLarge naming puzzle_reveal, got: {other:?}")
+            }
         }
     }
 
@@ -584,4 +586,3 @@ mod tests {
         }
     }
 }
-

@@ -1335,7 +1335,11 @@ fn find_eve_reserve_provenance(
             continue;
         };
 
-        authenticated.push((confirmed_height, candidate.coin.parent_coin_info, lineage_proof));
+        authenticated.push((
+            confirmed_height,
+            candidate.coin.parent_coin_info,
+            lineage_proof,
+        ));
     }
 
     if authenticated.is_empty() {

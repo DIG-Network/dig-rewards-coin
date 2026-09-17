@@ -2241,7 +2241,11 @@ fn two_authenticating_reserve_candidates_at_the_same_height_still_refuses() -> a
         .find(|spend| spend.coin.coin_id() == second_source_cat.coin.coin_id())
         .expect("the second CAT spend was produced");
 
-    let twin = Coin::new(second_source_cat.coin.coin_id(), reserve_full_puzzle_hash, 0);
+    let twin = Coin::new(
+        second_source_cat.coin.coin_id(),
+        reserve_full_puzzle_hash,
+        0,
+    );
     assert_eq!(
         twin.puzzle_hash, reserve_full_puzzle_hash,
         "the CAT layer must wrap the same asset id + inner puzzle hash to the identical full \
