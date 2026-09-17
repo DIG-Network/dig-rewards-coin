@@ -2115,8 +2115,15 @@ fn a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_select
     Ok(())
 }
 
+/// #3304 item 2: a zero-amount decoy at the reserve puzzle hash that has no resolvable CAT
+/// lineage (no registered parent spend) must be discarded during authentication, not treated as
+/// an ambiguous sibling of the real candidate -- otherwise landing such a decoy is a standing
+/// read-DoS requiring no signature and no genuine spend. This replaces the previous version of
+/// this test, which asserted the OLD (buggy) selects-before-authenticating behaviour: it expected
+/// this exact decoy to make the read refuse with "ambiguous ...". Under the fix the decoy fails
+/// authentication and is silently discarded, and the real candidate alone is picked.
 #[test]
-fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyhow::Result<()> {
+fn a_zero_amount_decoy_that_fails_lineage_does_not_prevent_the_read() -> anyhow::Result<()> {
     use dig_chainsource_interface::ChainSource;
 
     let ctx = &mut SpendContext::new();
@@ -2143,8 +2150,8 @@ fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyho
         .expect("the genuine eve-era reserve candidate is loaded");
 
     // A second, distinct coin at the identical puzzle hash, also zero-amount, confirmed at the
-    // identical height -- the selector has no principled way to prefer one over the other, so it
-    // must refuse rather than pick arbitrarily.
+    // identical height -- but with NO registered parent spend, so it can never authenticate as a
+    // genuine CAT of the reserve asset id. A decoy this cheap to plant must not brick the read.
     let twin = Coin::new(Bytes32::new([0x88; 32]), reserve_full_puzzle_hash, 0);
     let chain = chain.with_coin(
         twin.coin_id(),
@@ -2157,11 +2164,355 @@ fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyho
         },
     );
 
-    // The specific reason matters: `Malformed(_)` alone is satisfied by the orderings where
-    // `pop()` happens to return the twin and the read then fails somewhere later in the recipe.
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "a decoy that fails CAT lineage must never be picked -- the real, authenticating \
+         candidate must still be the one used"
+    );
+
+    Ok(())
+}
+
+/// #3304 item 2: even after fixing decoys-that-fail-authentication, two candidates that BOTH
+/// authenticate as genuine CATs of the reserve asset id at the same lowest confirmed height must
+/// still refuse -- there is no principled tiebreak, and picking one arbitrarily would be a wrong
+/// read, which is worse than a refusal.
+#[test]
+fn two_authenticating_reserve_candidates_at_the_same_height_still_refuses() -> anyhow::Result<()> {
+    use dig_chainsource_interface::ChainSource;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+    let reserve_inner_puzzle_hash = harness.distributor.info.constants.reserve_inner_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    // Build a genuine second CAT spend of the SAME asset id as the distributor's reserve asset,
+    // landing a zero-amount output at the SAME `reserve_inner_puzzle_hash` -- which the CAT layer
+    // wraps to the identical `reserve_full_puzzle_hash` the real eve reserve sits at, since both
+    // share the same asset id. This is not a decoy: `Cat::parse_children` authenticates it exactly
+    // as it would the real candidate.
+    let funder_p2 = StandardLayer::new(harness.funder.pk);
+    let second_source_cat = harness.source_cat;
+    let leftover = second_source_cat.coin.amount;
+    let cat_inner_puzzle = clvm_quote!(Conditions::new()
+        .create_coin(reserve_inner_puzzle_hash, 0, Memos::None)
+        .create_coin(harness.funder.puzzle_hash, leftover, Memos::None))
+    .to_clvm(ctx)?;
+    let cat_inner_spend = funder_p2.delegated_inner_spend(
+        ctx,
+        Spend {
+            puzzle: cat_inner_puzzle,
+            solution: NodePtr::NIL,
+        },
+    )?;
+    second_source_cat.spend(
+        ctx,
+        SingleCatSpend {
+            prev_coin_id: second_source_cat.coin.coin_id(),
+            next_coin_proof: CoinProof {
+                parent_coin_info: second_source_cat.coin.parent_coin_info,
+                inner_puzzle_hash: harness.funder.puzzle_hash,
+                amount: second_source_cat.coin.amount,
+            },
+            prev_subtotal: 0,
+            extra_delta: 0,
+            p2_spend: cat_inner_spend,
+            revoke: false,
+        },
+    )?;
+    let spends = ctx.take();
+    let second_parent_spend = spends
+        .into_iter()
+        .find(|spend| spend.coin.coin_id() == second_source_cat.coin.coin_id())
+        .expect("the second CAT spend was produced");
+
+    let twin = Coin::new(
+        second_source_cat.coin.coin_id(),
+        reserve_full_puzzle_hash,
+        0,
+    );
+
+    let real_confirmed_height = chain
+        .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
+        .expect("mock reads never fail")
+        .into_iter()
+        .find(|record| record.coin.amount == 0)
+        .expect("the genuine eve-era reserve candidate is loaded")
+        .confirmed_height;
+
+    let chain = chain
+        .with_coin(
+            twin.coin_id(),
+            dig_chainsource_interface::CoinRecord {
+                coin: twin,
+                confirmed_height: real_confirmed_height,
+                spent_height: None,
+                timestamp: None,
+                coinbase: false,
+            },
+        )
+        .with_spend(second_source_cat.coin.coin_id(), second_parent_spend);
+
     assert_malformed_because(
         read_distributor(&chain, launcher_id),
         "ambiguous eve-era reserve candidates at the lowest confirmed height",
+    );
+
+    Ok(())
+}
+
+/// #3304 item 1 (`state.rs:1323-1327`): a decoy at the reserve puzzle hash whose PARENT spend is
+/// oversized (`solution` over `DECODE_MAX_SERIALIZED_BYTES`) must be skipped during authentication
+/// -- never fatal to the read -- before either `ctx.alloc` at `state.rs:1329`/`1333` ever runs on
+/// it.
+///
+/// The decoy here is built the SAME way as
+/// [`two_authenticating_reserve_candidates_at_the_same_height_still_refuses`]'s twin -- a genuine
+/// second CAT spend of the real reserve asset id, landing a zero-amount output at the real
+/// `reserve_inner_puzzle_hash`, so it WOULD fully authenticate if the size check let it through.
+/// The only difference is padding: hundreds of harmless zero-amount filler `CREATE_COIN`
+/// conditions inflate the solution past the bound. This is deliberate, not incidental -- an
+/// assertion that merely checks "the read still succeeds" cannot tell the size guard's `continue`
+/// apart from the ordinary decoy-fails-authentication path a garbage/unregistered parent already
+/// exercises (proven by mutation: a bare unparseable oversized reveal is skipped by
+/// `Cat::parse_children` failing regardless of the size check, so removing the size check alone
+/// changes nothing observable). Making the oversized parent spend GENUINELY AUTHENTICATE once
+/// allowed through is what makes guard-removal observable: with the guard, it is skipped and the
+/// real candidate alone is found; without it, it becomes a second authenticated candidate at the
+/// same height as the real one, and the read refuses as ambiguous instead.
+#[test]
+fn an_oversized_decoy_parent_spend_is_skipped_and_the_genuine_reserve_is_still_found(
+) -> anyhow::Result<()> {
+    use dig_chainsource_interface::ChainSource;
+    use dig_rewards_coin::discovery::DECODE_MAX_SERIALIZED_BYTES;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+    let reserve_inner_puzzle_hash = harness.distributor.info.constants.reserve_inner_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    let funder_p2 = StandardLayer::new(harness.funder.pk);
+    let second_source_cat = harness.source_cat;
+    let leftover = second_source_cat.coin.amount;
+
+    // Hundreds of harmless zero-amount filler outputs, each to a distinct (unused) puzzle hash,
+    // solely to push this genuine spend's SOLUTION past `DECODE_MAX_SERIALIZED_BYTES` -- they
+    // contribute nothing to the CAT's amount conservation and are not read by anything.
+    const FILLER_COUNT: usize = 2_500;
+    let mut conditions = Conditions::new()
+        .create_coin(reserve_inner_puzzle_hash, 0, Memos::None)
+        .create_coin(harness.funder.puzzle_hash, leftover, Memos::None);
+    for i in 0..FILLER_COUNT {
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        conditions = conditions.create_coin(Bytes32::new(hash_bytes), 0, Memos::None);
+    }
+    let cat_inner_puzzle = clvm_quote!(conditions).to_clvm(ctx)?;
+    let cat_inner_spend = funder_p2.delegated_inner_spend(
+        ctx,
+        Spend {
+            puzzle: cat_inner_puzzle,
+            solution: NodePtr::NIL,
+        },
+    )?;
+    second_source_cat.spend(
+        ctx,
+        SingleCatSpend {
+            prev_coin_id: second_source_cat.coin.coin_id(),
+            next_coin_proof: CoinProof {
+                parent_coin_info: second_source_cat.coin.parent_coin_info,
+                inner_puzzle_hash: harness.funder.puzzle_hash,
+                amount: second_source_cat.coin.amount,
+            },
+            prev_subtotal: 0,
+            extra_delta: 0,
+            p2_spend: cat_inner_spend,
+            revoke: false,
+        },
+    )?;
+    let spends = ctx.take();
+    let oversized_parent_spend = spends
+        .into_iter()
+        .find(|spend| spend.coin.coin_id() == second_source_cat.coin.coin_id())
+        .expect("the oversized second CAT spend was produced");
+    assert!(
+        oversized_parent_spend.solution.len() > DECODE_MAX_SERIALIZED_BYTES,
+        "fixture bug: the padded solution must actually cross the size bound, got {} bytes",
+        oversized_parent_spend.solution.len()
+    );
+
+    let decoy = Coin::new(
+        second_source_cat.coin.coin_id(),
+        reserve_full_puzzle_hash,
+        0,
+    );
+
+    let real_confirmed_height = chain
+        .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
+        .expect("mock reads never fail")
+        .into_iter()
+        .find(|candidate| candidate.coin.amount == 0)
+        .expect("the genuine eve-era reserve candidate is loaded")
+        .confirmed_height;
+
+    let chain = chain
+        .with_coin(
+            decoy.coin_id(),
+            dig_chainsource_interface::CoinRecord {
+                coin: decoy,
+                confirmed_height: real_confirmed_height,
+                spent_height: None,
+                timestamp: None,
+                coinbase: false,
+            },
+        )
+        .with_spend(second_source_cat.coin.coin_id(), oversized_parent_spend);
+
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "an oversized decoy parent spend must be skipped by the size bound before it can ever \
+         authenticate -- the real, in-bound candidate must still be the one found"
+    );
+
+    Ok(())
+}
+
+/// Wraps a `MockChainSource`, forcing `coin_record` to `Err` for exactly one coin id -- which
+/// forces `ChainSource::parent_spend`'s default implementation (composed from `coin_record` +
+/// `coin_spend`) to `Err` for that SAME id, without disturbing any other read the mock answers.
+/// `MockChainSource::fail_with` cannot express the fixture #3304 item 1's `Err` distinction needs:
+/// it fails EVERY read, including the `coin_records_by_puzzle_hash` call
+/// `find_eve_reserve_provenance` makes before it ever reaches the per-candidate loop, so it would
+/// never actually exercise `state.rs:1317-1321` -- the top-level call would fail first instead.
+struct ErrOnCoinRecord {
+    inner: dig_chainsource_interface::MockChainSource,
+    poisoned_coin_id: Bytes32,
+}
+
+impl dig_chainsource_interface::ChainSource for ErrOnCoinRecord {
+    type Error = dig_chainsource_interface::ChainSourceError;
+
+    fn coin_record(
+        &self,
+        coin_id: Bytes32,
+    ) -> Result<Option<dig_chainsource_interface::CoinRecord>, Self::Error> {
+        if coin_id == self.poisoned_coin_id {
+            return Err(dig_chainsource_interface::ChainSourceError::Timeout);
+        }
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+        self.inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        parent_coin_id: Bytes32,
+    ) -> Result<Vec<dig_chainsource_interface::CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent_coin_id)
+    }
+
+    fn coin_spend(
+        &self,
+        coin_id: Bytes32,
+    ) -> Result<Option<chia_protocol::CoinSpend>, Self::Error> {
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+        self.inner.resolve_singleton_lineage(launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.inner.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_timestamp(height)
+    }
+}
+
+/// #3304 item 1 (`state.rs:1317-1321`): a `ChainSource::parent_spend` `Err` on the GENUINE
+/// candidate's own record must surface `read_distributor` as `RewardsError::ChainUnavailable`,
+/// never collapse into "no candidate authenticated" (`RewardsError::Malformed`). A transient read
+/// failure on the one candidate that IS genuine must say "retry", not "your chain is malformed".
+#[test]
+fn a_parent_spend_err_on_the_genuine_candidate_yields_chain_unavailable_not_malformed(
+) -> anyhow::Result<()> {
+    use dig_chainsource_interface::ChainSource;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    let real_candidate = chain
+        .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
+        .expect("mock reads never fail")
+        .into_iter()
+        .find(|candidate| candidate.coin.amount == 0)
+        .expect("the genuine eve-era reserve candidate is loaded");
+
+    let poisoned = ErrOnCoinRecord {
+        inner: chain,
+        poisoned_coin_id: real_candidate.coin.coin_id(),
+    };
+
+    let result = read_distributor(&poisoned, launcher_id);
+    assert!(
+        matches!(result, Err(RewardsError::ChainUnavailable(_))),
+        "a transient parent_spend failure on the genuine candidate must surface as \
+         ChainUnavailable, never a malformed/no-candidate-authenticated refusal, got: {result:?}"
     );
 
     Ok(())
@@ -3350,6 +3701,98 @@ fn mint_end_to_end_is_recoverable_by_discovery() -> anyhow::Result<()> {
         discovered[0].generation(),
         generation,
         "the decoded generation must be exactly what the launch advertised"
+    );
+
+    Ok(())
+}
+
+/// #3334: `discovered_distributors_in_spend` discards the CLVM cost `run_puzzle_with_cost`
+/// charges as `_cost` -- deliberately not surfaced on `DiscoveredDistributor` or its return type
+/// (a caller has no legitimate use for it, and exposing it would invite a caller to build policy
+/// on a number the puzzle owns, not the reader). This test measures it independently, test-side
+/// only, against the SAME genuine bundle `mint_end_to_end_is_recoverable_by_discovery` decodes --
+/// not a synthetic puzzle -- and asserts a literal figure, so a change to the real launch puzzle
+/// that quietly moves this cost is visible here.
+///
+/// Measured: running the actual security-coin spend that creates the distributor's launcher costs
+/// exactly the literal asserted below -- several orders of magnitude under `DECODE_MAX_COST`
+/// (10,000,000), which is expected: `DECODE_MAX_COST` is sized for the worst attacker-chosen
+/// puzzle under the 64 KiB size bound, not for this crate's own well-behaved launch puzzle. This
+/// bound is NOT moved by this ticket even though it looks generous.
+#[test]
+fn the_real_launch_spends_decode_cost_is_a_measured_literal() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, _manager_launcher_id, distributor_launcher_id, _generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    // The one spend in the bundle whose CREATE_COIN carries the distributor's own well-formed
+    // generation comment -- the same spend `discovered_distributors_in_spend` decodes it from.
+    let security_coin_spend = all_spends
+        .iter()
+        .find(|spend| {
+            discovered_distributors_in_spend(spend)
+                .map(|discovered| {
+                    discovered
+                        .iter()
+                        .any(|d| d.launcher_id() == distributor_launcher_id)
+                })
+                .unwrap_or(false)
+        })
+        .expect("exactly one spend in the bundle decodes the distributor's launch");
+
+    let mut measuring_ctx = SpendContext::new();
+    let puzzle_ptr = measuring_ctx.alloc(&security_coin_spend.puzzle_reveal)?;
+    let solution_ptr = measuring_ctx.alloc(&security_coin_spend.solution)?;
+    let clvmr::reduction::Reduction(measured_cost, _output_ptr) =
+        chia_sdk_types::run_puzzle_with_cost(
+            &mut measuring_ctx,
+            puzzle_ptr,
+            solution_ptr,
+            u64::MAX,
+            false,
+        )
+        .expect("the same puzzle discovery decoded without error must run without error here too");
+
+    assert_eq!(
+        measured_cost, 55_338,
+        "the real launch spend's decode cost moved -- re-measure and update this literal \
+         deliberately rather than loosen it to a tolerance band"
+    );
+
+    Ok(())
+}
+
+/// Pins `DECODE_MAX_SERIALIZED_BYTES`'s own doc-comment derivation: the largest observed
+/// `puzzle_reveal` and `solution` across a real launch bundle, so that literal cannot silently
+/// drift the way an unpinned "measured" number would (the same discipline
+/// `the_real_launch_spends_decode_cost_is_a_measured_literal` applies to the neighbouring cost
+/// literal).
+#[test]
+fn the_real_launch_spends_observed_sizes_are_measured_literals() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, _manager_launcher_id, _distributor_launcher_id, _generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    let largest_puzzle_reveal = all_spends
+        .iter()
+        .map(|spend| spend.puzzle_reveal.len())
+        .max()
+        .expect("the bundle produced at least one spend");
+    let largest_solution = all_spends
+        .iter()
+        .map(|spend| spend.solution.len())
+        .max()
+        .expect("the bundle produced at least one spend");
+
+    assert_eq!(
+        largest_puzzle_reveal, 2_060,
+        "the largest puzzle_reveal in a real launch bundle moved -- re-measure and update \
+         DECODE_MAX_SERIALIZED_BYTES's doc comment deliberately, this literal must track it"
+    );
+    assert_eq!(
+        largest_solution, 387,
+        "the largest solution in a real launch bundle moved -- re-measure and update \
+         DECODE_MAX_SERIALIZED_BYTES's doc comment deliberately, this literal must track it"
     );
 
     Ok(())

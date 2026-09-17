@@ -2337,6 +2337,26 @@ What remains genuinely unimplemented is narrower than it once was: §13.2 (off-c
 beyond the §2.3 counters (#3253) — see the table in §14 above for the authoritative per-clause
 status, which this prose summarises rather than duplicates.
 
+**As of v0.7.0**, four hardening fixes landed against code this document already specifies rather
+than against new surface (dig_ecosystem#3246 hardening set): §13.1's decode gains an independent
+serialized-size bound (`DECODE_MAX_SERIALIZED_BYTES`, `src/discovery.rs`) ahead of its existing CLVM
+cost bound, so an oversized `puzzle_reveal`/`solution` is refused before either is allocated; §12's
+staleness judgement (`entry_set_is_stale`) now reports stale, not fresh, when a last-write timestamp
+is inverted relative to the observed peak; §12's eve-era reserve provenance lookup
+(`find_eve_reserve_provenance`) now authenticates every zero-amount candidate as a genuine CAT child
+of the distributor's own reserve asset id before selecting one (reusing the same size bound to check
+each candidate's parent spend, so the authentication loop itself cannot become an unbounded
+per-candidate allocation), closing a decoy read that previously could be steered by an
+unauthenticated coin at the reserve puzzle hash; and that same lookup's parent-spend read no longer
+collapses a chain-source `Err` into the same "candidate discarded" outcome as a genuine `Ok(None)`
+decoy -- a transient read failure on the one authenticating candidate now propagates
+`ChainUnavailable` rather than reporting as malformed chain data. None of the four changes a public
+method's signature. The last of the four is a **conformance fix, not a contract change**: this
+module's own doc (`src/state.rs`, "A failed read is never an empty answer") already required every
+`ChainSource` error to become `ChainUnavailable`; `find_eve_reserve_provenance` violated that
+requirement on its parent-spend lookup until this fix. Each of the four closes a gap between what
+this specification (or this module's own doc) already required and what the code checked.
+
 **Citation discipline, after one failure.** A first revision cited a doc comment's illustrative ratio
 as if it defined a constant (§0.3), and it was propping up an immutable curried value. Two rules
 follow, and §15.4 records both as fixed rather than silently corrected:

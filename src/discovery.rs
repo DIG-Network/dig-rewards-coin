@@ -53,6 +53,69 @@ use crate::RewardsError;
 /// decoding peer real CPU before the accumulated charge trips this ceiling.
 const DECODE_MAX_COST: u64 = 10_000_000;
 
+/// The largest serialized `puzzle_reveal` or `solution` this decode will allocate at all, checked
+/// **independently** against each of the two -- never against their sum.
+///
+/// `DECODE_MAX_COST` bounds the CLVM cost `run_puzzle_with_cost` charges, but `ctx.alloc` at
+/// [`discovered_distributors_in_spend`]'s first two lines deserialises `observed`'s bytes into the
+/// allocator **before any cost accounting exists at all**, and `clvmr` 0.16.4 charges several
+/// operators (`op_multiply` among them) only after they finish, so a cost bound alone is
+/// post-hoc accounting, not mid-run interruption: one pair of very large atoms burns real CPU and
+/// RAM before the ceiling trips. This is a bound on bytes received, checked before the first byte
+/// is allocated.
+///
+/// **Independent, not summed.** A sum bound over `puzzle_reveal.len() + solution.len()` admits a
+/// degenerate split -- a 1-byte puzzle paired with an (N-1)-byte solution passes it exactly as
+/// easily as a balanced split -- so it gives an attacker one knob to spend however they like,
+/// where two independent bounds give none. Checking each field on its own also lets the refusal
+/// name *which* input exceeded, rather than a combined figure neither field alone explains.
+///
+/// **The literal, derived from a real measurement, not picked round.** `tests/simulator.rs`'s
+/// `launch_manager_and_distributor_in_one_bundle` fixture bundles a manager-singleton launch and a
+/// DIG-distributor launch together and submits every produced spend; measuring
+/// `puzzle_reveal.len()` and `solution.len()` across all of them (2026-09-16, this crate at
+/// 0.6.0) gave a largest observed `puzzle_reveal` of **2,060 bytes** and a largest observed
+/// `solution` of **387 bytes** -- both on the order of 1-2 KB, as an ordinary standard-puzzle or
+/// singleton-launcher spend is. Sixteen times the larger of the two is 32,960 bytes, and the
+/// smallest power of two at or above that is 65,536 (64 KiB) -- comfortable room for a real spend
+/// while still refusing the multi-megabyte blob DIG-Network/dig_ecosystem#3333 is about. This
+/// derivation is pinned by `tests/simulator.rs`'s
+/// `the_real_launch_spends_observed_sizes_are_measured_literals`, the same way the neighbouring
+/// `DECODE_MAX_COST` literal is pinned by `the_real_launch_spends_decode_cost_is_a_measured_literal`
+/// -- an unpinned "measured" number is silent drift the moment the fixture it was measured from
+/// changes shape.
+///
+/// # What this bound does NOT cover
+///
+/// Scoped to [`discovered_distributors_in_spend`] only -- `find_eve_reserve_provenance`
+/// performs its own, separate per-candidate size check against this same constant (see that
+/// function's doc), and is not covered by the list below.
+///
+/// A screen that reads as complete and is not is worse than no screen at all -- 0.5.0 shipped
+/// exactly that shape once already (`commit_incentives.rs` hanging at `epoch_seconds == 0` while
+/// the hanging spend's hash stayed a legitimately recognised cohort member). This bound is
+/// narrower than it may look:
+///
+/// 1. **An under-bound spend can still be expensive to evaluate.** This is a *size* bound; the
+///    *evaluation cost* of a spend under 64 KiB is bounded only by `DECODE_MAX_COST`, which is
+///    itself charged post-hoc (see that constant's own doc) -- a small puzzle can still be a slow
+///    one to run.
+/// 2. **Everything the run produces is unbounded by this check.** `ctx.extract::<Conditions<..>>`
+///    and the per-`CREATE_COIN` memo extraction execute *after* this gate and are bounded only by
+///    however many conditions the run produced -- a small serialized input can still unpack into a
+///    large condition list. (The hint `tree_hash` is computed once, over the fixed literal
+///    `"Reward Distributor v1"`, and does not scale with the run's output at all.)
+/// 3. **In-memory amplification is untouched.** This bounds bytes *received*, not bytes *held*: a
+///    small serialized atom can still expand into a far larger `NodePtr` tree once allocated.
+/// 4. **This is a per-spend bound, not a per-scan one.** N spends each one byte under the limit
+///    cost N times the work; nothing here rate-limits how many spends a caller decodes.
+/// 5. **It authenticates nothing.** A well-formed, under-bound, cheap spend from an attacker
+///    decodes in full, and the resulting [`DiscoveredDistributor`] proves only that *some* spend
+///    advertised `storeId:root` (module docs above, §13.1 clause 9) -- never that the distributor
+///    is this reader's own, still exists, or is funded. §9.3 is still required before a caller
+///    treats a discovered distributor as its own.
+pub const DECODE_MAX_SERIALIZED_BYTES: usize = 65_536;
+
 /// A distributor discovered from an observed spend -- private fields, no public constructor.
 ///
 /// Every value here is derived from the spend that was decoded, never from caller input (§13.1
@@ -96,6 +159,24 @@ impl DiscoveredDistributor {
 pub fn discovered_distributors_in_spend(
     observed: &CoinSpend,
 ) -> Result<Vec<DiscoveredDistributor>, RewardsError> {
+    // Bounded before any allocation (§ `DECODE_MAX_SERIALIZED_BYTES`'s doc): `ctx.alloc` below
+    // deserialises attacker bytes into the allocator, which must not happen at all for a spend
+    // this oversized, let alone before `DECODE_MAX_COST`'s accounting exists.
+    if observed.puzzle_reveal.len() > DECODE_MAX_SERIALIZED_BYTES {
+        return Err(RewardsError::ObservedSpendFieldTooLarge {
+            field: "puzzle_reveal",
+            actual_len: observed.puzzle_reveal.len(),
+            limit_bytes: DECODE_MAX_SERIALIZED_BYTES,
+        });
+    }
+    if observed.solution.len() > DECODE_MAX_SERIALIZED_BYTES {
+        return Err(RewardsError::ObservedSpendFieldTooLarge {
+            field: "solution",
+            actual_len: observed.solution.len(),
+            limit_bytes: DECODE_MAX_SERIALIZED_BYTES,
+        });
+    }
+
     let mut ctx = SpendContext::new();
 
     let puzzle_ptr = ctx.alloc(&observed.puzzle_reveal).map_err(|error| {
@@ -370,18 +451,33 @@ mod tests {
     /// cheap, small-in-wall-time construction is enough to cross it.
     #[test]
     fn a_puzzle_over_the_decode_cost_bound_is_refused() {
-        let mut ctx = SpendContext::new();
+        // `op_multiply` is variadic (`more_ops.rs`'s `op_multiply` loops `a.next(input)`), so one
+        // call can take thousands of small quoted arguments rather than two huge atoms: each
+        // argument charges `MUL_COST_PER_OP` (885) on top of its size-dependent terms, so 4,200
+        // one-byte arguments alone cross `DECODE_MAX_COST` (measured cost ~10,464,848) while the
+        // whole serialized puzzle stays at ~16.8 KB -- comfortably UNDER
+        // `DECODE_MAX_SERIALIZED_BYTES` (65,536), so this test exercises the cost gate in
+        // isolation from the size gate above it, rather than tripping the size gate first.
+        const ARG_COUNT: usize = 4_200;
 
+        let mut ctx = SpendContext::new();
         let quote_op = ctx.new_small_number(1).unwrap();
         let multiply_op = ctx.new_small_number(18).unwrap();
-        let big_atom = ctx.new_atom(&vec![0x7f_u8; 60_000]).unwrap();
-        let quoted_big_atom = ctx.new_pair(quote_op, big_atom).unwrap();
-        let nil = ctx.nil();
-        let second_arg = ctx.new_pair(quoted_big_atom, nil).unwrap();
-        let arg_list = ctx.new_pair(quoted_big_atom, second_arg).unwrap();
+        let mut arg_list = ctx.nil();
+        for _ in 0..ARG_COUNT {
+            let atom = ctx.new_small_number(2).unwrap();
+            let quoted = ctx.new_pair(quote_op, atom).unwrap();
+            arg_list = ctx.new_pair(quoted, arg_list).unwrap();
+        }
         let expensive_puzzle = ctx.new_pair(multiply_op, arg_list).unwrap();
 
         let puzzle_reveal = ctx.serialize(&expensive_puzzle).unwrap();
+        assert!(
+            puzzle_reveal.len() < DECODE_MAX_SERIALIZED_BYTES,
+            "this fixture must stay under the size gate to test the cost gate in isolation, got \
+             {} bytes",
+            puzzle_reveal.len()
+        );
         let solution = ctx.serialize(&NodePtr::NIL).unwrap();
         let coin = Coin::new(
             Bytes32::new([1; 32]),
@@ -398,6 +494,103 @@ mod tests {
             other => panic!(
                 "expected a Malformed refusal naming the decode's cost bound, got: {other:?}"
             ),
+        }
+    }
+
+    /// `DECODE_MAX_SERIALIZED_BYTES` must be checked BEFORE any decode work runs -- provable
+    /// without executing an expensive puzzle by declaring an over-budget shape and asserting on
+    /// the refusal payload alone (the crate's established pattern for an unrunnable-scale
+    /// fixture): this gate must fire before any run is even attempted, so the puzzle bytes here
+    /// need not be valid CLVM at all.
+    #[test]
+    fn a_puzzle_reveal_one_byte_over_the_size_bound_is_refused_before_any_decode() {
+        let oversized = vec![0u8; DECODE_MAX_SERIALIZED_BYTES + 1];
+        let coin = Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 0);
+        let observed = CoinSpend::new(coin, Program::from(oversized), Program::from(vec![0x80]));
+
+        match discovered_distributors_in_spend(&observed) {
+            Err(RewardsError::ObservedSpendFieldTooLarge {
+                field,
+                actual_len,
+                limit_bytes,
+            }) => {
+                assert_eq!(field, "puzzle_reveal");
+                assert_eq!(actual_len, DECODE_MAX_SERIALIZED_BYTES + 1);
+                assert_eq!(limit_bytes, DECODE_MAX_SERIALIZED_BYTES);
+            }
+            other => {
+                panic!("expected ObservedSpendFieldTooLarge naming puzzle_reveal, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_solution_one_byte_over_the_size_bound_is_refused_before_any_decode() {
+        // A well-formed, in-bound puzzle reveal -- the refusal must come from the SOLUTION arm,
+        // independently of the puzzle_reveal arm covered above.
+        let mut ctx = SpendContext::new();
+        let puzzle_ptr = clvm_quote!(Conditions::<NodePtr>::new())
+            .to_clvm(&mut ctx)
+            .unwrap();
+        let puzzle_reveal = ctx.serialize(&puzzle_ptr).unwrap();
+        let coin = Coin::new(Bytes32::new([1; 32]), ctx.tree_hash(puzzle_ptr).into(), 0);
+
+        let oversized_solution = vec![0u8; DECODE_MAX_SERIALIZED_BYTES + 1];
+        let observed = CoinSpend::new(coin, puzzle_reveal, Program::from(oversized_solution));
+
+        match discovered_distributors_in_spend(&observed) {
+            Err(RewardsError::ObservedSpendFieldTooLarge {
+                field,
+                actual_len,
+                limit_bytes,
+            }) => {
+                assert_eq!(field, "solution");
+                assert_eq!(actual_len, DECODE_MAX_SERIALIZED_BYTES + 1);
+                assert_eq!(limit_bytes, DECODE_MAX_SERIALIZED_BYTES);
+            }
+            other => panic!("expected ObservedSpendFieldTooLarge naming solution, got: {other:?}"),
+        }
+    }
+
+    /// The size gate is `>`, not `>=`: a `puzzle_reveal` of exactly `DECODE_MAX_SERIALIZED_BYTES`
+    /// must not be refused by [`RewardsError::ObservedSpendFieldTooLarge`]. This declares a
+    /// boundary-sized shape (deliberately not a valid CLVM program -- only the length matters to
+    /// this gate, and it runs before any deserialisation is attempted) and asserts on the
+    /// resulting error's IDENTITY: it must be the deserialise-failure arm
+    /// ([`RewardsError::Malformed`]), never the size-refusal arm, proving the length gate itself
+    /// let this exact byte count through.
+    #[test]
+    fn a_puzzle_reveal_exactly_at_the_size_bound_is_not_refused_by_the_size_gate() {
+        let at_bound = vec![0xffu8; DECODE_MAX_SERIALIZED_BYTES];
+        let coin = Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 0);
+        let observed = CoinSpend::new(coin, Program::from(at_bound), Program::from(vec![0x80]));
+
+        // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        if let Err(RewardsError::ObservedSpendFieldTooLarge { .. }) =
+            discovered_distributors_in_spend(&observed)
+        {
+            panic!("a puzzle_reveal of exactly the bound must pass the size gate");
+        }
+    }
+
+    /// Same boundary, the `solution` arm: exactly at the bound must not trip the size gate.
+    #[test]
+    fn a_solution_exactly_at_the_size_bound_is_not_refused_by_the_size_gate() {
+        let mut ctx = SpendContext::new();
+        let puzzle_ptr = clvm_quote!(Conditions::<NodePtr>::new())
+            .to_clvm(&mut ctx)
+            .unwrap();
+        let puzzle_reveal = ctx.serialize(&puzzle_ptr).unwrap();
+        let coin = Coin::new(Bytes32::new([1; 32]), ctx.tree_hash(puzzle_ptr).into(), 0);
+
+        let at_bound = vec![0xffu8; DECODE_MAX_SERIALIZED_BYTES];
+        let observed = CoinSpend::new(coin, puzzle_reveal, Program::from(at_bound));
+
+        // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        if let Err(RewardsError::ObservedSpendFieldTooLarge { .. }) =
+            discovered_distributors_in_spend(&observed)
+        {
+            panic!("a solution of exactly the bound must pass the size gate");
         }
     }
 }

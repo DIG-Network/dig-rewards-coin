@@ -149,6 +149,12 @@ pub fn commitment_distributor_epoch_start(
 /// chain, and an attacker who launches a distributor with a hostile bps constant reaches this
 /// function with it.
 ///
+/// **Not the same quantity as [`crate::state::DistributorSnapshot::rewards_per_distributor_epoch`]**,
+/// despite both being "base units of reward" in prose: this is a per-COMMITMENT preview (one
+/// entry's own withdrawal-share figure), while `rewards_per_distributor_epoch` is a per-EPOCH
+/// AGGREGATE (every entry's committed reward, summed, for one epoch). Reading one where the other
+/// is meant silently answers the wrong question at the wrong scale — refs #3304 item 3.
+///
 #[must_use]
 pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> Option<u64> {
     if withdrawal_share_bps > 10_000 {

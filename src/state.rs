@@ -37,6 +37,7 @@ use clvm_traits::clvm_tuple;
 use clvmr::NodePtr;
 use dig_chainsource_interface::ChainSource;
 
+use crate::discovery::DECODE_MAX_SERIALIZED_BYTES;
 use crate::RewardsError;
 
 /// A distributor's entry set has not changed in this long, while its reserve is non-zero, is
@@ -274,6 +275,12 @@ impl DistributorSnapshot {
     ///
     /// Derived from the reward slots, which is where the puzzle keeps them; this performs no
     /// accrual arithmetic of its own.
+    ///
+    /// **Not the same quantity as [`crate::recoverable_base_units`]**, despite both being
+    /// "base units of reward" in prose: this is a per-epoch AGGREGATE (every entry's committed
+    /// reward, summed, for one epoch), while `recoverable_base_units` is a per-COMMITMENT figure
+    /// (one entry's own withdrawal-share preview). Reading one where the other is meant silently
+    /// answers the wrong question at the wrong scale — refs #3304 item 3.
     #[must_use]
     pub fn rewards_per_distributor_epoch(&self) -> Vec<(u64, u64)> {
         let mut totals: Vec<(u64, u64)> = self
@@ -388,6 +395,18 @@ fn entry_set_is_stale(
         // distributor with no entry set is the §12.4 case, not missing information.
         return true;
     };
+
+    // `last_write > peak_timestamp` is a clock inconsistency -- a reorg, out-of-order block
+    // timestamps, or an inconsistent chain source -- not a valid "the write is in the future"
+    // reading. `saturating_sub` alone turns that inconsistency into `0`, which reads as freshly
+    // written; §12.4's whole point is a signal a funder cannot flatter, so an unanswerable
+    // comparison must report the SAFE direction (stale) rather than silently read healthy
+    // (DIG-Network/dig_ecosystem#3304 item 1). This needs no return-type change: `entry_set_stale`
+    // already returns a bool with no way for a caller to distinguish "fresh" from "unknown", so
+    // reporting `true` here is the only direction that cannot be misread as reassurance.
+    if last_write > peak_timestamp {
+        return true;
+    }
 
     peak_timestamp.saturating_sub(last_write) >= STALE_ENTRY_SET_SECONDS
 }
@@ -1237,9 +1256,26 @@ pub fn read_distributor(
     }))
 }
 
-/// Steps 4-5 of the recipe: selects the eve-era reserve candidate unambiguously and authenticates
-/// it as a genuine CAT of `constants.reserve_asset_id`, returning the provenance
-/// `from_eve_coin_spend` needs.
+/// Steps 4-5 of the recipe: authenticates every zero-amount eve-era reserve candidate as a
+/// genuine CAT of `constants.reserve_asset_id` FIRST, discarding whichever fail, then selects
+/// unambiguously among the survivors -- returning the provenance `from_eve_coin_spend` needs.
+///
+/// #3304 item 2: the previous shape selected the candidate at the lowest confirmed height
+/// BEFORE authenticating it. An attacker who lands a same-block, zero-amount decoy coin at
+/// `reserve_full_puzzle_hash` (never a genuine CAT of this asset id, and never spendable as
+/// one) made the candidate set permanently ambiguous -- a standing read-DoS requiring no
+/// signature and no genuine spend, just a coin creation. Authenticating first means a decoy
+/// that cannot pass CAT lineage is simply discarded and never reaches the ambiguity check;
+/// authentication failure is not itself grounds for refusal. Two or more candidates that DO
+/// authenticate at the same lowest height still refuse -- a wrong read is worse than a DoS, so
+/// no tiebreak heuristic is added here.
+///
+/// Each candidate's parent spend is also checked against
+/// [`crate::discovery::DECODE_MAX_SERIALIZED_BYTES`] before either of its fields is allocated --
+/// this loop runs once per candidate, over parent spends an attacker can plant (any number of
+/// zero-amount decoys at `reserve_full_puzzle_hash`), so an unbounded allocation here is
+/// per-candidate amplification of exactly the shape `discovery.rs`'s own size bound exists to
+/// close on its own read path; the same limit is reused rather than a second one invented.
 fn find_eve_reserve_provenance(
     ctx: &mut SpendContext,
     source: &impl ChainSource,
@@ -1260,74 +1296,99 @@ fn find_eve_reserve_provenance(
         ));
     }
 
-    let min_height = zero_amount
-        .iter()
-        .filter_map(|record| record.confirmed_height)
-        .min()
-        .ok_or_else(|| malformed("eve-era reserve candidate(s) have no confirmed height"))?;
+    // Authenticate every candidate before selecting among them. A candidate that fails any
+    // authentication step (unresolvable parent, parent spend not a CAT spend, not actually a
+    // child of that parent, wrong asset id, no lineage proof) is discarded, not an error --
+    // failing authentication is exactly what a decoy is expected to do.
+    let mut authenticated: Vec<(u32, Bytes32, chia_puzzle_types::LineageProof)> = Vec::new();
+    for candidate in &zero_amount {
+        let Some(confirmed_height) = candidate.confirmed_height else {
+            continue;
+        };
+        let candidate_coin_id = candidate.coin.coin_id();
 
-    let mut at_min_height: Vec<_> = zero_amount
-        .into_iter()
-        .filter(|record| record.confirmed_height == Some(min_height))
-        .collect();
+        // `Err` and `Ok(None)` are NOT the same signal: `Ok(None)` is a decoy whose parent was
+        // never registered (the natural "fails authentication" shape), but `Err` is the chain
+        // source itself failing -- e.g. a transient RPC error on the one candidate that IS
+        // genuine. Collapsing both into "continue" would make a transient failure on the real
+        // reserve read as "no candidate authenticates", i.e. malformed chain data, when the
+        // honest answer is "try again". That is exactly the absence-vs-failure defect #3304 item
+        // 1 exists to close, reintroduced on this neighbouring path if collapsed.
+        let parent_spend = match source.parent_spend(candidate_coin_id) {
+            Ok(Some(parent_spend)) => parent_spend,
+            Ok(None) => continue,
+            Err(err) => return Err(chain_unavailable(err)),
+        };
 
-    let candidate = match (at_min_height.pop(), at_min_height.is_empty()) {
-        (Some(only), true) => only,
-        _ => {
-            return Err(malformed(
-                "ambiguous eve-era reserve candidates at the lowest confirmed height",
-            ));
+        if parent_spend.puzzle_reveal.len() > DECODE_MAX_SERIALIZED_BYTES
+            || parent_spend.solution.len() > DECODE_MAX_SERIALIZED_BYTES
+        {
+            continue;
         }
-    };
 
-    let candidate_coin_id = candidate.coin.coin_id();
-    let Some(parent_spend) = source
-        .parent_spend(candidate_coin_id)
-        .map_err(chain_unavailable)?
-    else {
-        return Err(malformed(
-            "eve-era reserve candidate's parent spend could not be resolved",
-        ));
-    };
+        let Ok(parent_puzzle_ptr) = ctx.alloc(&parent_spend.puzzle_reveal) else {
+            continue;
+        };
+        let parent_puzzle = chia_sdk_driver::Puzzle::parse(ctx, parent_puzzle_ptr);
+        let Ok(parent_solution_ptr) = ctx.alloc(&parent_spend.solution) else {
+            continue;
+        };
 
-    let parent_puzzle_ptr = ctx
-        .alloc(&parent_spend.puzzle_reveal)
-        .map_err(RewardsError::from)?;
-    let parent_puzzle = chia_sdk_driver::Puzzle::parse(ctx, parent_puzzle_ptr);
-    let parent_solution_ptr = ctx
-        .alloc(&parent_spend.solution)
-        .map_err(RewardsError::from)?;
+        let Ok(Some(children)) = chia_sdk_driver::Cat::parse_children(
+            ctx,
+            parent_spend.coin,
+            parent_puzzle,
+            parent_solution_ptr,
+        ) else {
+            continue;
+        };
 
-    let children = chia_sdk_driver::Cat::parse_children(
-        ctx,
-        parent_spend.coin,
-        parent_puzzle,
-        parent_solution_ptr,
-    )
-    .map_err(RewardsError::from)?
-    .ok_or_else(|| malformed("eve-era reserve candidate's parent spend is not a CAT spend"))?;
+        let Some(genuine) = children
+            .into_iter()
+            .find(|child| child.coin.coin_id() == candidate_coin_id)
+        else {
+            continue;
+        };
 
-    let authenticated = children
-        .into_iter()
-        .find(|child| child.coin.coin_id() == candidate_coin_id)
-        .ok_or_else(|| {
-            malformed(
-                "eve-era reserve candidate is not among its claimed parent's children -- \
-                 not a genuine CAT of the reserve asset id",
-            )
-        })?;
+        if genuine.info.asset_id != constants.reserve_asset_id {
+            continue;
+        }
 
-    if authenticated.info.asset_id != constants.reserve_asset_id {
-        return Err(malformed(
-            "eve-era reserve candidate's authenticated asset id does not match the distributor's",
+        let Some(lineage_proof) = genuine.lineage_proof else {
+            continue;
+        };
+
+        authenticated.push((
+            confirmed_height,
+            candidate.coin.parent_coin_info,
+            lineage_proof,
         ));
     }
 
-    let reserve_lineage_proof = authenticated
-        .lineage_proof
-        .ok_or_else(|| malformed("authenticated eve-era reserve candidate has no lineage proof"))?;
+    if authenticated.is_empty() {
+        return Err(malformed(
+            "no zero-amount eve-era reserve candidate authenticated as a genuine CAT of the \
+             distributor's reserve asset id",
+        ));
+    }
 
-    Ok((candidate.coin.parent_coin_info, reserve_lineage_proof))
+    let min_height = authenticated
+        .iter()
+        .map(|(height, _, _)| *height)
+        .min()
+        .expect("authenticated is non-empty");
+
+    let mut at_min_height: Vec<_> = authenticated
+        .into_iter()
+        .filter(|(height, _, _)| *height == min_height)
+        .collect();
+
+    match (at_min_height.pop(), at_min_height.is_empty()) {
+        (Some((_, parent_coin_info, lineage_proof)), true) => Ok((parent_coin_info, lineage_proof)),
+        _ => Err(malformed(
+            "ambiguous eve-era reserve candidates at the lowest confirmed height",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1411,6 +1472,21 @@ mod tests {
         assert!(
             entry_set_is_stale(1, last_write + STALE_ENTRY_SET_SECONDS, Some(last_write)),
             "the threshold itself is stale (§12.4 says `>=`)"
+        );
+    }
+
+    /// DIG-Network/dig_ecosystem#3304 item 1: `last_entry_write_unix > peak_timestamp` -- a
+    /// reorg, out-of-order block timestamps, or an inconsistent chain source -- must report
+    /// STALE, not fresh. `saturating_sub` alone yields `0` here, which reads as freshly written;
+    /// this test fails if only that guard (the `last_write > peak_timestamp` check) is reverted.
+    #[test]
+    fn an_inconsistent_clock_where_the_write_is_after_the_peak_reports_stale() {
+        let peak_timestamp = 1_000_000;
+        let last_write = peak_timestamp + 1;
+
+        assert!(
+            entry_set_is_stale(1, peak_timestamp, Some(last_write)),
+            "an unanswerable clock comparison must report the safe direction (stale), not fresh"
         );
     }
 

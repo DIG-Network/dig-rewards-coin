@@ -33,17 +33,22 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      # cargo fmt does not resolve dependencies (`--locked` is rejected: "unexpected argument"),
+      # so this step resolves freely by necessity, not by choice — every other step below is
+      # `--locked` and `cohort_lock_guard` still pins the graph they see.
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Check clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Check documentation
-        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked
 
   # The debug profile has overflow-checks ON and release has them OFF (there is no [profile]
   # section in Cargo.toml), so the two profiles exercise DIFFERENT halves of #3286: debug proves
