@@ -87,7 +87,7 @@ const DECODE_MAX_COST: u64 = 10_000_000;
 ///
 /// # What this bound does NOT cover
 ///
-/// Scoped to [`discovered_distributors_in_spend`] only -- [`crate::state::find_eve_reserve_provenance`]
+/// Scoped to [`discovered_distributors_in_spend`] only -- `find_eve_reserve_provenance`
 /// performs its own, separate per-candidate size check against this same constant (see that
 /// function's doc), and is not covered by the list below.
 ///
