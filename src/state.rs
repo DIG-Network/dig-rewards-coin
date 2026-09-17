@@ -274,6 +274,12 @@ impl DistributorSnapshot {
     ///
     /// Derived from the reward slots, which is where the puzzle keeps them; this performs no
     /// accrual arithmetic of its own.
+    ///
+    /// **Not the same quantity as [`crate::recoverable_base_units`]**, despite both being
+    /// "base units of reward" in prose: this is a per-epoch AGGREGATE (every entry's committed
+    /// reward, summed, for one epoch), while `recoverable_base_units` is a per-COMMITMENT figure
+    /// (one entry's own withdrawal-share preview). Reading one where the other is meant silently
+    /// answers the wrong question at the wrong scale — refs #3304 item 3.
     #[must_use]
     pub fn rewards_per_distributor_epoch(&self) -> Vec<(u64, u64)> {
         let mut totals: Vec<(u64, u64)> = self
