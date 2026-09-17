@@ -252,6 +252,30 @@ pub enum RewardsError {
     )]
     UnreadableEpochSeconds,
 
+    /// An observed spend's serialized `puzzle_reveal` or `solution` exceeds
+    /// [`crate::discovery::DECODE_MAX_SERIALIZED_BYTES`], refused before any byte of it is
+    /// deserialised into the allocator (DIG-Network/dig_ecosystem#3333).
+    ///
+    /// Deliberately its own variant rather than [`RewardsError::Malformed`]:
+    /// [`RewardsError::Malformed`] means "the read was attempted and could not be interpreted",
+    /// while this is a policy refusal **before any read is attempted at all** -- a caller scanning
+    /// the chain has a legitimate reason to distinguish "this spend is junk" from "this spend is
+    /// too big to be worth decoding", and a `#[non_exhaustive]` enum can carry the new arm without
+    /// breaking any caller that already matches on an else/wildcard arm.
+    #[error(
+        "observed spend's {field} is {actual_len} bytes, exceeding the \
+         {limit_bytes}-byte decode limit -- refusing before any allocation"
+    )]
+    ObservedSpendFieldTooLarge {
+        /// Which field was too large: `"puzzle_reveal"` or `"solution"`.
+        field: &'static str,
+        /// The field's actual serialized length, in bytes.
+        actual_len: usize,
+        /// The limit that was exceeded:
+        /// [`crate::discovery::DECODE_MAX_SERIALIZED_BYTES`].
+        limit_bytes: usize,
+    },
+
     /// `commit_incentives`'s non-adjacent-epoch backfill loop (see
     /// [`RewardsError::UnreadableEpochSeconds`]) pushes one reward slot per iteration of
     /// `(epoch_start - slot_epoch_time) / epoch_seconds`, both `epoch_start` and `slot_epoch_time`
