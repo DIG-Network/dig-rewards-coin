@@ -557,11 +557,11 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 0);
         let observed = CoinSpend::new(coin, Program::from(at_bound), Program::from(vec![0x80]));
 
-        match discovered_distributors_in_spend(&observed) {
-            Err(RewardsError::ObservedSpendFieldTooLarge { .. }) => {
-                panic!("a puzzle_reveal of exactly the bound must pass the size gate")
-            }
-            _ => {} // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        if let Err(RewardsError::ObservedSpendFieldTooLarge { .. }) =
+            discovered_distributors_in_spend(&observed)
+        {
+            panic!("a puzzle_reveal of exactly the bound must pass the size gate");
         }
     }
 
@@ -578,11 +578,11 @@ mod tests {
         let at_bound = vec![0xffu8; DECODE_MAX_SERIALIZED_BYTES];
         let observed = CoinSpend::new(coin, puzzle_reveal, Program::from(at_bound));
 
-        match discovered_distributors_in_spend(&observed) {
-            Err(RewardsError::ObservedSpendFieldTooLarge { .. }) => {
-                panic!("a solution of exactly the bound must pass the size gate")
-            }
-            _ => {} // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        // Malformed (not valid CLVM) or Ok -- either proves the size gate let it through.
+        if let Err(RewardsError::ObservedSpendFieldTooLarge { .. }) =
+            discovered_distributors_in_spend(&observed)
+        {
+            panic!("a solution of exactly the bound must pass the size gate");
         }
     }
 }
