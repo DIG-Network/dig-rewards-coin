@@ -1255,9 +1255,19 @@ pub fn read_distributor(
     }))
 }
 
-/// Steps 4-5 of the recipe: selects the eve-era reserve candidate unambiguously and authenticates
-/// it as a genuine CAT of `constants.reserve_asset_id`, returning the provenance
-/// `from_eve_coin_spend` needs.
+/// Steps 4-5 of the recipe: authenticates every zero-amount eve-era reserve candidate as a
+/// genuine CAT of `constants.reserve_asset_id` FIRST, discarding whichever fail, then selects
+/// unambiguously among the survivors -- returning the provenance `from_eve_coin_spend` needs.
+///
+/// #3304 item 2: the previous shape selected the candidate at the lowest confirmed height
+/// BEFORE authenticating it. An attacker who lands a same-block, zero-amount decoy coin at
+/// `reserve_full_puzzle_hash` (never a genuine CAT of this asset id, and never spendable as
+/// one) made the candidate set permanently ambiguous -- a standing read-DoS requiring no
+/// signature and no genuine spend, just a coin creation. Authenticating first means a decoy
+/// that cannot pass CAT lineage is simply discarded and never reaches the ambiguity check;
+/// authentication failure is not itself grounds for refusal. Two or more candidates that DO
+/// authenticate at the same lowest height still refuse -- a wrong read is worse than a DoS, so
+/// no tiebreak heuristic is added here.
 fn find_eve_reserve_provenance(
     ctx: &mut SpendContext,
     source: &impl ChainSource,
@@ -1278,74 +1288,80 @@ fn find_eve_reserve_provenance(
         ));
     }
 
-    let min_height = zero_amount
-        .iter()
-        .filter_map(|record| record.confirmed_height)
-        .min()
-        .ok_or_else(|| malformed("eve-era reserve candidate(s) have no confirmed height"))?;
+    // Authenticate every candidate before selecting among them. A candidate that fails any
+    // authentication step (unresolvable parent, parent spend not a CAT spend, not actually a
+    // child of that parent, wrong asset id, no lineage proof) is discarded, not an error --
+    // failing authentication is exactly what a decoy is expected to do.
+    let mut authenticated: Vec<(u32, Bytes32, chia_puzzle_types::LineageProof)> = Vec::new();
+    for candidate in &zero_amount {
+        let Some(confirmed_height) = candidate.confirmed_height else {
+            continue;
+        };
+        let candidate_coin_id = candidate.coin.coin_id();
 
-    let mut at_min_height: Vec<_> = zero_amount
-        .into_iter()
-        .filter(|record| record.confirmed_height == Some(min_height))
-        .collect();
+        let Ok(Some(parent_spend)) = source.parent_spend(candidate_coin_id) else {
+            continue;
+        };
 
-    let candidate = match (at_min_height.pop(), at_min_height.is_empty()) {
-        (Some(only), true) => only,
-        _ => {
-            return Err(malformed(
-                "ambiguous eve-era reserve candidates at the lowest confirmed height",
-            ));
+        let Ok(parent_puzzle_ptr) = ctx.alloc(&parent_spend.puzzle_reveal) else {
+            continue;
+        };
+        let parent_puzzle = chia_sdk_driver::Puzzle::parse(ctx, parent_puzzle_ptr);
+        let Ok(parent_solution_ptr) = ctx.alloc(&parent_spend.solution) else {
+            continue;
+        };
+
+        let Ok(Some(children)) = chia_sdk_driver::Cat::parse_children(
+            ctx,
+            parent_spend.coin,
+            parent_puzzle,
+            parent_solution_ptr,
+        ) else {
+            continue;
+        };
+
+        let Some(genuine) = children
+            .into_iter()
+            .find(|child| child.coin.coin_id() == candidate_coin_id)
+        else {
+            continue;
+        };
+
+        if genuine.info.asset_id != constants.reserve_asset_id {
+            continue;
         }
-    };
 
-    let candidate_coin_id = candidate.coin.coin_id();
-    let Some(parent_spend) = source
-        .parent_spend(candidate_coin_id)
-        .map_err(chain_unavailable)?
-    else {
+        let Some(lineage_proof) = genuine.lineage_proof else {
+            continue;
+        };
+
+        authenticated.push((confirmed_height, candidate.coin.parent_coin_info, lineage_proof));
+    }
+
+    if authenticated.is_empty() {
         return Err(malformed(
-            "eve-era reserve candidate's parent spend could not be resolved",
-        ));
-    };
-
-    let parent_puzzle_ptr = ctx
-        .alloc(&parent_spend.puzzle_reveal)
-        .map_err(RewardsError::from)?;
-    let parent_puzzle = chia_sdk_driver::Puzzle::parse(ctx, parent_puzzle_ptr);
-    let parent_solution_ptr = ctx
-        .alloc(&parent_spend.solution)
-        .map_err(RewardsError::from)?;
-
-    let children = chia_sdk_driver::Cat::parse_children(
-        ctx,
-        parent_spend.coin,
-        parent_puzzle,
-        parent_solution_ptr,
-    )
-    .map_err(RewardsError::from)?
-    .ok_or_else(|| malformed("eve-era reserve candidate's parent spend is not a CAT spend"))?;
-
-    let authenticated = children
-        .into_iter()
-        .find(|child| child.coin.coin_id() == candidate_coin_id)
-        .ok_or_else(|| {
-            malformed(
-                "eve-era reserve candidate is not among its claimed parent's children -- \
-                 not a genuine CAT of the reserve asset id",
-            )
-        })?;
-
-    if authenticated.info.asset_id != constants.reserve_asset_id {
-        return Err(malformed(
-            "eve-era reserve candidate's authenticated asset id does not match the distributor's",
+            "no zero-amount eve-era reserve candidate authenticated as a genuine CAT of the \
+             distributor's reserve asset id",
         ));
     }
 
-    let reserve_lineage_proof = authenticated
-        .lineage_proof
-        .ok_or_else(|| malformed("authenticated eve-era reserve candidate has no lineage proof"))?;
+    let min_height = authenticated
+        .iter()
+        .map(|(height, _, _)| *height)
+        .min()
+        .expect("authenticated is non-empty");
 
-    Ok((candidate.coin.parent_coin_info, reserve_lineage_proof))
+    let mut at_min_height: Vec<_> = authenticated
+        .into_iter()
+        .filter(|(height, _, _)| *height == min_height)
+        .collect();
+
+    match (at_min_height.pop(), at_min_height.is_empty()) {
+        (Some((_, parent_coin_info, lineage_proof)), true) => Ok((parent_coin_info, lineage_proof)),
+        _ => Err(malformed(
+            "ambiguous eve-era reserve candidates at the lowest confirmed height",
+        )),
+    }
 }
 
 #[cfg(test)]

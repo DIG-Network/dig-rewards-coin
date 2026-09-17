@@ -2115,8 +2115,15 @@ fn a_nonzero_amount_decoy_at_the_reserve_puzzle_hash_does_not_confuse_the_select
     Ok(())
 }
 
+/// #3304 item 2: a zero-amount decoy at the reserve puzzle hash that has no resolvable CAT
+/// lineage (no registered parent spend) must be discarded during authentication, not treated as
+/// an ambiguous sibling of the real candidate -- otherwise landing such a decoy is a standing
+/// read-DoS requiring no signature and no genuine spend. This replaces the previous version of
+/// this test, which asserted the OLD (buggy) selects-before-authenticating behaviour: it expected
+/// this exact decoy to make the read refuse with "ambiguous ...". Under the fix the decoy fails
+/// authentication and is silently discarded, and the real candidate alone is picked.
 #[test]
-fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyhow::Result<()> {
+fn a_zero_amount_decoy_that_fails_lineage_does_not_prevent_the_read() -> anyhow::Result<()> {
     use dig_chainsource_interface::ChainSource;
 
     let ctx = &mut SpendContext::new();
@@ -2143,8 +2150,8 @@ fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyho
         .expect("the genuine eve-era reserve candidate is loaded");
 
     // A second, distinct coin at the identical puzzle hash, also zero-amount, confirmed at the
-    // identical height -- the selector has no principled way to prefer one over the other, so it
-    // must refuse rather than pick arbitrarily.
+    // identical height -- but with NO registered parent spend, so it can never authenticate as a
+    // genuine CAT of the reserve asset id. A decoy this cheap to plant must not brick the read.
     let twin = Coin::new(Bytes32::new([0x88; 32]), reserve_full_puzzle_hash, 0);
     let chain = chain.with_coin(
         twin.coin_id(),
@@ -2157,8 +2164,111 @@ fn two_zero_amount_reserve_candidates_at_the_same_height_is_ambiguous() -> anyho
         },
     );
 
-    // The specific reason matters: `Malformed(_)` alone is satisfied by the orderings where
-    // `pop()` happens to return the twin and the read then fails somewhere later in the recipe.
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+    assert_eq!(
+        snapshot.reserve_base_units(),
+        harness.distributor.info.state.total_reserves,
+        "a decoy that fails CAT lineage must never be picked -- the real, authenticating \
+         candidate must still be the one used"
+    );
+
+    Ok(())
+}
+
+/// #3304 item 2: even after fixing decoys-that-fail-authentication, two candidates that BOTH
+/// authenticate as genuine CATs of the reserve asset id at the same lowest confirmed height must
+/// still refuse -- there is no principled tiebreak, and picking one arbitrarily would be a wrong
+/// read, which is worse than a refusal.
+#[test]
+fn two_authenticating_reserve_candidates_at_the_same_height_still_refuses() -> anyhow::Result<()> {
+    use dig_chainsource_interface::ChainSource;
+
+    let ctx = &mut SpendContext::new();
+    let harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let reserve_full_puzzle_hash = harness.distributor.info.constants.reserve_full_puzzle_hash;
+    let reserve_inner_puzzle_hash = harness.distributor.info.constants.reserve_inner_puzzle_hash;
+
+    let singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id],
+    );
+
+    // Build a genuine second CAT spend of the SAME asset id as the distributor's reserve asset,
+    // landing a zero-amount output at the SAME `reserve_inner_puzzle_hash` -- which the CAT layer
+    // wraps to the identical `reserve_full_puzzle_hash` the real eve reserve sits at, since both
+    // share the same asset id. This is not a decoy: `Cat::parse_children` authenticates it exactly
+    // as it would the real candidate.
+    let funder_p2 = StandardLayer::new(harness.funder.pk);
+    let second_source_cat = harness.source_cat;
+    let leftover = second_source_cat.coin.amount;
+    let cat_inner_puzzle = clvm_quote!(Conditions::new()
+        .create_coin(reserve_inner_puzzle_hash, 0, Memos::None)
+        .create_coin(harness.funder.puzzle_hash, leftover, Memos::None))
+    .to_clvm(ctx)?;
+    let cat_inner_spend = funder_p2.delegated_inner_spend(
+        ctx,
+        Spend {
+            puzzle: cat_inner_puzzle,
+            solution: NodePtr::NIL,
+        },
+    )?;
+    second_source_cat.spend(
+        ctx,
+        SingleCatSpend {
+            prev_coin_id: second_source_cat.coin.coin_id(),
+            next_coin_proof: CoinProof {
+                parent_coin_info: second_source_cat.coin.parent_coin_info,
+                inner_puzzle_hash: harness.funder.puzzle_hash,
+                amount: second_source_cat.coin.amount,
+            },
+            prev_subtotal: 0,
+            extra_delta: 0,
+            p2_spend: cat_inner_spend,
+            revoke: false,
+        },
+    )?;
+    let spends = ctx.take();
+    let second_parent_spend = spends
+        .into_iter()
+        .find(|spend| spend.coin.coin_id() == second_source_cat.coin.coin_id())
+        .expect("the second CAT spend was produced");
+
+    let twin = Coin::new(second_source_cat.coin.coin_id(), reserve_full_puzzle_hash, 0);
+    assert_eq!(
+        twin.puzzle_hash, reserve_full_puzzle_hash,
+        "the CAT layer must wrap the same asset id + inner puzzle hash to the identical full \
+         puzzle hash the real eve reserve sits at, or this fixture is not testing what it claims"
+    );
+
+    let real_confirmed_height = chain
+        .coin_records_by_puzzle_hash(reserve_full_puzzle_hash, true)
+        .expect("mock reads never fail")
+        .into_iter()
+        .find(|record| record.coin.amount == 0)
+        .expect("the genuine eve-era reserve candidate is loaded")
+        .confirmed_height;
+
+    let chain = chain
+        .with_coin(
+            twin.coin_id(),
+            dig_chainsource_interface::CoinRecord {
+                coin: twin,
+                confirmed_height: real_confirmed_height,
+                spent_height: None,
+                timestamp: None,
+                coinbase: false,
+            },
+        )
+        .with_spend(second_source_cat.coin.coin_id(), second_parent_spend);
+
     assert_malformed_because(
         read_distributor(&chain, launcher_id),
         "ambiguous eve-era reserve candidates at the lowest confirmed height",
