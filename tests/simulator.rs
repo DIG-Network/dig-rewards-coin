@@ -3465,6 +3465,62 @@ fn mint_end_to_end_is_recoverable_by_discovery() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #3334: `discovered_distributors_in_spend` discards the CLVM cost `run_puzzle_with_cost`
+/// charges as `_cost` -- deliberately not surfaced on `DiscoveredDistributor` or its return type
+/// (a caller has no legitimate use for it, and exposing it would invite a caller to build policy
+/// on a number the puzzle owns, not the reader). This test measures it independently, test-side
+/// only, against the SAME genuine bundle `mint_end_to_end_is_recoverable_by_discovery` decodes --
+/// not a synthetic puzzle -- and asserts a literal figure, so a change to the real launch puzzle
+/// that quietly moves this cost is visible here.
+///
+/// Measured: running the actual security-coin spend that creates the distributor's launcher costs
+/// exactly the literal asserted below -- several orders of magnitude under `DECODE_MAX_COST`
+/// (10,000,000), which is expected: `DECODE_MAX_COST` is sized for the worst attacker-chosen
+/// puzzle under the 64 KiB size bound, not for this crate's own well-behaved launch puzzle. This
+/// bound is NOT moved by this ticket even though it looks generous.
+#[test]
+fn the_real_launch_spends_decode_cost_is_a_measured_literal() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, _manager_launcher_id, distributor_launcher_id, _generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    // The one spend in the bundle whose CREATE_COIN carries the distributor's own well-formed
+    // generation comment -- the same spend `discovered_distributors_in_spend` decodes it from.
+    let security_coin_spend = all_spends
+        .iter()
+        .find(|spend| {
+            discovered_distributors_in_spend(spend)
+                .map(|discovered| {
+                    discovered
+                        .iter()
+                        .any(|d| d.launcher_id() == distributor_launcher_id)
+                })
+                .unwrap_or(false)
+        })
+        .expect("exactly one spend in the bundle decodes the distributor's launch");
+
+    let mut measuring_ctx = SpendContext::new();
+    let puzzle_ptr = measuring_ctx.alloc(&security_coin_spend.puzzle_reveal)?;
+    let solution_ptr = measuring_ctx.alloc(&security_coin_spend.solution)?;
+    let clvmr::reduction::Reduction(measured_cost, _output_ptr) =
+        chia_sdk_types::run_puzzle_with_cost(
+            &mut measuring_ctx,
+            puzzle_ptr,
+            solution_ptr,
+            u64::MAX,
+            false,
+        )
+        .expect("the same puzzle discovery decoded without error must run without error here too");
+
+    assert_eq!(
+        measured_cost, 55_338,
+        "the real launch spend's decode cost moved -- re-measure and update this literal \
+         deliberately rather than loosen it to a tolerance band"
+    );
+
+    Ok(())
+}
+
 /// §13.1 clause 6: a `CREATE_COIN` to some OTHER puzzle hash, even carrying memos shaped exactly
 /// like a real DIG rewards comment, must not be mistaken for a launcher creation.
 #[test]
