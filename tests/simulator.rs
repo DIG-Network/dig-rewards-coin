@@ -1928,8 +1928,8 @@ fn a_claim_built_entirely_from_a_chain_read_is_accepted() -> anyhow::Result<()> 
 
     // The distributor AND the entry slot, ONLY from the chain -- never `harness.distributor` and
     // never `created_slot_value_to_slot`.
-    let snapshot =
-        read_distributor(&chain, launcher_id)?.expect("a distributor was launched at this launcher id");
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
     let mut chain_distributor = snapshot.distributor().clone();
     let chain_source = dig_rewards_coin::ChainEntrySlotSource::new(&chain, launcher_id);
 
@@ -1973,8 +1973,8 @@ fn a_claim_built_entirely_from_a_chain_read_is_accepted() -> anyhow::Result<()> 
 /// naming a coin that never existed. `initiate_payout` builds against it without complaint;
 /// the chain MUST reject the resulting bundle at submission.
 #[test]
-fn a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected() -> anyhow::Result<()>
-{
+fn a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected(
+) -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
     let mut harness = launch_harness(ctx)?;
     let launcher_id = harness.distributor.info.constants.launcher_id;
@@ -2044,8 +2044,8 @@ fn a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejec
         &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
     );
 
-    let snapshot =
-        read_distributor(&chain, launcher_id)?.expect("a distributor was launched at this launcher id");
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
 
     // THE DEFECT UNDER TEST: `created_slot_value_to_slot` called on the TIP, for a value an
     // EARLIER generation created. `snapshot.distributor()`'s own doc comment names this exact

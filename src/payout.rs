@@ -20,8 +20,8 @@
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{
-    RewardDistributor, RewardDistributorConstants, RewardDistributorInitiatePayoutAction, Slot,
-    RewardDistributorState, SpendContext,
+    RewardDistributor, RewardDistributorConstants, RewardDistributorInitiatePayoutAction,
+    RewardDistributorState, Slot, SpendContext,
 };
 use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
 use chia_sdk_types::Conditions;
@@ -154,7 +154,8 @@ pub fn accrued_base_units(
 
     let withdrawal_amount_precision = u128::from(entry.shares) * elapsed_cumulative_payout;
 
-    let withdrawal_amount = withdrawal_amount_precision.checked_div(u128::from(constants.precision))?;
+    let withdrawal_amount =
+        withdrawal_amount_precision.checked_div(u128::from(constants.precision))?;
 
     u64::try_from(withdrawal_amount).ok()
 }
@@ -186,7 +187,9 @@ impl<'a, S> ChainEntrySlotSource<'a, S> {
     }
 }
 
-impl<'a, S: dig_chainsource_interface::ChainSource> EntrySlotSource for ChainEntrySlotSource<'a, S> {
+impl<'a, S: dig_chainsource_interface::ChainSource> EntrySlotSource
+    for ChainEntrySlotSource<'a, S>
+{
     /// Performs a full [`crate::state::read_distributor`] and takes the slot from that snapshot's
     /// [`crate::state::DistributorSnapshot::entry_slot`] accessor.
     ///
@@ -201,10 +204,11 @@ impl<'a, S: dig_chainsource_interface::ChainSource> EntrySlotSource for ChainEnt
         &self,
         payout_puzzle_hash: Bytes32,
     ) -> Result<Option<Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
-        let snapshot = crate::state::read_distributor(self.source, self.launcher_id)?
-            .ok_or(RewardsError::NoDistributorAtLauncherId {
+        let snapshot = crate::state::read_distributor(self.source, self.launcher_id)?.ok_or(
+            RewardsError::NoDistributorAtLauncherId {
                 launcher_id: self.launcher_id,
-            })?;
+            },
+        )?;
 
         Ok(snapshot.entry_slot(payout_puzzle_hash)?.cloned())
     }

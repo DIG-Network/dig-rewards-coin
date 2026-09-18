@@ -180,7 +180,10 @@ fn remove_one_each_by_value<T: PartialEq + Copy>(
     slot_kind: &str,
 ) -> Result<(), RewardsError> {
     for value in spent {
-        let Some(index) = set.iter().position(|existing| &existing.info.value == value) else {
+        let Some(index) = set
+            .iter()
+            .position(|existing| &existing.info.value == value)
+        else {
             return Err(malformed(format!(
                 "a generation spends a {slot_kind} slot this walk never saw created -- the \
                  reader's model of the chain disagrees with the chain"
@@ -1549,7 +1552,9 @@ mod tests {
     /// A `Slot` wrapping `value`, for tests that exercise [`SpendableSlots::apply_generation`]
     /// directly and only care about value-equality bookkeeping -- the `LineageProof` and launcher
     /// id are arbitrary and carry no meaning here.
-    fn test_reward_slot(value: RewardDistributorRewardSlotValue) -> Slot<RewardDistributorRewardSlotValue> {
+    fn test_reward_slot(
+        value: RewardDistributorRewardSlotValue,
+    ) -> Slot<RewardDistributorRewardSlotValue> {
         let proof = LineageProof {
             parent_parent_coin_info: Bytes32::default(),
             parent_inner_puzzle_hash: Bytes32::default(),
@@ -1557,15 +1562,17 @@ mod tests {
         };
         Slot::new(
             proof,
-            SlotInfo::from_value(some_identity(), RewardDistributorSlotNonce::REWARD.to_u64(), value),
+            SlotInfo::from_value(
+                some_identity(),
+                RewardDistributorSlotNonce::REWARD.to_u64(),
+                value,
+            ),
         )
     }
 
     /// A `Slot<RewardDistributorEntrySlotValue>` paying `payout_puzzle_hash`, for tests that
     /// exercise [`entry_slot_for_payout_puzzle_hash`] directly. Every other field is arbitrary.
-    fn test_entry_slot(
-        payout_puzzle_hash: Bytes32,
-    ) -> Slot<RewardDistributorEntrySlotValue> {
+    fn test_entry_slot(payout_puzzle_hash: Bytes32) -> Slot<RewardDistributorEntrySlotValue> {
         let proof = LineageProof {
             parent_parent_coin_info: Bytes32::default(),
             parent_inner_puzzle_hash: Bytes32::default(),
@@ -1579,7 +1586,11 @@ mod tests {
         };
         Slot::new(
             proof,
-            SlotInfo::from_value(some_identity(), RewardDistributorSlotNonce::ENTRY.to_u64(), value),
+            SlotInfo::from_value(
+                some_identity(),
+                RewardDistributorSlotNonce::ENTRY.to_u64(),
+                value,
+            ),
         )
     }
 
