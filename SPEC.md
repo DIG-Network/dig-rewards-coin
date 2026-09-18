@@ -23,11 +23,17 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    puzzle's, and this document names the function that performs each rather than repeating a formula
    that would then drift.
 
-   **Exception:** This crate may carry **exactly one** authoritative restatement of puzzle arithmetic
-   when it is **bound to the driver's implementation by a test that fails if the two diverge**. The
+   **Exception:** This crate may carry an authoritative restatement of puzzle arithmetic only when it
+   is **bound to the driver's implementation by a test that fails if the two diverge**. **Exactly two**
+   such restatements exist and a third MUST NOT be added; the count was widened from one by §12.5
+   clause 3b, recorded as §15.4 row A5. The
    `recoverable_base_units` function restates the withdrawal share arithmetic and is proven equal
    to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by the equality test
    `recoverable_base_units_matches_a_real_clawback_at_odd_amounts` in `tests/recoverable_share.rs`.
+   The second is `accrued_base_units` (§12.5 clause 3b), which restates the payout accrual of
+   `chia-sdk-driver` 0.36.0's `RewardDistributorInitiatePayoutAction` (`initiate_payout.rs:127-131`)
+   and MUST be bound by an equality test on the same terms. Neither restatement is a licence for a
+   third, and neither introduces a division anywhere else.
    An untested copy scattered in a consumer drifts **silently**; a tested copy here fails **loudly**.
    That asymmetry is the justification.
    The equality proof holds at or below `u64::MAX / withdrawal_share_bps`. Above that bound the
@@ -1842,6 +1848,71 @@ per-distributor option.
    `apps/web/features/staking/config.ts`, `lib/rewards-distributor.ts`) — but that surface predates
    the authenticated-reserve requirement this crate's reader adds; an implementation MUST reuse the
    walk shape, not its unauthenticated reserve lookup.
+1a. **Slot bookkeeping is over `Slot<V>`, in exactly one place.** The walk of clause 1 MUST carry
+   `chia_sdk_driver::Slot<V>` objects, not bare slot *values*. Each generation's created slots MUST
+   become `reconstructed.created_slot_value_to_slot(value, nonce)` — computed on `reconstructed`,
+   the distributor whose own coin **is** the spend being parsed (`src/state.rs:1128-1134`), and
+   **before** the walk advances with `distributor = reconstructed.child(next_state)`
+   (`src/state.rs:1185`) — so the `LineageProof` each slot carries names the coin that actually
+   created it. The eve generation's reward slot already arrives as a `Slot` (`launch_reward_slot`,
+   `src/state.rs:1048`). Spent slots MUST be removed by `info.value` equality, exactly one instance
+   per spent value: that is the semantics `remove_one_each` (`src/state.rs:141`) already has, and
+   value equality is the only handle the puzzle itself offers (§10.2 clause 3). A generation that
+   spends a slot this walk never saw created MUST stay an error rather than a silently smaller
+   answer (`src/state.rs:111`).
+
+   There MUST be **exactly one** bookkeeping path. The value view
+   `DistributorSlots { entries, commitments, rewards }` (`src/state.rs:87-96`) MUST keep its public
+   fields and their meaning — a live consumer already reads them (DIG-Network/dig-node#620) — and
+   MUST be **derived once**, from the spendable `Slot` set, at the end of the walk. Accumulating
+   values and `Slot`s as two parallel sets is FORBIDDEN: they are two models of one fact, they drift,
+   and the drift is invisible until a spend is rejected on chain.
+
+1b. **The snapshot yields the slots; a caller never derives one.** `DistributorSnapshot`
+   (`src/state.rs:226`) MUST expose the spendable slots:
+
+   - `entry_slot(&self, payout_puzzle_hash: Bytes32) -> Result<Option<&Slot<RewardDistributorEntrySlotValue>>, RewardsError>`
+     — `Ok(None)` when no entry in the set carries that payout puzzle hash, and an **error** when
+     more than one does. Ambiguity MUST be refused, never resolved by picking: two entries paying one
+     puzzle hash is a set this crate cannot reconcile, and choosing silently would pay one and strand
+     the other while reporting success.
+   - `commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>]`
+   - `reward_slots(&self) -> &[Slot<RewardDistributorRewardSlotValue>]`
+
+   `distributor()` (`src/state.rs:237`), `slots()` (`src/state.rs:243`) and `observed()`
+   (`src/state.rs:249`) keep their signatures and their meaning.
+
+1c. **A slot derived from the tip is a phantom, and MUST NOT be built.**
+   `RewardDistributor::created_slot_value_to_slot(value, nonce)` derives the slot's `LineageProof`
+   from **the distributor coin it is called on**. On a snapshot rebuilt by clause 1 that coin is the
+   **tip**, so calling it for a slot some **earlier** generation created yields a slot coin that never
+   existed. Nothing local rejects it: the proof is well-formed, the slot puzzle hash computes,
+   `initiate_payout` builds, `finish_spend` succeeds, and the bundle fails only at submission, refused
+   by the chain with no indication of which part was wrong (`tests/simulator.rs:733` already names
+   this hazard for the in-process harness).
+
+   A caller holding a snapshot MUST take slots from clause 1b's accessors and MUST NOT call
+   `created_slot_value_to_slot` on `distributor()`; the rustdoc on `DistributorSnapshot::distributor`
+   MUST state that prohibition, because the type cannot enforce it — the upstream method is on a
+   `RewardDistributor` this crate hands out by reference. **A reader MUST NOT conclude**, from a
+   bundle that builds, from a non-zero `LineageProof`, or from a slot puzzle hash that matches a
+   known value, that the slot coin exists on chain. Only clause 1a's walk establishes that.
+
+1d. **What 0.8.0 MUST NOT change.** This is a pre-1.0 **minor**: additive at the type level,
+   behaviour-preserving everywhere else. `initiate_payout`'s signature (`src/payout.rs:91-96`), the
+   `EntrySlotSource` trait and its single method (`src/payout.rs:38-51`), `launch_dig_distributor`'s
+   signature, and `DistributorSlots`'s public fields MUST NOT change. §0.5 clause 1's cohort pins
+   (`chia-sdk-driver =0.36.0`, `chia-sdk-types =0.36.0`, `chia-puzzle-types =0.36.1`, with
+   `chia-protocol` / `chia-bls` / `chia-consensus` semver-compatible) MUST NOT move. Every guard added
+   in 0.5.0-0.7.0 MUST survive unchanged: the pre-`from_spend` hazard screen
+   (`refuse_unrepresentable_action_arithmetic`, defined `src/state.rs:503`, run inside the walk at
+   `src/state.rs:1120`), the `epoch_seconds == 0` refusal (`src/state.rs:1034`),
+   `DECODE_MAX_SERIALIZED_BYTES` (`src/discovery.rs`, §13.1), the refusal to accept a derived
+   launcher id, and `ManagerInnerPuzzle`'s provenance arms (`src/manager.rs:41-54`, §7.2a clause 3).
+   A new `RewardsError` variant is additive because the enum is `#[non_exhaustive]`
+   (`src/error.rs:16`); **removing** a variant, or adding a required method to `EntrySlotSource`,
+   would be a breaking change for a consumer and is out of scope for 0.8.0.
+
 2. Local prover state is a **cache and advisory**. On restart:
    - challenge **strikes MUST reset to zero** — a strike is evidence about a specific recent window
      the prover no longer holds, and carrying it forward evicts on evidence nobody can re-examine;
@@ -1933,6 +2004,85 @@ entry set (§15 clause 9a) and every peer that discovers it inside that window r
 3. A claim loop MUST re-read the entry slot before every claim and MUST NOT cache a slot value across
    cycles: `counter` increments on each payout, so a cached value produces an invalid spend and a
    wasted fee.
+3a. **The chain-backed `EntrySlotSource` is `ChainEntrySlotSource`, and it re-walks on every call.**
+   This crate MUST provide the one implementation of `EntrySlotSource` (`src/payout.rs:38-51`) that
+   reads from a chain: `ChainEntrySlotSource<'a, S: ChainSource> { source: &'a S, launcher_id:
+   Bytes32 }`, over `dig_chainsource_interface::ChainSource`. Its `read_entry_slot` MUST perform a
+   **full** `read_distributor` (`src/state.rs:972`) on **every** call and take the slot from that
+   snapshot's §12.1 clause 1b accessor. The cost is stated rather than optimised away: one claim is
+   one walk from the eve coin to the tip, which a loop claiming on §8.6's `CLAIM_CADENCE_SECONDS`
+   pays once per cadence period. That is what clause 3's freshness and §10.2 clause 3's replay guard
+   cost, and a slot read is still a chain **read**, so clause 1a's accounting is unchanged: no XCH
+   mojos, no $DIG base units, none of §6.3's write bounds.
+
+   A narrower read is FORBIDDEN. `ChainSource` has no hint index and a slot's puzzle hash depends on
+   the slot *value* (§12.1 clause 1), so the authenticated walk is the only thing that establishes
+   that a slot coin exists and what proof it carries — **the walk is the authentication**. A
+   shortcut that returned a `Slot` without it would return exactly §12.1 clause 1c's phantom, with
+   none of the warning signs.
+
+   Two answers MUST NOT be collapsed into "not in the set":
+
+   - `read_distributor` answering `Ok(None)` — the launcher coin was never spent, so **no
+     distributor exists at that launcher id** — MUST surface from `read_entry_slot` as an **error**,
+     never as `Ok(None)`. "This distributor does not exist" and "this peer holds no entry in it" are
+     different facts with different remedies, and clause 1's treatment of an absence (keep observing,
+     spend nothing, report nothing wrong) is correct only for the second. Reported as an absence, a
+     mistyped or non-existent launcher id would be indistinguishable from a peer patiently waiting to
+     be admitted, forever. `RewardsError` is `#[non_exhaustive]` (`src/error.rs:16`), so the variant
+     this needs is additive.
+   - every `ChainSource` failure MUST become `RewardsError::ChainUnavailable` (`src/error.rs:24`),
+     which `read_distributor` already guarantees. A failed read is never an empty answer.
+
+3b. **`accrued_base_units` — what is owed, computed without a spend.** A claim loop has to know
+   whether a claim would clear §8.3's `payout_threshold` before it builds one. This crate MUST
+   provide
+
+   `accrued_base_units(constants: &RewardDistributorConstants, state: &RewardDistributorState, entry: &RewardDistributorEntrySlotValue) -> Option<u64>`
+
+   as a **pure** function: no chain read, no `SpendContext`, no mutation, no I/O. It MUST compute
+   exactly what `chia-sdk-driver` 0.36.0's `RewardDistributorInitiatePayoutAction` computes
+   (`initiate_payout.rs:127-131`) — the per-share delta taken in `u128`, divided by
+   `constants.precision`, narrowed back to `u64` — and it MUST answer `None`, never a wrapped,
+   saturated or clamped number, when `entry.initial_cumulative_payout` exceeds
+   `state.round_reward_info.cumulative_payout` or when the narrowing does not fit. The unit is **$DIG
+   base units** (§0.2), never $DIG.
+
+   It MUST NOT apply the threshold: `payout_threshold_base_units` (`src/payout.rs:125-127`) answers
+   that question and the two MUST stay separate, because a sub-threshold accrual is money that is
+   owed and merely not yet claimable (§8.3 clause 4, §6.4 clause 1). It MUST NOT be presented as
+   an amount paid: what a claim pays is the puzzle's own figure,
+   `PayoutOutcome::Paid::amount_base_units` (`src/payout.rs:66`). **A reader MUST NOT conclude** from
+   a non-`None` answer that a claim would succeed — the state it was computed from may already be a
+   generation stale, and only clause 3's fresh read decides.
+
+   This is the second restatement of puzzle arithmetic this crate carries, and §0.1 clause 1's
+   exception is widened from one to two **by this clause and on identical terms** (§15.4 row A5): it
+   MUST be bound by a test that fails if the two diverge — a simulator claim whose returned
+   `amount_base_units` is asserted equal to `accrued_base_units` over the same constants, the same
+   state the spend was built against, and the same entry slot value. Unbound, it is a copy that
+   drifts silently, which is the failure §0.1 clause 1 exists to prevent. No other division is
+   introduced anywhere by this section.
+
+3c. **Conformance: the claim is proven from a chain read, and the phantom is proven fatal.** Clause
+   3a and §12.1 clause 1c are claims about what the **chain** accepts, and nothing short of a
+   submitted spend tests them. Two simulator cases MUST land in the same change as the code:
+
+   1. **Chain-only claim (positive).** Launch, fund, admit one entry, drive at least half an epoch,
+      then build `initiate_payout` with a distributor **and** an entry slot obtained only from
+      `read_distributor` over a `MockChainSource` loaded from the simulator
+      (`tests/simulator.rs:1481`) — never from the in-process harness distributor, never from
+      `created_slot_value_to_slot`. `finish_spend` followed by `sim.spend_coins` MUST succeed, and a
+      coin of the reserve-asset CAT (§9.1) with amount exactly `amount_base_units` MUST land at the
+      entry's recorded `payout_puzzle_hash`. Only the chain accepting that spend proves the singleton
+      proof, the reserve proof and the slot proof are all real together; the existing non-zero-proof
+      assertion (`tests/simulator.rs:1787-1790`) does not, and its own comment says why.
+   2. **Phantom slot (negative).** The same setup, with the entry slot instead derived by
+      `snapshot.distributor().created_slot_value_to_slot(value, RewardDistributorSlotNonce::ENTRY)`
+      for an entry created before the tip, MUST be **rejected** by `sim.spend_coins`. This is what
+      measures §12.1 clause 1c: without it clause 1c is an unfalsifiable doc claim, and the positive
+      case alone would still pass in a build where the accessor and the derivation happened to agree.
+
 4. **Clause 3 and clause 1a are one requirement seen from two sides.** "Re-read the entry slot before
    every claim, and never cache a slot value across cycles" already presumes there is a next claim to
    re-read before, and an **absence MUST NOT be cached any more than a value is**: `absent` is a slot
@@ -2288,7 +2438,7 @@ An implementation conforms when all of the following hold.
 ### 15.1 Which side each clause lands on
 
 - **This crate (#3249):** §0.1, §0.2, §0.5, §1.3, §4.3's call sequence as a reusable predicate, §6.4's
-  settlement amount, §7, §8, §9, §10.2, §11, §12.1 clause 1, §12.5 clause 3, **§7.2a**, **§13.1 clauses 4-10**, §15.3.
+  settlement amount, §7, §8, §9, §10.2, §11, §12.1 clauses 1 and 1a-1d, §12.5 clauses 3 and 3a-3c, **§7.2a**, **§13.1 clauses 4-10**, §15.3.
 - **`dig-node` prover (#3250):** §1.1-§1.2, §1.4-§1.5, §2 (except §2.4's rendering and §2.2's
   wording, which are #3253's), §3, §4.1-§4.2, §4.4-§4.7, §5, §6.3, §6.5, §12.1-§12.3, §12.6, §13.1 clauses 1-3 (the scan and the §9.3 check that consume
   this crate's §13.1 clauses 4-10 decode),
@@ -2357,6 +2507,25 @@ module's own doc (`src/state.rs`, "A failed read is never an empty answer") alre
 requirement on its parent-spend lookup until this fix. Each of the four closes a gap between what
 this specification (or this module's own doc) already required and what the code checked.
 
+**As of v0.8.0 (DIG-Network/dig_ecosystem#3356), two clause groups are _specified, not yet
+implemented_.** §12.1 clauses 1a-1d (slot bookkeeping over `Slot<V>`, the `DistributorSnapshot` slot
+accessors, the phantom-slot prohibition, the freeze list) and §12.5 clauses 3a-3c
+(`ChainEntrySlotSource`, `accrued_base_units`, the two conformance tests) describe code that does not
+exist at the tip this revision was written against (`dig-rewards-coin` v0.7.0, 626707c): there the
+walk accumulates slot **values** only (`src/state.rs:87-96`), the only `EntrySlotSource`
+implementations are two test stubs (`tests/simulator.rs:126` and `:143`, each handing back a slot
+captured at creation), and no claim can be built from a chain read alone. Every `file:line` in those
+clauses cites either the pinned upstream SDK or v0.7.0 code the change **extends**, never code the
+change introduces, so this section's citation rule holds. What they close is narrower than it looks,
+and the difference is worth stating: §12.1 clause 1's reader already produces **real** singleton and
+reserve lineage proofs — it calls `from_eve_coin_spend` with authenticated reserve provenance
+(`src/state.rs:1048`) and walks with `from_spend(.., Some(reserve_lineage_proof), ..)`
+(`src/state.rs:1128-1134`), never `from_parent_spend` — so a reader MUST NOT conclude that a
+snapshot from this crate ever carried the all-zero dummy proof clause 1 warns about. The gap was that
+slots reached a caller as **values**, leaving the caller to derive a slot it cannot derive (§12.1
+clause 1c). §14's table is unchanged: §12 still **ships**, and these clauses are what shipping it
+completely means.
+
 **Citation discipline, after one failure.** A first revision cited a doc comment's illustrative ratio
 as if it defined a constant (§0.3), and it was propping up an immutable curried value. Two rules
 follow, and §15.4 records both as fixed rather than silently corrected:
@@ -2410,6 +2579,7 @@ a later reader can tell a decision from an open item.
 | A2 | **§2.6 defined three methods, so §7.4 clauses 3 and 5 could not be fed** — clause 5 orders a per-epoch, per-slot clawback presentation and clause 3 orders a destination parsed from the chain's `clawback_ph`, while no §2.6 method returned a commitment slot and §2.3's record carries no slot field | **fixed** — §2.6 gains `dig.listRewardDistributorCommitments` at `Tier::Control`, matching the shipped `dig-rpc-protocol` **v0.11.0** wire field for field, with six normative clauses: the **responder** MUST compute `recoverable_base_units` as `rewards_base_units * withdrawal_share_bps / 10_000` in integer arithmetic in that order, truncated; the echoed `withdrawal_share_bps` and `epoch_seconds` MUST be used rather than compiled-in constants; the chain's `clawback_ph` and the wire's `clawback_puzzle_hash` are stated to be one value; the figure is share arithmetic, never entitlement; an empty list is legitimate. §15.1's `dig-rpc-protocol` line corrected from "the three §2.6 methods"; §14's §2 row and metrics row record the shipped wire; §15.2 records the one implemented exception. No constant, default or driver shape changed |
 | A3 | **§12.5 clause 1 contradicted its own clauses 2 and 3** — "a **terminal, non-error** outcome for that distributor: stop retrying" admits the reading *never read that distributor again*, which makes clause 2's re-entry unobservable and clause 3 vacuous. Implemented literally in DIG-Network/dig-node#594, as a process-lifetime blacklist keyed by launcher id, it produced two reachable states in which a peer earns nothing while reporting nothing wrong: a peer legitimately re-admitted after `REENTRY_COOLDOWN_SECONDS`, and a peer that discovers a newly funded distributor before the funder's `AddEntry` lands — which §15 clause 9a makes the **ordinary** case rather than an edge | **fixed** — clause 1 now scopes "terminal" to the claim **attempt** and keeps every guarantee it had (no spend, no chain fault, no report of a lost payment, because §6.4 clause 1 already settled everything accrued including a sub-threshold remainder); new clause **1a** requires continued observation on §8.6's cadence and states that a slot read is a chain read, not a spend, so §6.3's write bounds do not reach it; clause **4** reconciles this with clause 3 explicitly — an absence MUST NOT be cached any more than a value is; clause **5** bans a permanent per-distributor exclusion set; clause **6** requires the absence be surfaced in the vocabulary §2.3/§2.4 already define, and states what the shipped v0.11.0 `RewardDistributorRef` cannot carry instead of ordering a presentation no wire can feed; clause **7** forbids guessing "never admitted" apart from "evicted after settlement". The heading widened from "A peer claiming after eviction", which pointed a reader looking for the not-yet-added case at no section at all. Clauses 2 and 3 are unchanged, so §15.1's "§12.5 clause 3" allocation still resolves. No constant, default or driver shape changed |
 | A4 | **Two clauses ordered work no caller could perform.** §7.2 clause 1a and §15 clause 3a order a launch-time manager-singleton inner-puzzle choice, while the crate ships **no singleton launcher at all**: `DistributorLaunchTerms` requires `manager_singleton_launcher_id` (`src/constants.rs:91`) and refuses a zero one (`src/constants.rs:197-203`), so at 0.5.0 no distributor can be minted through this crate without an id it offers no way to obtain. Separately, §13.1 clause 2 requires a peer with nothing but a chain source to find a distributor, while `LaunchComment` was written at launch and never read back from a spend | **specified** — new **§7.2a** (the manager singleton launch: launcher id derived from the spend this crate builds, inner puzzle an explicit un-defaulted choice named by **provenance** rather than by a capability this crate cannot verify of 32 opaque bytes, zero hash refused, both spends in one bundle) and **§13.1 clauses 4-10** (the decode: the comment is in the memos of the launcher-creating `CREATE_COIN`, not in the launcher solution, so every value is derived from the observed spend; absence over a zero generation; what a decoded result does not prove). §15 clauses **3b** and **10** carry them into conformance, §15 clause 9a gains the assertions its test must make, and §15.1 reallocates the §13.1 decode from the prover to this crate. Tracked by DIG-Network/dig_ecosystem#3308 and #3249. No constant, default or driver shape changed |
+| A5 | **§0.1 clause 1's exception admitted “exactly one” restatement of puzzle arithmetic**, and §12.5 clause 3b needs a second: a claim loop cannot decide whether a claim clears §8.3's `payout_threshold` without computing the accrual, and the only alternative — building a spend to find out — pays a fee to ask a question | **amended** — §0.1 clause 1 now admits **two**, on identical terms, and bans a third: each MUST be bound by a test that fails if it diverges from `chia-sdk-driver` 0.36.0's own implementation (`withdraw_incentives.rs:105-107` for `recoverable_base_units`, `initiate_payout.rs:127-131` for `accrued_base_units`). The prohibition itself is unchanged — no third restatement, and no new division anywhere else in the crate |
 
 Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
 reason the gate conditions are: a reader must be able to tell a decision from a correction, and a
