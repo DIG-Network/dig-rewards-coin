@@ -732,6 +732,13 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
     // The entry claims for itself, permissionlessly. The slot object must be the one the add
     // created: `created_slot_value_to_slot` derives the slot coin from the distributor coin being
     // spent, so re-deriving it later would name a coin that never existed.
+    //
+    // Captured BEFORE the spend, for the `accrued_base_units` equality test below: `spend`
+    // consumes `distributor` and its `pending_spend.latest_state` is what upstream actually
+    // multiplies against.
+    let state_before_claim = harness.distributor.pending_spend.latest_state.1;
+    let constants_before_claim = harness.distributor.info.constants;
+
     let source = StubSlotSource(entry_slot.clone());
     let outcome = initiate_payout(
         ctx,
@@ -754,6 +761,18 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
         "a claim below the threshold would not be payable: {amount_base_units}"
     );
     assert_eq!(counter, 0, "the slot's replay guard, as read");
+
+    // `SPEC.md` §12.5 clause 3b: `accrued_base_units` must mirror the puzzle's own arithmetic
+    // exactly, over the SAME state and entry the driver actually paid against.
+    assert_eq!(
+        dig_rewards_coin::accrued_base_units(
+            &constants_before_claim,
+            &state_before_claim,
+            &entry_slot.info.value,
+        ),
+        Some(amount_base_units),
+        "accrued_base_units must restate exactly what InitiatePayout actually paid"
+    );
 
     // The claim spent the entry slot and created its replacement, with `counter` advanced. That
     // replacement is what a later write must reference.
@@ -1833,6 +1852,232 @@ fn state_rebuilt_from_chain_matches_what_was_driven() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `SPEC.md` §12.5 clauses 3a/3c: a claim built ENTIRELY from a chain read -- the distributor and
+/// the entry slot both taken from [`read_distributor`]/[`dig_rewards_coin::ChainEntrySlotSource`],
+/// never from the in-process harness or `created_slot_value_to_slot` -- must actually be accepted
+/// by the chain. The entry is added several generations before the tip the chain read walks to,
+/// so this exercises the real walk, not a same-generation shortcut.
+#[test]
+fn a_claim_built_entirely_from_a_chain_read_is_accepted() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        COMMITTED_BASE_UNITS,
+    )?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    // Two more generations past the AddEntry -- the entry slot the claim below spends was created
+    // several generations before the tip the chain walk reaches.
+    harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let first_reward_slot = reward_slots
+        .iter()
+        .find(|slot| slot.info.value.epoch_start == FIRST_EPOCH_START)
+        .expect("a reward slot for the first epoch")
+        .clone();
+    let roll = start_next_distributor_epoch(ctx, &mut harness.distributor, first_reward_slot)?;
+    ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let sync_time = FIRST_EPOCH_START + TEST_EPOCH_SECONDS / 2;
+    harness.sim.set_next_timestamp(sync_time)?;
+    let sync_conditions = sync_distributor(ctx, &mut harness.distributor, sync_time)?;
+    ensure_conditions_met(ctx, &mut harness.sim, sync_conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    );
+
+    let reserve_before_claim = harness.distributor.info.state.total_reserves;
+
+    // The distributor AND the entry slot, ONLY from the chain -- never `harness.distributor` and
+    // never `created_slot_value_to_slot`.
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+    let mut chain_distributor = snapshot.distributor().clone();
+    let chain_source = dig_rewards_coin::ChainEntrySlotSource::new(&chain, launcher_id);
+
+    let outcome = initiate_payout(
+        ctx,
+        &mut chain_distributor,
+        &chain_source,
+        harness.entry.puzzle_hash,
+    )?;
+    let PayoutOutcome::Paid {
+        conditions,
+        amount_base_units,
+        ..
+    } = outcome
+    else {
+        panic!("the entry is in the chain-rebuilt set, so the claim must build");
+    };
+    assert!(
+        amount_base_units > 0,
+        "half an epoch with one entry must have accrued something"
+    );
+
+    ensure_conditions_met(ctx, &mut harness.sim, conditions)?;
+    chain_distributor = chain_distributor.finish_spend(ctx, vec![])?.0;
+
+    // The assertion the whole test exists for: a bundle built entirely from a chain read is
+    // actually ACCEPTED, never merely well-formed.
+    harness.sim.spend_coins(ctx.take(), &[])?;
+
+    assert_eq!(
+        chain_distributor.info.state.total_reserves,
+        reserve_before_claim - amount_base_units,
+        "the claim actually moved money out of the reserve, on-chain"
+    );
+
+    Ok(())
+}
+
+/// `SPEC.md` §12.1 clause 1c: `created_slot_value_to_slot`, called on a `RewardDistributor` for a
+/// slot an EARLIER generation created, derives a well-formed but PHANTOM `LineageProof` -- one
+/// naming a coin that never existed. `initiate_payout` builds against it without complaint;
+/// the chain MUST reject the resulting bundle at submission.
+#[test]
+fn a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut harness = launch_harness(ctx)?;
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+
+    let mut singleton_members = vec![launcher_id, harness.distributor.coin.coin_id()];
+    let reserve_launch_id = harness.distributor.reserve.coin.coin_id();
+    let reserve_parent_id = harness.distributor.reserve.coin.parent_coin_info;
+
+    let first_epoch_slot = harness.first_epoch_slot.clone();
+    let reward_slots = commit_to_epoch(
+        ctx,
+        &mut harness,
+        first_epoch_slot,
+        FIRST_EPOCH_START,
+        COMMITTED_BASE_UNITS,
+    )?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let authority = ManagerAuthority::new(harness.manager.inner_puzzle_hash)?;
+    let write = add_entry(
+        ctx,
+        &mut harness.distributor,
+        authority,
+        verdict_for(harness.entry.puzzle_hash),
+        0,
+    )?;
+    // The value from the generation that actually created it -- the ONLY value a real slot for
+    // this entry ever had.
+    let entry_slot_value = harness.distributor.pending_spend.created_entry_slots[0];
+
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    ensure_optional_conditions_met(ctx, &mut harness.sim, write.sync_conditions)?;
+    let (next_manager_coin, next_manager_proof) =
+        spend_manager_singleton(ctx, &harness.manager, write.manager_conditions)?;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    harness.manager.coin = next_manager_coin;
+    harness.manager.proof = next_manager_proof;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    // At least one more generation past the AddEntry, so the tip is not the generation that
+    // created the entry slot.
+    harness.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let first_reward_slot = reward_slots
+        .iter()
+        .find(|slot| slot.info.value.epoch_start == FIRST_EPOCH_START)
+        .expect("a reward slot for the first epoch")
+        .clone();
+    let roll = start_next_distributor_epoch(ctx, &mut harness.distributor, first_reward_slot)?;
+    ensure_conditions_met(ctx, &mut harness.sim, roll.conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let sync_time = FIRST_EPOCH_START + TEST_EPOCH_SECONDS / 2;
+    harness.sim.set_next_timestamp(sync_time)?;
+    let sync_conditions = sync_distributor(ctx, &mut harness.distributor, sync_time)?;
+    ensure_conditions_met(ctx, &mut harness.sim, sync_conditions)?;
+    harness.distributor = harness.distributor.clone().finish_spend(ctx, vec![])?.0;
+    harness.sim.spend_coins(ctx.take(), &[])?;
+    singleton_members.push(harness.distributor.coin.coin_id());
+
+    let reserve_tip_id = harness.distributor.reserve.coin.coin_id();
+    let chain = mock_chain_source(
+        &harness.sim,
+        launcher_id,
+        &singleton_members,
+        &[reserve_launch_id, reserve_parent_id, reserve_tip_id],
+    );
+
+    let snapshot = read_distributor(&chain, launcher_id)?
+        .expect("a distributor was launched at this launcher id");
+
+    // THE DEFECT UNDER TEST: `created_slot_value_to_slot` called on the TIP, for a value an
+    // EARLIER generation created. `snapshot.distributor()`'s own doc comment names this exact
+    // prohibition; this test is the proof the chain -- not the type system -- is what catches it.
+    let phantom_entry_slot = snapshot
+        .distributor()
+        .created_slot_value_to_slot(entry_slot_value, RewardDistributorSlotNonce::ENTRY);
+    let mut spending_distributor = snapshot.distributor().clone();
+    let source = StubSlotSource(phantom_entry_slot);
+    let outcome = initiate_payout(
+        ctx,
+        &mut spending_distributor,
+        &source,
+        harness.entry.puzzle_hash,
+    )?;
+    let PayoutOutcome::Paid { conditions, .. } = outcome else {
+        panic!("the phantom slot is well-formed, so InitiatePayout builds without complaint");
+    };
+    ensure_conditions_met(ctx, &mut harness.sim, conditions)?;
+    let _ = spending_distributor.finish_spend(ctx, vec![])?;
+
+    let result = harness.sim.spend_coins(ctx.take(), &[]);
+
+    assert!(
+        result.is_err(),
+        "a phantom slot names a coin that never existed -- the chain must reject the spend \
+         bundle, got: {result:?}"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // F5: an observed entry-set write whose generation has no resolvable chain timestamp must refuse
 // the read, never report a snapshot with a stale/absent `last_entry_write_unix` -- a pruning RPC
@@ -2542,6 +2787,28 @@ fn an_unspent_launcher_reads_as_never_launched() {
     assert!(
         result.unwrap().is_none(),
         "no coin record for the launcher id -- Ok(None) is the ONLY case this reserves"
+    );
+}
+
+/// `SPEC.md` §12.5 clause 3a: `read_distributor` answering `Ok(None)` -- no distributor was ever
+/// launched at this id -- MUST surface from [`ChainEntrySlotSource`] as an ERROR, never as
+/// `Ok(None)`. Degrading it to `Ok(None)` would make "this distributor does not exist" read
+/// identical to "this peer holds no entry in a real distributor", which is a different fact with
+/// a different remedy.
+#[test]
+fn chain_entry_slot_source_errors_rather_than_answering_none_for_a_never_launched_distributor() {
+    let chain = dig_chainsource_interface::MockChainSource::new();
+    let launcher_id = Bytes32::new([0x42; 32]);
+    let source = dig_rewards_coin::ChainEntrySlotSource::new(&chain, launcher_id);
+
+    let result = source.read_entry_slot(Bytes32::new([0x99; 32]));
+
+    assert!(
+        matches!(
+            result,
+            Err(RewardsError::NoDistributorAtLauncherId { launcher_id: id }) if id == launcher_id
+        ),
+        "a never-launched launcher id must be a distinct error, not Ok(None), got: {result:?}"
     );
 }
 
