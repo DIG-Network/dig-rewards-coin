@@ -309,24 +309,7 @@ impl DistributorSnapshot {
         &self,
         payout_puzzle_hash: Bytes32,
     ) -> Result<Option<&Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
-        let mut matches = self
-            .spendable
-            .entries
-            .iter()
-            .filter(|slot| slot.info.value.payout_puzzle_hash == payout_puzzle_hash);
-
-        let Some(first) = matches.next() else {
-            return Ok(None);
-        };
-
-        if matches.next().is_some() {
-            return Err(malformed(format!(
-                "more than one entry slot pays puzzle hash {payout_puzzle_hash} -- refusing to \
-                 pick one rather than pay one and strand the other"
-            )));
-        }
-
-        Ok(Some(first))
+        entry_slot_for_payout_puzzle_hash(&self.spendable.entries, payout_puzzle_hash)
     }
 
     /// The spendable commitment slots, each with the `LineageProof` of the generation that
@@ -463,6 +446,30 @@ impl DistributorSnapshot {
 
         Ok(current.observed.tip_coin_id == self.observed.tip_coin_id)
     }
+}
+
+/// [`DistributorSnapshot::entry_slot`]'s search, factored out so a unit test can drive the
+/// ambiguity path directly without constructing a whole snapshot.
+fn entry_slot_for_payout_puzzle_hash(
+    entries: &[Slot<RewardDistributorEntrySlotValue>],
+    payout_puzzle_hash: Bytes32,
+) -> Result<Option<&Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
+    let mut matches = entries
+        .iter()
+        .filter(|slot| slot.info.value.payout_puzzle_hash == payout_puzzle_hash);
+
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+
+    if matches.next().is_some() {
+        return Err(malformed(format!(
+            "more than one entry slot pays puzzle hash {payout_puzzle_hash} -- refusing to pick \
+             one rather than pay one and strand the other"
+        )));
+    }
+
+    Ok(Some(first))
 }
 
 // `RewardDistributorInfo::constants` isn't a real accessor upstream (the field is named
@@ -1552,6 +1559,67 @@ mod tests {
             proof,
             SlotInfo::from_value(some_identity(), RewardDistributorSlotNonce::REWARD.to_u64(), value),
         )
+    }
+
+    /// A `Slot<RewardDistributorEntrySlotValue>` paying `payout_puzzle_hash`, for tests that
+    /// exercise [`entry_slot_for_payout_puzzle_hash`] directly. Every other field is arbitrary.
+    fn test_entry_slot(
+        payout_puzzle_hash: Bytes32,
+    ) -> Slot<RewardDistributorEntrySlotValue> {
+        let proof = LineageProof {
+            parent_parent_coin_info: Bytes32::default(),
+            parent_inner_puzzle_hash: Bytes32::default(),
+            parent_amount: 0,
+        };
+        let value = RewardDistributorEntrySlotValue {
+            payout_puzzle_hash,
+            initial_cumulative_payout: 0,
+            shares: 1,
+            counter: 0,
+        };
+        Slot::new(
+            proof,
+            SlotInfo::from_value(some_identity(), RewardDistributorSlotNonce::ENTRY.to_u64(), value),
+        )
+    }
+
+    /// `SPEC.md` §12.1 clause 1b: two entry slots paying the same puzzle hash is a set this crate
+    /// cannot reconcile -- picking one silently would pay it while stranding the other and
+    /// reporting success, so this MUST be an error rather than a pick.
+    #[test]
+    fn two_entry_slots_paying_the_same_puzzle_hash_is_an_error_not_a_pick() {
+        let payout_puzzle_hash = Bytes32::new([0xAB; 32]);
+        let entries = vec![
+            test_entry_slot(payout_puzzle_hash),
+            test_entry_slot(payout_puzzle_hash),
+        ];
+
+        let result = entry_slot_for_payout_puzzle_hash(&entries, payout_puzzle_hash);
+
+        match result {
+            Err(RewardsError::Malformed(message)) => {
+                assert!(
+                    message.contains("more than one entry slot"),
+                    "wrong reason: {message}"
+                );
+            }
+            other => panic!("an ambiguous entry set must be an error, got {other:?}"),
+        }
+    }
+
+    /// The ordinary case: exactly one entry slot for a puzzle hash is returned, not an error.
+    #[test]
+    fn one_entry_slot_for_a_puzzle_hash_is_returned() {
+        let payout_puzzle_hash = Bytes32::new([0xCD; 32]);
+        let entries = vec![test_entry_slot(payout_puzzle_hash)];
+
+        let result = entry_slot_for_payout_puzzle_hash(&entries, payout_puzzle_hash)
+            .expect("exactly one match is never an error");
+
+        assert_eq!(
+            result.map(|slot| slot.info.value.payout_puzzle_hash),
+            Some(payout_puzzle_hash)
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ pub use manager::{
     launch_manager_singleton, LaunchedManagerSingleton, ManagerInnerPuzzle,
     MANAGER_SINGLETON_AMOUNT_MOJOS,
 };
+pub use payout::ChainEntrySlotSource;
 pub use state::{
     read_distributor, ChainObservation, DistributorSlots, DistributorSnapshot,
     STALE_ENTRY_SET_SECONDS,

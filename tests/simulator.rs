@@ -2545,6 +2545,28 @@ fn an_unspent_launcher_reads_as_never_launched() {
     );
 }
 
+/// `SPEC.md` §12.5 clause 3a: `read_distributor` answering `Ok(None)` -- no distributor was ever
+/// launched at this id -- MUST surface from [`ChainEntrySlotSource`] as an ERROR, never as
+/// `Ok(None)`. Degrading it to `Ok(None)` would make "this distributor does not exist" read
+/// identical to "this peer holds no entry in a real distributor", which is a different fact with
+/// a different remedy.
+#[test]
+fn chain_entry_slot_source_errors_rather_than_answering_none_for_a_never_launched_distributor() {
+    let chain = dig_chainsource_interface::MockChainSource::new();
+    let launcher_id = Bytes32::new([0x42; 32]);
+    let source = dig_rewards_coin::ChainEntrySlotSource::new(&chain, launcher_id);
+
+    let result = source.read_entry_slot(Bytes32::new([0x99; 32]));
+
+    assert!(
+        matches!(
+            result,
+            Err(RewardsError::NoDistributorAtLauncherId { launcher_id: id }) if id == launcher_id
+        ),
+        "a never-launched launcher id must be a distinct error, not Ok(None), got: {result:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The launch-created reward slot (F2), the step-11 money cross-check (F3) and the fail-closed
 // rule (F4) -- every one of these was invisible to a fully green suite.

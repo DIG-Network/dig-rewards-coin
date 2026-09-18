@@ -125,3 +125,54 @@ pub fn slot_payout_puzzle_hash(entry_slot: &Slot<RewardDistributorEntrySlotValue
 pub fn payout_threshold_base_units(distributor: &RewardDistributor) -> u64 {
     distributor.info.constants.payout_threshold
 }
+
+/// The chain-backed [`EntrySlotSource`] (`SPEC.md` §12.5 clause 3a): re-walks the whole
+/// distributor, from the eve coin to the tip, on **every** call.
+///
+/// A narrower read is FORBIDDEN. `dig_chainsource_interface::ChainSource` has no hint index and a
+/// slot's puzzle hash depends on the slot *value* (§12.1 clause 1), so the authenticated walk
+/// [`crate::state::read_distributor`] performs is the only thing that establishes a slot coin
+/// exists and what proof it carries — the walk **is** the authentication. A shortcut that
+/// returned a `Slot` without it would return exactly §12.1 clause 1c's phantom, with none of the
+/// warning signs.
+///
+/// The cost is stated rather than optimised away: one claim is one walk, which a loop claiming on
+/// `SPEC.md` §8.6's `CLAIM_CADENCE_SECONDS` pays once per cadence period.
+pub struct ChainEntrySlotSource<'a, S> {
+    source: &'a S,
+    launcher_id: Bytes32,
+}
+
+impl<'a, S> ChainEntrySlotSource<'a, S> {
+    /// Reads entry slots for the distributor launched at `launcher_id`, through `source`.
+    pub fn new(source: &'a S, launcher_id: Bytes32) -> Self {
+        Self {
+            source,
+            launcher_id,
+        }
+    }
+}
+
+impl<'a, S: dig_chainsource_interface::ChainSource> EntrySlotSource for ChainEntrySlotSource<'a, S> {
+    /// Performs a full [`crate::state::read_distributor`] and takes the slot from that snapshot's
+    /// [`crate::state::DistributorSnapshot::entry_slot`] accessor.
+    ///
+    /// # Errors
+    ///
+    /// - [`RewardsError::NoDistributorAtLauncherId`] when `read_distributor` answers `Ok(None)` —
+    ///   no distributor was ever launched at this launcher id, which MUST NOT be degraded into
+    ///   `Ok(None)` here: "this distributor does not exist" and "this peer holds no entry in it"
+    ///   are different facts with different remedies (`SPEC.md` §12.5 clause 3a).
+    /// - [`RewardsError::ChainUnavailable`] when the underlying read could not be established.
+    fn read_entry_slot(
+        &self,
+        payout_puzzle_hash: Bytes32,
+    ) -> Result<Option<Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
+        let snapshot = crate::state::read_distributor(self.source, self.launcher_id)?
+            .ok_or(RewardsError::NoDistributorAtLauncherId {
+                launcher_id: self.launcher_id,
+            })?;
+
+        Ok(snapshot.entry_slot(payout_puzzle_hash)?.cloned())
+    }
+}
