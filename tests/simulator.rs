@@ -732,6 +732,13 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
     // The entry claims for itself, permissionlessly. The slot object must be the one the add
     // created: `created_slot_value_to_slot` derives the slot coin from the distributor coin being
     // spent, so re-deriving it later would name a coin that never existed.
+    //
+    // Captured BEFORE the spend, for the `accrued_base_units` equality test below: `spend`
+    // consumes `distributor` and its `pending_spend.latest_state` is what upstream actually
+    // multiplies against.
+    let state_before_claim = harness.distributor.pending_spend.latest_state.1;
+    let constants_before_claim = harness.distributor.info.constants;
+
     let source = StubSlotSource(entry_slot.clone());
     let outcome = initiate_payout(
         ctx,
@@ -754,6 +761,18 @@ fn managed_dig_distributor_end_to_end() -> anyhow::Result<()> {
         "a claim below the threshold would not be payable: {amount_base_units}"
     );
     assert_eq!(counter, 0, "the slot's replay guard, as read");
+
+    // `SPEC.md` §12.5 clause 3b: `accrued_base_units` must mirror the puzzle's own arithmetic
+    // exactly, over the SAME state and entry the driver actually paid against.
+    assert_eq!(
+        dig_rewards_coin::accrued_base_units(
+            &constants_before_claim,
+            &state_before_claim,
+            &entry_slot.info.value,
+        ),
+        Some(amount_base_units),
+        "accrued_base_units must restate exactly what InitiatePayout actually paid"
+    );
 
     // The claim spent the entry slot and created its replacement, with `counter` advanced. That
     // replacement is what a later write must reference.

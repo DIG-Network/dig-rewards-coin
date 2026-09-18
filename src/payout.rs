@@ -20,7 +20,8 @@
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{
-    RewardDistributor, RewardDistributorInitiatePayoutAction, Slot, SpendContext,
+    RewardDistributor, RewardDistributorConstants, RewardDistributorInitiatePayoutAction, Slot,
+    RewardDistributorState, SpendContext,
 };
 use chia_sdk_types::puzzles::RewardDistributorEntrySlotValue;
 use chia_sdk_types::Conditions;
@@ -126,6 +127,38 @@ pub fn payout_threshold_base_units(distributor: &RewardDistributor) -> u64 {
     distributor.info.constants.payout_threshold
 }
 
+/// What `InitiatePayout` would pay `entry`, mirroring `RewardDistributorInitiatePayoutAction::spend`'s
+/// arithmetic exactly (`SPEC.md` §12.5 clause 3b) -- a restatement of puzzle arithmetic, permitted
+/// only because it is bound to the real paying code by an equality test (§0.1 clause 1).
+///
+/// Deliberately does **not** apply [`payout_threshold_base_units`]: the threshold gates whether
+/// `InitiatePayout` succeeds, not what it would pay if it did, and conflating the two would make a
+/// caller under the threshold see `0` rather than "not yet, but accruing".
+///
+/// # `None`
+///
+/// Returned rather than a saturated or wrapped value on:
+/// - `state`'s `cumulative_payout` behind `entry`'s `initial_cumulative_payout` (a diverged read,
+///   never a valid distributor state for this entry);
+/// - the payout narrowing past `u64` (the same failure `spend` reports via `TryFromIntError`).
+#[must_use]
+pub fn accrued_base_units(
+    constants: &RewardDistributorConstants,
+    state: &RewardDistributorState,
+    entry: &RewardDistributorEntrySlotValue,
+) -> Option<u64> {
+    let elapsed_cumulative_payout = state
+        .round_reward_info
+        .cumulative_payout
+        .checked_sub(entry.initial_cumulative_payout)?;
+
+    let withdrawal_amount_precision = u128::from(entry.shares) * elapsed_cumulative_payout;
+
+    let withdrawal_amount = withdrawal_amount_precision.checked_div(u128::from(constants.precision))?;
+
+    u64::try_from(withdrawal_amount).ok()
+}
+
 /// The chain-backed [`EntrySlotSource`] (`SPEC.md` §12.5 clause 3a): re-walks the whole
 /// distributor, from the eve coin to the tip, on **every** call.
 ///
@@ -174,5 +207,115 @@ impl<'a, S: dig_chainsource_interface::ChainSource> EntrySlotSource for ChainEnt
             })?;
 
         Ok(snapshot.entry_slot(payout_puzzle_hash)?.cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia_sdk_driver::{RewardDistributorType, RoundRewardInfo, RoundTimeInfo};
+
+    fn some_constants(precision: u64) -> RewardDistributorConstants {
+        RewardDistributorConstants {
+            launcher_id: Bytes32::new([1; 32]),
+            reward_distributor_type: RewardDistributorType::Managed {
+                manager_singleton_launcher_id: Bytes32::new([7; 32]),
+            },
+            fee_payout_puzzle_hash: Bytes32::new([2; 32]),
+            epoch_seconds: 1,
+            precision,
+            max_seconds_offset: 0,
+            payout_threshold: 0,
+            require_payout_approval: false,
+            fee_bps: 0,
+            withdrawal_share_bps: 0,
+            reserve_asset_id: Bytes32::new([3; 32]),
+            reserve_inner_puzzle_hash: Bytes32::new([4; 32]),
+            reserve_full_puzzle_hash: Bytes32::new([5; 32]),
+        }
+    }
+
+    fn some_state(cumulative_payout: u128) -> RewardDistributorState {
+        RewardDistributorState {
+            total_reserves: 0,
+            active_shares: 0,
+            round_reward_info: RoundRewardInfo {
+                cumulative_payout,
+                remaining_rewards: 0,
+            },
+            round_time_info: RoundTimeInfo {
+                last_update: 0,
+                epoch_end: 0,
+            },
+        }
+    }
+
+    fn some_entry(initial_cumulative_payout: u128, shares: u64) -> RewardDistributorEntrySlotValue {
+        RewardDistributorEntrySlotValue {
+            counter: 0,
+            payout_puzzle_hash: Bytes32::new([6; 32]),
+            initial_cumulative_payout,
+            shares,
+        }
+    }
+
+    /// The ordinary case: matches `withdrawal_amount_precision / precision` from
+    /// `RewardDistributorInitiatePayoutAction::spend` by hand.
+    #[test]
+    fn accrues_shares_times_elapsed_payout_divided_by_precision() {
+        let constants = some_constants(100);
+        let state = some_state(1_000);
+        let entry = some_entry(200, 10);
+
+        // (1_000 - 200) * 10 / 100 = 80
+        assert_eq!(accrued_base_units(&constants, &state, &entry), Some(80));
+    }
+
+    /// `state`'s `cumulative_payout` behind `entry`'s `initial_cumulative_payout` is a diverged
+    /// read (never valid for this entry) -- `None`, never a wrapped/saturated figure.
+    #[test]
+    fn a_cumulative_payout_behind_the_entrys_initial_value_is_none_not_wrapped() {
+        let constants = some_constants(100);
+        let state = some_state(50);
+        let entry = some_entry(200, 10);
+
+        assert_eq!(accrued_base_units(&constants, &state, &entry), None);
+    }
+
+    /// A payout too large for `u64` is `None`, mirroring `spend`'s `u64::try_from` failing.
+    #[test]
+    fn a_payout_that_does_not_fit_u64_is_none() {
+        let constants = some_constants(1);
+        let state = some_state(u128::from(u64::MAX) + 1);
+        let entry = some_entry(0, 1);
+
+        assert_eq!(accrued_base_units(&constants, &state, &entry), None);
+    }
+
+    /// A zero precision would divide by zero in the puzzle's own arithmetic too; this must return
+    /// `None` rather than panic.
+    #[test]
+    fn a_zero_precision_is_none_not_a_panic() {
+        let constants = some_constants(0);
+        let state = some_state(1_000);
+        let entry = some_entry(0, 10);
+
+        assert_eq!(accrued_base_units(&constants, &state, &entry), None);
+    }
+
+    /// `payout_threshold` must never be applied here -- it gates whether `InitiatePayout`
+    /// succeeds, not what it would pay.
+    #[test]
+    fn the_payout_threshold_is_never_applied() {
+        let mut constants = some_constants(1);
+        constants.payout_threshold = 1_000_000;
+        let state = some_state(10);
+        let entry = some_entry(0, 1);
+
+        assert_eq!(
+            accrued_base_units(&constants, &state, &entry),
+            Some(10),
+            "a figure below the threshold is still the accrued figure, not zero"
+        );
     }
 }
