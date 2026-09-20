@@ -74,6 +74,22 @@ pub enum RewardsError {
     #[error("not the clawback authority recorded in the commitment slot")]
     NotTheClawbackAuthority,
 
+    /// No distributor was ever launched at this launcher id (`SPEC.md` §12.5 clause 3a).
+    ///
+    /// [`crate::state::read_distributor`] answering `Ok(None)` means exactly this — the launcher
+    /// coin was never spent — and it MUST NOT be degraded into "this peer holds no entry slot",
+    /// which is a different fact with a different remedy (clause 1's "keep observing, spend
+    /// nothing" is correct only for a real distributor a peer has not yet been admitted to).
+    /// [`crate::payout::ChainEntrySlotSource`]'s `read_entry_slot` surfaces this as an error rather
+    /// than `Ok(None)` for exactly that reason: reported as an absence, a mistyped or
+    /// non-existent launcher id would be indistinguishable from a peer patiently waiting to be
+    /// admitted, forever.
+    #[error("no distributor was ever launched at launcher id {launcher_id}")]
+    NoDistributorAtLauncherId {
+        /// The launcher id a chain-backed entry-slot read was asked to resolve.
+        launcher_id: Bytes32,
+    },
+
     /// A puzzle construction or spend-building step failed inside the Chia driver layer.
     ///
     /// Boxed because `DriverError` is large and would otherwise bloat every `Result` in the

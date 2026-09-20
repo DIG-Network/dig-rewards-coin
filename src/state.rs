@@ -83,6 +83,12 @@ fn malformed(reason: impl Into<String>) -> RewardsError {
 }
 
 /// The slots a distributor currently has outstanding, as observed by the walk.
+///
+/// A **derived value view** (`SPEC.md` §12.1 clause 1a): the walk itself bookkeeps over
+/// [`Slot<V>`](chia_sdk_driver::Slot), never over these bare values, and this struct is built
+/// exactly once — from that spendable `Slot` set, at the end of the walk. Two parallel
+/// accumulators (one of values, one of `Slot`s) would be two models of one fact that can drift
+/// silently; there is exactly one bookkeeping path, and it lives in `SpendableSlots`.
 #[derive(Debug, Clone, Default)]
 pub struct DistributorSlots {
     /// One per entry in the entry set: who gets paid, and the replay guard.
@@ -95,11 +101,26 @@ pub struct DistributorSlots {
     pub rewards: Vec<RewardDistributorRewardSlotValue>,
 }
 
-impl DistributorSlots {
+/// The **one** bookkeeping path (`SPEC.md` §12.1 clause 1a): the spendable `Slot<V>` set the walk
+/// maintains as it advances generation by generation.
+///
+/// Each `Slot` here carries the `LineageProof` of the generation that actually created it —
+/// unlike [`chia_sdk_driver::RewardDistributor::created_slot_value_to_slot`] called on the tip,
+/// which would fabricate a phantom (§12.1 clause 1c). [`DistributorSlots`] is derived from this set
+/// once, at the end of the walk, and is never bookkept independently.
+#[derive(Debug, Clone, Default)]
+struct SpendableSlots {
+    entries: Vec<Slot<RewardDistributorEntrySlotValue>>,
+    commitments: Vec<Slot<RewardDistributorCommitmentSlotValue>>,
+    rewards: Vec<Slot<RewardDistributorRewardSlotValue>>,
+}
+
+impl SpendableSlots {
     /// Applies one generation's created/spent deltas: removes exactly one matching instance of
-    /// each spent slot value, then appends the created ones.
+    /// each spent slot VALUE, then appends the created `Slot`s (already reconstructed by the
+    /// caller against the generation that created them).
     ///
-    /// Slot values are plain data (no coin id inside), so identity is by VALUE — which is exactly
+    /// Slot values are plain data (no coin id inside), so removal is by VALUE — which is exactly
     /// what the puzzle itself treats as the slot, and exactly why an entry is removed rather than
     /// decremented: there is no other handle to remove by.
     ///
@@ -111,46 +132,64 @@ impl DistributorSlots {
     fn apply_generation(
         &mut self,
         spent_entries: &[RewardDistributorEntrySlotValue],
-        created_entries: &[RewardDistributorEntrySlotValue],
+        created_entries: Vec<Slot<RewardDistributorEntrySlotValue>>,
         spent_commitments: &[RewardDistributorCommitmentSlotValue],
-        created_commitments: &[RewardDistributorCommitmentSlotValue],
+        created_commitments: Vec<Slot<RewardDistributorCommitmentSlotValue>>,
         spent_rewards: &[RewardDistributorRewardSlotValue],
-        created_rewards: &[RewardDistributorRewardSlotValue],
+        created_rewards: Vec<Slot<RewardDistributorRewardSlotValue>>,
     ) -> Result<(), RewardsError> {
-        remove_one_each(&mut self.entries, spent_entries, "entry")?;
-        self.entries.extend_from_slice(created_entries);
+        remove_one_each_by_value(&mut self.entries, spent_entries, "entry")?;
+        self.entries.extend(created_entries);
 
-        remove_one_each(&mut self.commitments, spent_commitments, "commitment")?;
-        self.commitments.extend_from_slice(created_commitments);
+        remove_one_each_by_value(&mut self.commitments, spent_commitments, "commitment")?;
+        self.commitments.extend(created_commitments);
 
-        remove_one_each(&mut self.rewards, spent_rewards, "reward")?;
-        self.rewards.extend_from_slice(created_rewards);
+        remove_one_each_by_value(&mut self.rewards, spent_rewards, "reward")?;
+        self.rewards.extend(created_rewards);
 
         Ok(())
     }
+
+    /// The one-time derivation `SPEC.md` §12.1 clause 1a requires: [`DistributorSlots`]'s public
+    /// value fields, read off this walk's spendable `Slot` set.
+    fn to_value_view(&self) -> DistributorSlots {
+        DistributorSlots {
+            entries: self.entries.iter().map(|slot| slot.info.value).collect(),
+            commitments: self
+                .commitments
+                .iter()
+                .map(|slot| slot.info.value)
+                .collect(),
+            rewards: self.rewards.iter().map(|slot| slot.info.value).collect(),
+        }
+    }
 }
 
-/// Removes, from `set`, one occurrence of each value in `spent` — never all occurrences, since two
-/// outstanding slots can be equal by value.
+/// Removes, from `set`, one occurrence of the `Slot` whose value equals each entry of `spent` —
+/// never all occurrences, since two outstanding slots can be equal by value.
 ///
 /// # Errors
 ///
-/// If a value in `spent` is not in `set`. The chain cannot spend a slot that was never created, so
-/// a spend the walk cannot account for means the walk's model is WRONG — and absorbing it would
-/// render a diverged read as a merely smaller one, which for a slot set is a claim about money.
-fn remove_one_each<T: PartialEq + Copy>(
-    set: &mut Vec<T>,
+/// If a value in `spent` matches no slot in `set`. The chain cannot spend a slot that was never
+/// created, so a spend the walk cannot account for means the walk's model is WRONG — and absorbing
+/// it would render a diverged read as a merely smaller one, which for a slot set is a claim about
+/// money.
+fn remove_one_each_by_value<T: PartialEq + Copy>(
+    set: &mut Vec<Slot<T>>,
     spent: &[T],
     slot_kind: &str,
 ) -> Result<(), RewardsError> {
     for value in spent {
-        let Some(index) = set.iter().position(|existing| existing == value) else {
+        let Some(index) = set
+            .iter()
+            .position(|existing| &existing.info.value == value)
+        else {
             return Err(malformed(format!(
                 "a generation spends a {slot_kind} slot this walk never saw created -- the \
                  reader's model of the chain disagrees with the chain"
             )));
         };
-        set.remove(index);
+        let _ = set.remove(index);
     }
 
     Ok(())
@@ -226,6 +265,7 @@ impl ChainObservation {
 pub struct DistributorSnapshot {
     distributor: RewardDistributor,
     slots: DistributorSlots,
+    spendable: SpendableSlots,
     observed: ChainObservation,
 }
 
@@ -234,14 +274,57 @@ impl DistributorSnapshot {
     ///
     /// The contents are `Clone`: see the type's own docs for why a copy taken from here must not be
     /// trusted as current.
+    ///
+    /// # A phantom is one call away, and this type cannot stop it (`SPEC.md` §12.1 clause 1c)
+    ///
+    /// `RewardDistributor::created_slot_value_to_slot` derives a slot's `LineageProof` from **the
+    /// coin it is called on** — the tip, here. A caller MUST NOT call it on the `RewardDistributor`
+    /// this method hands out for a slot some EARLIER generation created: the resulting slot coin
+    /// never existed, yet the proof is well-formed, the puzzle hash computes, `initiate_payout`
+    /// builds, `finish_spend` succeeds, and the bundle is refused only at chain submission, with no
+    /// indication of which part was wrong. Take slots from [`Self::entry_slot`],
+    /// [`Self::commitment_slots`] or [`Self::reward_slots`] instead — those carry the `LineageProof`
+    /// of the generation that actually created each one. This type cannot enforce the prohibition
+    /// itself: the upstream method lives on `RewardDistributor`, which this crate hands out by
+    /// reference.
     pub fn distributor(&self) -> &RewardDistributor {
         &self.distributor
     }
 
-    /// The outstanding slots.
+    /// The outstanding slots, as a plain value view.
+    ///
+    /// Derived once from [`Self::entry_slot`]/[`Self::commitment_slots`]/[`Self::reward_slots`]'s
+    /// underlying `Slot` set (`SPEC.md` §12.1 clause 1a) — never bookkept in parallel with it.
     #[must_use]
     pub fn slots(&self) -> &DistributorSlots {
         &self.slots
+    }
+
+    /// The spendable entry slot paying `payout_puzzle_hash`, with the `LineageProof` of the
+    /// generation that actually created it (`SPEC.md` §12.1 clause 1b).
+    ///
+    /// # Errors
+    ///
+    /// If more than one entry in the set carries that payout puzzle hash. Two entries paying one
+    /// puzzle hash is a set this crate cannot reconcile, and choosing one silently would pay it
+    /// while stranding the other and reporting success.
+    pub fn entry_slot(
+        &self,
+        payout_puzzle_hash: Bytes32,
+    ) -> Result<Option<&Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
+        entry_slot_for_payout_puzzle_hash(&self.spendable.entries, payout_puzzle_hash)
+    }
+
+    /// The spendable commitment slots, each with the `LineageProof` of the generation that
+    /// actually created it (`SPEC.md` §12.1 clause 1b).
+    pub fn commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>] {
+        &self.spendable.commitments
+    }
+
+    /// The spendable reward slots, each with the `LineageProof` of the generation that actually
+    /// created it (`SPEC.md` §12.1 clause 1b).
+    pub fn reward_slots(&self) -> &[Slot<RewardDistributorRewardSlotValue>] {
+        &self.spendable.rewards
     }
 
     /// The chain view this snapshot was read against.
@@ -364,6 +447,30 @@ impl DistributorSnapshot {
 
         Ok(current.observed.tip_coin_id == self.observed.tip_coin_id)
     }
+}
+
+/// [`DistributorSnapshot::entry_slot`]'s search, factored out so a unit test can drive the
+/// ambiguity path directly without constructing a whole snapshot.
+fn entry_slot_for_payout_puzzle_hash(
+    entries: &[Slot<RewardDistributorEntrySlotValue>],
+    payout_puzzle_hash: Bytes32,
+) -> Result<Option<&Slot<RewardDistributorEntrySlotValue>>, RewardsError> {
+    let mut matches = entries
+        .iter()
+        .filter(|slot| slot.info.value.payout_puzzle_hash == payout_puzzle_hash);
+
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+
+    if matches.next().is_some() {
+        return Err(malformed(format!(
+            "more than one entry slot pays puzzle hash {payout_puzzle_hash} -- refusing to pick \
+             one rather than pay one and strand the other"
+        )));
+    }
+
+    Ok(Some(first))
 }
 
 // `RewardDistributorInfo::constants` isn't a real accessor upstream (the field is named
@@ -939,7 +1046,7 @@ fn refuse_unrepresentable_action_arithmetic(
 ///    API and IS accepted by the simulator --
 ///    `a_same_generation_commit_and_withdraw_above_the_driver_bound_is_refused_before_from_spend`
 ///    builds and submits one. This reader refuses it either way, but note WHICH check does the
-///    refusing: `DistributorSlots::apply_generation` removes a generation's spent slots before
+///    refusing: `SpendableSlots::apply_generation` removes a generation's spent slots before
 ///    extending with its created ones, so a create-then-spend of one commitment slot inside one
 ///    generation is refused as `Malformed` by slot bookkeeping alone, at any magnitude. That
 ///    backstop is orthogonal to B2's bound, which is why no test asserts B2's value on that
@@ -966,7 +1073,7 @@ fn refuse_unrepresentable_action_arithmetic(
 ///
 /// Batching cannot hide a commitment's value from B2 the way it could from a reserve-amount proxy:
 /// the bound is checked against the slot bookkeeping this walk already reconstructs
-/// (`DistributorSlots::apply_generation`'s `created_commitments`), never against the reserve
+/// (`SpendableSlots::apply_generation`'s `created_commitments`), never against the reserve
 /// coin, so nothing about how many other actions share the generation changes what B2 sees.
 ///
 pub fn read_distributor(
@@ -1067,16 +1174,19 @@ pub fn read_distributor(
     // reports it as created -- so a walk that starts from the eve spend must seed it here or a
     // chain-rebuilt prover cannot roll the first epoch (an in-process launcher gets the same
     // handle as `LaunchedDistributor::first_distributor_epoch_slot`).
-    let mut slots = DistributorSlots {
-        rewards: vec![launch_reward_slot.info.value],
-        ..DistributorSlots::default()
+    // Seeded with the SLOT the launch itself produced (`SPEC.md` §12.1 clause 1a), never its bare
+    // value: `launch_reward_slot` already carries the eve generation's `LineageProof`, which is
+    // exactly the provenance clause 1c requires and re-deriving it later would lose.
+    let mut spendable = SpendableSlots {
+        rewards: vec![launch_reward_slot],
+        ..SpendableSlots::default()
     };
     let mut last_entry_write_unix: Option<u64> = None;
 
     // `MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS` is a budget for the WHOLE READ, consumed as this walk
     // goes, never a ceiling re-offered to each generation or to each action within one. It is
     // declared HERE, one frame above the loop, because that is the frame that owns the data it
-    // bounds: the reward slots a backfill creates land in `slots.rewards`, which is retained until
+    // bounds: the reward slots a backfill creates land in `spendable.rewards`, which is retained until
     // this function returns and is never pruned -- backfilled slots carry `counter: 0, rewards: 0`
     // and an attacker's own distributor need never spend them. A budget scoped to one generation
     // would therefore bound nothing: N cheaply-mined generations multiply this reader's retained
@@ -1171,13 +1281,45 @@ pub fn read_distributor(
             )
         });
 
-        slots.apply_generation(
+        // `SPEC.md` §12.1 clause 1a: created slots MUST become `Slot`s via
+        // `reconstructed.created_slot_value_to_slot`, computed on `reconstructed` -- the
+        // distributor whose own coin IS the spend just parsed -- and BEFORE the walk advances to
+        // `reconstructed.child(next_state)` below. Doing this after the advance is exactly clause
+        // 1c's phantom: the child's coin never created these slots, but `created_slot_value_to_slot`
+        // would happily derive a well-formed, unspendable proof from it anyway.
+        let created_entry_slots = reconstructed
+            .pending_spend
+            .created_entry_slots
+            .iter()
+            .map(|value| {
+                reconstructed.created_slot_value_to_slot(*value, RewardDistributorSlotNonce::ENTRY)
+            })
+            .collect();
+        let created_commitment_slots = reconstructed
+            .pending_spend
+            .created_commitment_slots
+            .iter()
+            .map(|value| {
+                reconstructed
+                    .created_slot_value_to_slot(*value, RewardDistributorSlotNonce::COMMITMENT)
+            })
+            .collect();
+        let created_reward_slots = reconstructed
+            .pending_spend
+            .created_reward_slots
+            .iter()
+            .map(|value| {
+                reconstructed.created_slot_value_to_slot(*value, RewardDistributorSlotNonce::REWARD)
+            })
+            .collect();
+
+        spendable.apply_generation(
             &reconstructed.pending_spend.spent_entry_slots,
-            &reconstructed.pending_spend.created_entry_slots,
+            created_entry_slots,
             &reconstructed.pending_spend.spent_commitment_slots,
-            &reconstructed.pending_spend.created_commitment_slots,
+            created_commitment_slots,
             &reconstructed.pending_spend.spent_reward_slots,
-            &reconstructed.pending_spend.created_reward_slots,
+            created_reward_slots,
         )?;
 
         let next_state = reconstructed.pending_spend.latest_state.1;
@@ -1244,9 +1386,12 @@ pub fn read_distributor(
         .map_err(chain_unavailable)?
         .ok_or_else(|| malformed("chain source has no timestamp for its own peak"))?;
 
+    let slots = spendable.to_value_view();
+
     Ok(Some(DistributorSnapshot {
         distributor,
         slots,
+        spendable,
         observed: ChainObservation {
             peak_height,
             peak_timestamp,
@@ -1394,15 +1539,101 @@ fn find_eve_reserve_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chia_puzzle_types::LineageProof;
+    use chia_sdk_types::puzzles::SlotInfo;
 
     /// A non-zero identity, so a test asserting `false` is asserting something.
     fn some_identity() -> Bytes32 {
         Bytes32::new([7; 32])
     }
 
+    /// A `Slot` wrapping `value`, for tests that exercise [`SpendableSlots::apply_generation`]
+    /// directly and only care about value-equality bookkeeping -- the `LineageProof` and launcher
+    /// id are arbitrary and carry no meaning here.
+    fn test_reward_slot(
+        value: RewardDistributorRewardSlotValue,
+    ) -> Slot<RewardDistributorRewardSlotValue> {
+        let proof = LineageProof {
+            parent_parent_coin_info: Bytes32::default(),
+            parent_inner_puzzle_hash: Bytes32::default(),
+            parent_amount: 0,
+        };
+        Slot::new(
+            proof,
+            SlotInfo::from_value(
+                some_identity(),
+                RewardDistributorSlotNonce::REWARD.to_u64(),
+                value,
+            ),
+        )
+    }
+
+    /// A `Slot<RewardDistributorEntrySlotValue>` paying `payout_puzzle_hash`, for tests that
+    /// exercise [`entry_slot_for_payout_puzzle_hash`] directly. Every other field is arbitrary.
+    fn test_entry_slot(payout_puzzle_hash: Bytes32) -> Slot<RewardDistributorEntrySlotValue> {
+        let proof = LineageProof {
+            parent_parent_coin_info: Bytes32::default(),
+            parent_inner_puzzle_hash: Bytes32::default(),
+            parent_amount: 0,
+        };
+        let value = RewardDistributorEntrySlotValue {
+            payout_puzzle_hash,
+            initial_cumulative_payout: 0,
+            shares: 1,
+            counter: 0,
+        };
+        Slot::new(
+            proof,
+            SlotInfo::from_value(
+                some_identity(),
+                RewardDistributorSlotNonce::ENTRY.to_u64(),
+                value,
+            ),
+        )
+    }
+
+    /// `SPEC.md` §12.1 clause 1b: two entry slots paying the same puzzle hash is a set this crate
+    /// cannot reconcile -- picking one silently would pay it while stranding the other and
+    /// reporting success, so this MUST be an error rather than a pick.
+    #[test]
+    fn two_entry_slots_paying_the_same_puzzle_hash_is_an_error_not_a_pick() {
+        let payout_puzzle_hash = Bytes32::new([0xAB; 32]);
+        let entries = vec![
+            test_entry_slot(payout_puzzle_hash),
+            test_entry_slot(payout_puzzle_hash),
+        ];
+
+        let result = entry_slot_for_payout_puzzle_hash(&entries, payout_puzzle_hash);
+
+        match result {
+            Err(RewardsError::Malformed(message)) => {
+                assert!(
+                    message.contains("more than one entry slot"),
+                    "wrong reason: {message}"
+                );
+            }
+            other => panic!("an ambiguous entry set must be an error, got {other:?}"),
+        }
+    }
+
+    /// The ordinary case: exactly one entry slot for a puzzle hash is returned, not an error.
+    #[test]
+    fn one_entry_slot_for_a_puzzle_hash_is_returned() {
+        let payout_puzzle_hash = Bytes32::new([0xCD; 32]);
+        let entries = vec![test_entry_slot(payout_puzzle_hash)];
+
+        let result = entry_slot_for_payout_puzzle_hash(&entries, payout_puzzle_hash)
+            .expect("exactly one match is never an error");
+
+        assert_eq!(
+            result.map(|slot| slot.info.value.payout_puzzle_hash),
+            Some(payout_puzzle_hash)
+        );
+    }
+
     #[test]
     fn a_slot_spent_without_a_matching_creation_is_a_diverged_read() {
-        let mut slots = DistributorSlots::default();
+        let mut slots = SpendableSlots::default();
         let never_created = RewardDistributorRewardSlotValue {
             counter: 0,
             epoch_start: 1_234,
@@ -1410,7 +1641,7 @@ mod tests {
             rewards: 5,
         };
 
-        let result = slots.apply_generation(&[], &[], &[], &[], &[never_created], &[]);
+        let result = slots.apply_generation(&[], vec![], &[], vec![], &[never_created], vec![]);
 
         match result {
             Err(RewardsError::Malformed(message)) => assert!(
@@ -1429,17 +1660,24 @@ mod tests {
             next_epoch_initialized: false,
             rewards: 5,
         };
-        let mut slots = DistributorSlots::default();
+        let mut slots = SpendableSlots::default();
 
         slots
-            .apply_generation(&[], &[], &[], &[], &[], &[value, value])
+            .apply_generation(
+                &[],
+                vec![],
+                &[],
+                vec![],
+                &[],
+                vec![test_reward_slot(value), test_reward_slot(value)],
+            )
             .expect("creations alone never diverge");
         slots
-            .apply_generation(&[], &[], &[], &[], &[value], &[])
+            .apply_generation(&[], vec![], &[], vec![], &[value], vec![])
             .expect("one of the two outstanding copies is spent");
 
         assert_eq!(
-            slots.rewards,
+            slots.to_value_view().rewards,
             vec![value],
             "two outstanding slots can be equal by value; spending one must not remove both"
         );
