@@ -2507,8 +2507,9 @@ module's own doc (`src/state.rs`, "A failed read is never an empty answer") alre
 requirement on its parent-spend lookup until this fix. Each of the four closes a gap between what
 this specification (or this module's own doc) already required and what the code checked.
 
-**As of v0.8.0 (DIG-Network/dig_ecosystem#3356), two clause groups are _specified, not yet
-implemented_.** §12.1 clauses 1a-1d (slot bookkeeping over `Slot<V>`, the `DistributorSnapshot` slot
+**As of v0.8.0 (DIG-Network/dig_ecosystem#3356), both clause groups are implemented**, bound by
+`tests/simulator.rs`'s `a_claim_built_entirely_from_a_chain_read_is_accepted` and
+`a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected`. §12.1 clauses 1a-1d (slot bookkeeping over `Slot<V>`, the `DistributorSnapshot` slot
 accessors, the phantom-slot prohibition, the freeze list) and §12.5 clauses 3a-3c
 (`ChainEntrySlotSource`, `accrued_base_units`, the two conformance tests) describe code that does not
 exist at the tip this revision was written against (`dig-rewards-coin` v0.7.0, 626707c): there the

@@ -135,6 +135,13 @@ pub fn payout_threshold_base_units(distributor: &RewardDistributor) -> u64 {
 /// `InitiatePayout` succeeds, not what it would pay if it did, and conflating the two would make a
 /// caller under the threshold see `0` rather than "not yet, but accruing".
 ///
+/// Upstream `InitiatePayout` first reconciles the slot through
+/// `RewardDistributor::actual_entry_slot_value` (chia-sdk-driver 0.36.0, `initiate_payout.rs:125`)
+/// before this arithmetic; this function takes the RAW slot value, which coincides with the
+/// reconciled one for a distributor whose pending spend has not yet touched that slot (every
+/// chain-read distributor), but a caller composing several actions in one spend MUST read the
+/// figure from [`PayoutOutcome::Paid`]'s `amount_base_units` field instead.
+///
 /// # `None`
 ///
 /// Returned rather than a saturated or wrapped value on:
