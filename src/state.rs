@@ -317,14 +317,12 @@ impl DistributorSnapshot {
 
     /// The spendable commitment slots, each with the `LineageProof` of the generation that
     /// actually created it (`SPEC.md` §12.1 clause 1b).
-    #[must_use]
     pub fn commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>] {
         &self.spendable.commitments
     }
 
     /// The spendable reward slots, each with the `LineageProof` of the generation that actually
     /// created it (`SPEC.md` §12.1 clause 1b).
-    #[must_use]
     pub fn reward_slots(&self) -> &[Slot<RewardDistributorRewardSlotValue>] {
         &self.spendable.rewards
     }
