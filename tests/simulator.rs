@@ -14,6 +14,7 @@
 //! literal for the $DIG asset id appears anywhere here.
 
 use chia_protocol::{Bytes32, Coin, SpendBundle};
+use chia_puzzle_types::cat::CatArgs;
 use chia_puzzle_types::singleton::{SingletonArgs, SingletonSolution};
 use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzle_types::{EveProof, LineageProof, Proof};
@@ -1963,6 +1964,43 @@ fn a_claim_built_entirely_from_a_chain_read_is_accepted() -> anyhow::Result<()> 
         chain_distributor.info.state.total_reserves,
         reserve_before_claim - amount_base_units,
         "the claim actually moved money out of the reserve, on-chain"
+    );
+
+    // H9: a reserve decrease proves money LEFT, never that the PEER received it -- prove receipt
+    // directly, on chain, at the puzzle hash the slot actually recorded.
+    let reserve_asset_id = chain_distributor.info.constants.reserve_asset_id;
+    let payout_puzzle_hash =
+        CatArgs::curry_tree_hash(reserve_asset_id, harness.entry.puzzle_hash.into()).into();
+    let children = harness.sim.children(reserve_tip_id);
+
+    let payee_coins: Vec<_> = children
+        .iter()
+        .filter(|state| state.coin.puzzle_hash == payout_puzzle_hash)
+        .collect();
+    assert_eq!(
+        payee_coins.len(),
+        1,
+        "exactly one payee CAT coin must exist on chain at the slot's payout puzzle hash"
+    );
+    assert_eq!(
+        payee_coins[0].coin.amount, amount_base_units,
+        "the payee's CAT coin exists on chain at the slot's payout puzzle hash with the \
+         puzzle's own figure"
+    );
+
+    let new_reserve_coins: Vec<_> = children
+        .iter()
+        .filter(|state| state.coin.puzzle_hash != payout_puzzle_hash)
+        .collect();
+    assert_eq!(
+        new_reserve_coins.len(),
+        1,
+        "exactly one new reserve coin must exist on chain, distinct from the payee's puzzle hash"
+    );
+    assert_eq!(
+        new_reserve_coins[0].coin.amount,
+        reserve_before_claim - amount_base_units,
+        "the new reserve coin on chain holds what was left behind"
     );
 
     Ok(())
