@@ -80,7 +80,7 @@ pub enum RewardsError {
     /// coin was never spent — and it MUST NOT be degraded into "this peer holds no entry slot",
     /// which is a different fact with a different remedy (clause 1's "keep observing, spend
     /// nothing" is correct only for a real distributor a peer has not yet been admitted to).
-    /// [`crate::payout::ChainEntrySlotSource::read_entry_slot`] surfaces this as an error rather
+    /// [`crate::payout::ChainEntrySlotSource`]'s `read_entry_slot` surfaces this as an error rather
     /// than `Ok(None)` for exactly that reason: reported as an absence, a mistyped or
     /// non-existent launcher id would be indistinguishable from a peer patiently waiting to be
     /// admitted, forever.

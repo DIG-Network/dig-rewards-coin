@@ -88,7 +88,7 @@ fn malformed(reason: impl Into<String>) -> RewardsError {
 /// [`Slot<V>`](chia_sdk_driver::Slot), never over these bare values, and this struct is built
 /// exactly once — from that spendable `Slot` set, at the end of the walk. Two parallel
 /// accumulators (one of values, one of `Slot`s) would be two models of one fact that can drift
-/// silently; there is exactly one bookkeeping path, and it lives in [`SpendableSlots`].
+/// silently; there is exactly one bookkeeping path, and it lives in `SpendableSlots`.
 #[derive(Debug, Clone, Default)]
 pub struct DistributorSlots {
     /// One per entry in the entry set: who gets paid, and the replay guard.
