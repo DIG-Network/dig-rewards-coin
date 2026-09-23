@@ -647,6 +647,8 @@ sets, and MUST NOT be done as a convenience. `dig.listRewardDistributorCommitmen
 promoted with it: a commitment schedule is a forward statement about the funder's money and it has
 no peer-facing use.
 
+**Two axes, stated explicitly (dig_ecosystem#3354).** `Tier::Control` governs TRANSPORT only—where the method is served, never whether it requires a token. `Tier::Control` means loopback / in-process only, served by dig-node's local dispatch and unreachable over mTLS peer surface. Whether a call needs a control token is decided per method and recorded in dig-node's `SPEC.md` §5.5 in the `meta::methods()` catalogue, not here: five methods are listed below, four shipped in v0.11.0 and `dig.getPayeeRewardClaimStatus` added in v0.12.0. Two are OPEN (no token, rate-bounded per source); three are token-gated. Tier prevents the peer surface from learning the operator's distributor set; the token tier enforces confidentiality for volunteer-sensitive reads.
+
 **Control is the correct default because the two directions are not symmetric.** Promoting a method
 later is **additive** — no existing caller breaks. Demoting one is **breaking**, and it breaks exactly
 the anonymous callers nobody can enumerate or notify. So an entry set and a payout history stay
@@ -2509,7 +2511,7 @@ this specification (or this module's own doc) already required and what the code
 
 **As of v0.8.0 (DIG-Network/dig_ecosystem#3356), both clause groups are implemented**, bound by
 `tests/simulator.rs`'s `a_claim_built_entirely_from_a_chain_read_is_accepted` and
-`a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected`. §12.1 clauses 1a-1d (slot bookkeeping over `Slot<V>`, the `DistributorSnapshot` slot
+`a_phantom_slot_derived_from_the_tip_for_an_earlier_generations_entry_is_rejected`. §2.6's tier axes (transport vs token) are documented in dig-node's `SPEC.md` §5.5 and §2.6 (DIG-Network/dig-node#619, dig_ecosystem#3354). §12.1 clauses 1a-1d (slot bookkeeping over `Slot<V>`, the `DistributorSnapshot` slot
 accessors, the phantom-slot prohibition, the freeze list) and §12.5 clauses 3a-3c
 (`ChainEntrySlotSource`, `accrued_base_units`, the two conformance tests) describe code that does not
 exist at the tip this revision was written against (`dig-rewards-coin` v0.7.0, 626707c): there the
