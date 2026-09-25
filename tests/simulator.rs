@@ -4144,7 +4144,7 @@ fn the_real_launch_spends_condition_count_is_a_measured_literal() -> anyhow::Res
 
     assert_eq!(
         conditions.len(),
-        3,
+        5,
         "the real launch spend's condition count moved -- re-measure and update this literal \
          deliberately rather than loosen it to a tolerance band"
     );
