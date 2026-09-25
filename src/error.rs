@@ -292,6 +292,32 @@ pub enum RewardsError {
         limit_bytes: usize,
     },
 
+    /// The condition list `run_puzzle_with_cost` produced from an observed spend exceeds
+    /// [`crate::discovery::DECODE_MAX_CONDITIONS`], refused before the per-condition
+    /// `CREATE_COIN`/memo extraction loop runs at all (DIG-Network/dig_ecosystem#3349).
+    ///
+    /// Deliberately its own variant rather than [`RewardsError::ObservedSpendFieldTooLarge`]: a
+    /// condition count is not a serialized field length -- [`DECODE_MAX_SERIALIZED_BYTES`] bounds
+    /// bytes the decode *received*, while this bounds a count the run *produced*, and
+    /// `DECODE_MAX_SERIALIZED_BYTES`'s own doc names exactly this gap ("everything the run
+    /// produces is unbounded by this check"). A caller scanning the chain has the same legitimate
+    /// reason to distinguish this refusal from either sibling: "this spend's output is too large
+    /// to be worth walking", not "this spend is junk" or "too big to be worth decoding". A
+    /// `#[non_exhaustive]` enum can carry the new arm without breaking any caller that already
+    /// matches on an else/wildcard arm.
+    ///
+    /// [`DECODE_MAX_SERIALIZED_BYTES`]: crate::discovery::DECODE_MAX_SERIALIZED_BYTES
+    #[error(
+        "observed spend's output decoded to {actual_count} conditions, exceeding the \
+         {limit}-condition decode limit -- refusing before the per-condition extraction loop runs"
+    )]
+    ObservedSpendConditionsTooMany {
+        /// The number of conditions the run actually produced.
+        actual_count: usize,
+        /// The limit that was exceeded: [`crate::discovery::DECODE_MAX_CONDITIONS`].
+        limit: usize,
+    },
+
     /// `commit_incentives`'s non-adjacent-epoch backfill loop (see
     /// [`RewardsError::UnreadableEpochSeconds`]) pushes one reward slot per iteration of
     /// `(epoch_start - slot_epoch_time) / epoch_seconds`, both `epoch_start` and `slot_epoch_time`

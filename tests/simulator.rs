@@ -4103,6 +4103,55 @@ fn the_real_launch_spends_observed_sizes_are_measured_literals() -> anyhow::Resu
     Ok(())
 }
 
+/// Pins `DECODE_MAX_CONDITIONS`'s own doc-comment derivation: the number of conditions
+/// `run_puzzle_with_cost` produces when the real security-coin spend that creates the
+/// distributor's launcher is run -- the same measurement discipline
+/// `the_real_launch_spends_decode_cost_is_a_measured_literal` applies to the cost literal, so a
+/// change to the real launch puzzle that quietly moves this count is visible here.
+#[test]
+fn the_real_launch_spends_condition_count_is_a_measured_literal() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let (_sim, _manager_launcher_id, distributor_launcher_id, _generation, all_spends) =
+        launch_manager_and_distributor_in_one_bundle(ctx)?;
+
+    let security_coin_spend = all_spends
+        .iter()
+        .find(|spend| {
+            discovered_distributors_in_spend(spend)
+                .map(|discovered| {
+                    discovered
+                        .iter()
+                        .any(|d| d.launcher_id() == distributor_launcher_id)
+                })
+                .unwrap_or(false)
+        })
+        .expect("exactly one spend in the bundle decodes the distributor's launch");
+
+    let mut measuring_ctx = SpendContext::new();
+    let puzzle_ptr = measuring_ctx.alloc(&security_coin_spend.puzzle_reveal)?;
+    let solution_ptr = measuring_ctx.alloc(&security_coin_spend.solution)?;
+    let clvmr::reduction::Reduction(_cost, output_ptr) = chia_sdk_types::run_puzzle_with_cost(
+        &mut measuring_ctx,
+        puzzle_ptr,
+        solution_ptr,
+        u64::MAX,
+        false,
+    )
+    .expect("the same puzzle discovery decoded without error must run without error here too");
+    let conditions = measuring_ctx
+        .extract::<Conditions<NodePtr>>(output_ptr)
+        .expect("the same output discovery decoded as a condition list must extract here too");
+
+    assert_eq!(
+        conditions.len(),
+        5,
+        "the real launch spend's condition count moved -- re-measure and update this literal \
+         deliberately rather than loosen it to a tolerance band"
+    );
+
+    Ok(())
+}
+
 /// §13.1 clause 6: a `CREATE_COIN` to some OTHER puzzle hash, even carrying memos shaped exactly
 /// like a real DIG rewards comment, must not be mistaken for a launcher creation.
 #[test]
