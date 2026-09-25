@@ -100,11 +100,13 @@ const DECODE_MAX_COST: u64 = 10_000_000;
 ///    *evaluation cost* of a spend under 64 KiB is bounded only by `DECODE_MAX_COST`, which is
 ///    itself charged post-hoc (see that constant's own doc) -- a small puzzle can still be a slow
 ///    one to run.
-/// 2. **Everything the run produces is unbounded by this check.** `ctx.extract::<Conditions<..>>`
-///    and the per-`CREATE_COIN` memo extraction execute *after* this gate and are bounded only by
-///    however many conditions the run produced -- a small serialized input can still unpack into a
-///    large condition list. (The hint `tree_hash` is computed once, over the fixed literal
-///    `"Reward Distributor v1"`, and does not scale with the run's output at all.)
+/// 2. **The run's output is bounded by a separate check, not this one.** `ctx.extract::<Conditions<..>>`
+///    executes *after* this gate and is bounded only by `DECODE_MAX_COST`'s charged cost -- a
+///    small serialized input can still unpack into a large condition list -- but that list is
+///    itself capped by [`DECODE_MAX_CONDITIONS`], checked immediately after the extraction and
+///    before the per-`CREATE_COIN`/memo loop that walks it. (The hint `tree_hash` is computed
+///    once, over the fixed literal `"Reward Distributor v1"`, and does not scale with the run's
+///    output at all.)
 /// 3. **In-memory amplification is untouched.** This bounds bytes *received*, not bytes *held*: a
 ///    small serialized atom can still expand into a far larger `NodePtr` tree once allocated.
 /// 4. **This is a per-spend bound, not a per-scan one.** N spends each one byte under the limit
@@ -115,6 +117,41 @@ const DECODE_MAX_COST: u64 = 10_000_000;
 ///    is this reader's own, still exists, or is funded. §9.3 is still required before a caller
 ///    treats a discovered distributor as its own.
 pub const DECODE_MAX_SERIALIZED_BYTES: usize = 65_536;
+
+/// The largest number of conditions this decode will walk in the per-`CREATE_COIN`/memo
+/// extraction loop below -- checked immediately after `ctx.extract::<Conditions<..>>`, before
+/// that loop runs at all.
+///
+/// `DECODE_MAX_SERIALIZED_BYTES`'s own doc names the gap this constant closes (its item 2): a
+/// small serialized `puzzle_reveal` can still unpack, via `ctx.extract::<Conditions<..>>`, into an
+/// arbitrarily large condition list, and `DECODE_MAX_COST` bounds only the *charged* CLVM cost of
+/// producing that list, not its length -- a puzzle that is cheap by `clvmr`'s cost model (for
+/// example a bare `(q . conditions)` quote, the same shape this module's own
+/// `quoted_puzzle_spend` test helper builds) can decode to a condition list with an implicit ceiling in
+/// the tens of thousands before `DECODE_MAX_COST` itself would refuse it, since quoting charges
+/// almost nothing regardless of the quoted list's length.
+///
+/// **The literal, derived from a real measurement, not picked round.** `tests/simulator.rs`'s
+/// `the_real_launch_spends_condition_count_is_a_measured_literal` -- the same measurement
+/// discipline `DECODE_MAX_COST`'s own pin applies -- decodes the real security-coin spend that
+/// creates a DIG distributor's launcher and finds **5** conditions. `1_024` is comfortably more
+/// than 200 times that (204x), room for every real spend this crate needs to decode while still
+/// refusing a run shaped to make the extraction loop below walk an unbounded list.
+///
+/// # What this bound does NOT cover
+///
+/// 1. **The extraction that produced this count already ran.** `ctx.extract::<Conditions<..>>`
+///    itself walks the full output before this check ever sees a length -- this bound stops the
+///    *per-condition* `CREATE_COIN`/memo work below it, not the single extract call above it,
+///    which is bounded only by `DECODE_MAX_COST`.
+/// 2. **This is a per-spend bound, not a per-scan one.** N spends each one condition under the
+///    limit cost N times the work; nothing here rate-limits how many spends a caller decodes.
+/// 3. **It authenticates nothing.** A well-formed, under-bound, cheap spend from an attacker
+///    decodes in full, and the resulting [`DiscoveredDistributor`] proves only that *some* spend
+///    advertised `storeId:root` -- never that the distributor is this reader's own, still exists,
+///    or is funded. §9.3 is still required before a caller treats a discovered distributor as its
+///    own.
+pub const DECODE_MAX_CONDITIONS: usize = 1_024;
 
 /// A distributor discovered from an observed spend -- private fields, no public constructor.
 ///
@@ -208,6 +245,16 @@ pub fn discovered_distributors_in_spend(
                 "observed spend's output is not a condition list: {error}"
             ))
         })?;
+
+    // Bounded before the extraction loop (#3349, § `DECODE_MAX_CONDITIONS`'s doc): the run's
+    // output can quote far more conditions than any real spend crate this repo drives produces,
+    // so this caps the loop below, independently of `DECODE_MAX_COST`'s charge-based bound.
+    if conditions.len() > DECODE_MAX_CONDITIONS {
+        return Err(RewardsError::ObservedSpendConditionsTooMany {
+            actual_count: conditions.len(),
+            limit: DECODE_MAX_CONDITIONS,
+        });
+    }
 
     // The hint atom, recomputed rather than written as a hash literal (§13.1 clause 5).
     let hint_ptr = ctx
@@ -592,5 +639,66 @@ mod tests {
         {
             panic!("a solution of exactly the bound must pass the size gate");
         }
+    }
+
+    /// A puzzle that quotes `DECODE_MAX_CONDITIONS + 1` `CREATE_COIN` conditions to an ordinary
+    /// puzzle hash: cheap to run (a bare quote) and small to serialize (well under
+    /// `DECODE_MAX_SERIALIZED_BYTES`), so it exercises the condition-count gate in isolation from
+    /// its size and cost siblings, the same way `a_puzzle_over_the_decode_cost_bound_is_refused`
+    /// isolates the cost gate from the size gate above it.
+    #[test]
+    fn a_condition_list_over_decode_max_conditions_is_refused_before_the_extraction_loop() {
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::<NodePtr>::new();
+        for _ in 0..(DECODE_MAX_CONDITIONS + 1) {
+            conditions = conditions.create_coin(Bytes32::new([9; 32]), 0, Memos::None);
+        }
+        let observed = quoted_puzzle_spend(&mut ctx, conditions);
+
+        assert!(
+            observed.puzzle_reveal.len() < DECODE_MAX_SERIALIZED_BYTES,
+            "this fixture must stay under the size gate to test the condition-count gate in \
+             isolation, got {} bytes",
+            observed.puzzle_reveal.len()
+        );
+        let mut cost_ctx = SpendContext::new();
+        let puzzle_ptr = cost_ctx.alloc(&observed.puzzle_reveal).unwrap();
+        let solution_ptr = cost_ctx.alloc(&observed.solution).unwrap();
+        let clvmr::reduction::Reduction(measured_cost, _) =
+            run_puzzle_with_cost(&mut cost_ctx, puzzle_ptr, solution_ptr, u64::MAX, false).unwrap();
+        assert!(
+            measured_cost < DECODE_MAX_COST,
+            "this fixture must stay under the cost gate to test the condition-count gate in \
+             isolation, got {measured_cost}"
+        );
+
+        match discovered_distributors_in_spend(&observed) {
+            Err(RewardsError::ObservedSpendConditionsTooMany {
+                actual_count,
+                limit,
+            }) => {
+                assert_eq!(actual_count, DECODE_MAX_CONDITIONS + 1);
+                assert_eq!(limit, DECODE_MAX_CONDITIONS);
+            }
+            other => panic!(
+                "expected ObservedSpendConditionsTooMany naming the count and limit, got: {other:?}"
+            ),
+        }
+    }
+
+    /// The condition-count gate is `>`, not `>=`: exactly `DECODE_MAX_CONDITIONS` conditions must
+    /// decode, not refuse -- none of them carry the launcher's own puzzle hash, so the result is
+    /// `Ok` with no discoveries.
+    #[test]
+    fn a_condition_list_exactly_at_decode_max_conditions_decodes() {
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::<NodePtr>::new();
+        for _ in 0..DECODE_MAX_CONDITIONS {
+            conditions = conditions.create_coin(Bytes32::new([9; 32]), 0, Memos::None);
+        }
+        let observed = quoted_puzzle_spend(&mut ctx, conditions);
+
+        let discoveries = discovered_distributors_in_spend(&observed).unwrap();
+        assert!(discoveries.is_empty());
     }
 }
