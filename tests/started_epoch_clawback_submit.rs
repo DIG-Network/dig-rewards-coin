@@ -26,21 +26,68 @@
 //! (`validate_conditions` / `validate_relative_conditions`) and only returns `Ok` after calling
 //! `create_block` -- CONFIRMED AT DEPTH, never a lower rung reported as this one.
 //!
-//! ## Two tests, one the other's control
+//! ## Verdict: REFUSED, on chain, by design -- not a fixture artifact
+//!
+//! A started-epoch commitment's withdraw builds and signs cleanly and is then refused at
+//! `chia_sdk_test::Simulator::spend_coins` (the real `chia_consensus` validator) with
+//! `Validation error: AssertBeforeSecondsAbsoluteFailed`. Four tests below triangulate this to a
+//! single mechanism and rule out every confound this epic has previously been burned by:
+//!
+//! - The bound is **wall-clock time versus the commitment's own `epoch_start`**, strict-before --
+//!   not `last_update`, not `MAX_SECONDS_OFFSET`, and not whether the distributor's own on-chain
+//!   generation has actually rolled into that epoch (`NewEpoch`) yet.
+//! - [`a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_roll`] jumps
+//!   the simulator's clock to exactly `FIRST_EPOCH_START` **without** ever calling
+//!   `start_next_distributor_epoch`, and still gets refused with the identical error. This rules
+//!   out epoch-roll state entirely: the distributor's own `round_time_info.epoch_end` never moves
+//!   in this test, so whatever is asserting cannot be reading it.
+//! - [`a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_boundary`] jumps
+//!   the clock to `FIRST_EPOCH_START - 1` and gets `Ok(900_000)` -- one second earlier, same
+//!   commitment, same fixture. This pins the boundary to `epoch_start` exactly (not
+//!   `epoch_start - MAX_SECONDS_OFFSET`, which sits 300 seconds further back and would still have
+//!   refused a jump to `epoch_start - 1`).
+//!
+//! Rust-visible provenance for the bound: `withdraw_committed_incentives`'s solution carries
+//! `reward_slot_epoch_time: reward_slot.info.value.epoch_start`
+//! (`chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs:125`,
+//! matching solution field at
+//! `chia-sdk-types-0.36.0/src/puzzles/action_layer/actions/reward_distributor/withdraw_incentives.rs:60`).
+//! No Rust-level `.assert_before_seconds_absolute()` call exists anywhere in this crate's
+//! `clawback.rs`, `commit.rs`, `epoch.rs`, or in `chia-sdk-driver`'s `Slot::spend` /
+//! `RewardDistributor::finish_spend` / `insert_action_spend` -- the assertion is compiled into the
+//! withdraw-incentives puzzle itself, downstream of that curried value, and only observable by
+//! running the chain's own validator against it, which is what the two isolation tests do.
+//!
+//! **This is legitimate design, not a bug in the reward distributor's own logic.** Once an epoch's
+//! wall-clock time arrives, that epoch's committed incentives are what fund its payouts to
+//! entries; a funder cannot unilaterally claw a commitment back out from under payouts that are
+//! about to be computed against it. The separate, real gap this ticket's body raised --
+//! `commitment_slots()` and `recoverable_base_units` do not know this and keep reporting a
+//! nonzero recoverable figure for a commitment the chain will now refuse to pay back on withdraw
+//! -- is confirmed a genuine money-honesty defect by this measurement, but changing that read path
+//! is out of this ticket's scope (the acceptance bar was the measuring test); see the ticket for
+//! that follow-up.
+//!
+//! ## Four tests, each isolating one variable
 //!
 //! - [`a_not_yet_started_commitment_is_clawed_back_on_chain`]: commits to the first distributor
 //!   epoch and claws it back immediately -- no `Sync`, no `NewEpoch` -- so the epoch is provably
 //!   NOT started (`round_time_info.epoch_end` is still `FIRST_EPOCH_START` throughout). This is
 //!   the harness proving it CAN submit a real withdraw at all: without it, a failure in the other
-//!   test would be measuring this harness, not the chain.
+//!   tests would be measuring this harness, not the chain.
 //! - [`a_started_epoch_commitment_is_clawed_back_on_chain`]: commits to the same epoch, then rolls
 //!   the distributor into it -- `sim.set_next_timestamp` + `start_next_distributor_epoch`, the
 //!   same sequence `tests/simulator.rs::managed_dig_distributor_end_to_end` uses to make an epoch
-//!   "current" -- and only THEN attempts the SAME commitment's withdraw.
+//!   "current" -- and only THEN attempts the SAME commitment's withdraw. This is the ticket's own
+//!   question, and it measures REFUSED.
+//! - [`a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_roll`] and
+//!   [`a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_boundary`]: the
+//!   isolation pair described above.
 //!
-//! Both use the identical fixture shape (same launch, same commitment amount, same withdraw
-//! wiring), differing only in whether `start_next_distributor_epoch` runs first, so the epoch
-//! question is the only variable between them.
+//! All four use the identical fixture shape (same launch, same commitment amount, same withdraw
+//! wiring) via the shared [`commit_to_first_epoch`] / [`submit_withdraw`] helpers, differing only
+//! in the simulator clock and whether `start_next_distributor_epoch` runs, so the epoch/clock
+//! state is the only variable under test in each.
 //!
 //! This is a new file rather than an addition to `tests/simulator.rs` or
 //! `tests/recoverable_share.rs` -- both carry live work elsewhere in this epic -- per
@@ -56,7 +103,8 @@ use chia_sdk_driver::{
     RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
     SpendWithConditions, StandardLayer,
 };
-use chia_sdk_test::Simulator;
+use chia_consensus::validation_error::ErrorCode;
+use chia_sdk_test::{Simulator, SimulatorError};
 use chia_sdk_types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
     RewardDistributorSlotNonce,
@@ -527,7 +575,22 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// #3425 -- the question itself.
+/// Extract the `chia_consensus` validator's [`ErrorCode`] out of a [`submit_withdraw`] refusal, so
+/// each assertion below names the exact refusal rather than accepting any error as confirmation --
+/// matching `tests/simulator.rs::the_entry_set_write_window_closes_at_the_end_of_an_epoch`'s own
+/// convention of matching a precise error shape instead of a loose string check.
+fn validation_error_code(error: &anyhow::Error) -> ErrorCode {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SimulatorError>())
+        .and_then(|sim_error| match sim_error {
+            SimulatorError::Validation(code) => Some(*code),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a SimulatorError::Validation refusal, got: {error:#}"))
+}
+
+/// #3425 -- the question itself. **Measures REFUSED.**
 ///
 /// Commits to [`FIRST_EPOCH_START`], rolls the distributor into that epoch (`NewEpoch`), and only
 /// THEN attempts the SAME commitment's withdraw -- the started-epoch case this ticket asks about.
@@ -536,21 +599,16 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
 /// [`roll_into_first_epoch`] call before the withdraw -- the epoch state is the single variable
 /// under test.
 ///
-/// This comment asserts no result. Whether the simulator's real consensus validator accepts or
-/// refuses a started-epoch withdraw is exactly what running this test measures, not something to
-/// claim in advance of running it -- BUILT and SIGNED prove nothing about admission either way;
-/// this epic already paid for that lesson once, where a slot derived from a distributor rebuilt at
-/// an earlier generation curried cleanly and signed cleanly, and the network refused it as
-/// `UnknownUnspent` at push time, after a user had watched a ceremony succeed. Only this test's own
-/// `spend_coins` call -- ADMITTED or CONFIRMED, never a lower rung dressed up as this one -- answers
-/// the question; see the ticket (#3425) for the rung actually reached and the chain's actual
-/// response.
+/// The withdraw builds and signs cleanly and is refused at `Simulator::spend_coins` -- the real
+/// `chia_consensus` validator -- with `Validation error: AssertBeforeSecondsAbsoluteFailed`. This
+/// is CONFIRMED AT DEPTH, the top rung of the evidence ladder this file's module doc describes,
+/// and the two isolation tests below pin the exact mechanism: a wall-clock bound against the
+/// commitment's own `epoch_start`, not an epoch-roll state check. See the module doc for the
+/// money-honesty consequence for `commitment_slots()` / `recoverable_base_units`.
 #[test]
 fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
     let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
-    let funder_puzzle_hash = committed.funder.puzzle_hash;
-    let asset_id = committed.asset_id;
 
     let rolled_reward_slot = roll_into_first_epoch(ctx, &mut committed)?;
     assert!(
@@ -558,17 +616,89 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
         "the epoch must actually have rolled forward before the withdraw is attempted"
     );
 
+    let refusal = match submit_withdraw(ctx, &mut committed, rolled_reward_slot) {
+        Ok(amount) => panic!(
+            "a started-epoch commitment's withdraw was accepted on chain and paid {amount} base \
+             units -- this ticket's premise (that this might be refused) no longer holds; update \
+             this test's expectation and the module doc together"
+        ),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        validation_error_code(&refusal),
+        ErrorCode::AssertBeforeSecondsAbsoluteFailed,
+        "expected the puzzle's own epoch_start bound to refuse this, got: {refusal:#}"
+    );
+
+    Ok(())
+}
+
+/// Isolates whether the started-epoch refusal above is caused by the epoch actually having rolled
+/// (`NewEpoch`), or merely by the simulator's clock having reached `epoch_start` --
+/// `roll_into_first_epoch` necessarily does both in one step, so without this test the two are
+/// confounded. Commits, then jumps the clock to exactly [`FIRST_EPOCH_START`] WITHOUT ever calling
+/// `start_next_distributor_epoch`, and attempts the withdraw against the still-not-rolled
+/// commitment and reward slot (`round_time_info.epoch_end` never moves in this test).
+///
+/// Measures the identical refusal as the started-epoch test, with zero `NewEpoch` involvement --
+/// ruling out epoch-roll state as the mechanism. The bound is wall-clock time against the
+/// commitment's own `epoch_start`, independent of whether the distributor's own on-chain
+/// generation has been rolled into that epoch yet.
+#[test]
+fn a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_roll(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let reward_slot = committed.reward_slot.clone();
+
+    committed.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    assert_eq!(
+        current_distributor_epoch_end(&committed.distributor),
+        FIRST_EPOCH_START,
+        "precondition: no NewEpoch has run, so the distributor's own state must not have rolled"
+    );
+
+    let refusal = match submit_withdraw(ctx, &mut committed, reward_slot) {
+        Ok(amount) => panic!(
+            "a withdraw at the exact epoch_start instant was accepted and paid {amount} base \
+             units with no epoch roll involved -- the wall-clock-bound hypothesis is wrong; \
+             update this test and the module doc together"
+        ),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        validation_error_code(&refusal),
+        ErrorCode::AssertBeforeSecondsAbsoluteFailed,
+        "expected the identical refusal as the rolled-epoch case, got: {refusal:#}"
+    );
+
+    Ok(())
+}
+
+/// Pins the exact boundary. Same fixture as
+/// [`a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_roll`], but jumps
+/// to `FIRST_EPOCH_START - 1` instead of `FIRST_EPOCH_START` exactly, to tell
+/// `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` (succeeds here) apart from a bound anchored
+/// `MAX_SECONDS_OFFSET` seconds earlier, e.g. `epoch_start - 300` (would still refuse here, since
+/// `933 < 1233`). Succeeding one second before the failing test above's identical instant proves
+/// the bound is `epoch_start` itself, strict-before, at one-second granularity.
+#[test]
+fn a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_boundary(
+) -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let funder_puzzle_hash = committed.funder.puzzle_hash;
+    let asset_id = committed.asset_id;
+    let reward_slot = committed.reward_slot.clone();
+
+    committed.sim.set_next_timestamp(FIRST_EPOCH_START - 1)?;
+
     let hinted_before = committed.sim.hinted_coins(funder_puzzle_hash);
 
-    let driver_reported = submit_withdraw(ctx, &mut committed, rolled_reward_slot)
-        .expect("CONFIRMED: a started-epoch commitment's withdraw was accepted on chain");
-
-    let paid = paid_on_chain(&committed.sim, asset_id, funder_puzzle_hash, &hinted_before);
-    assert_eq!(
-        paid.len(),
-        1,
-        "the withdraw must create exactly one reward-CAT coin hinted to the funder; found {}: {paid:?}",
-        paid.len()
+    let driver_reported = submit_withdraw(ctx, &mut committed, reward_slot).expect(
+        "one second before epoch_start must still succeed -- if this fails, the boundary moved",
     );
 
     let expected = recoverable_base_units(
@@ -580,17 +710,22 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
         expected, 900_000,
         "pinned to the same figure a prior lane's BUILD-only measurement reported"
     );
+    assert_eq!(
+        driver_reported, expected,
+        "Clawback::recovered_base_units() reported {driver_reported}, expected {expected}"
+    );
 
+    let paid = paid_on_chain(&committed.sim, asset_id, funder_puzzle_hash, &hinted_before);
+    assert_eq!(
+        paid.len(),
+        1,
+        "the withdraw must create exactly one reward-CAT coin hinted to the funder; found {}: {paid:?}",
+        paid.len()
+    );
     assert_eq!(
         paid[0].coin.amount, expected,
         "the simulator's own coin record at the funder's puzzle hash paid {} base units, but the \
          expectation was {expected}",
-        paid[0].coin.amount
-    );
-    assert_eq!(
-        paid[0].coin.amount, driver_reported,
-        "the on-chain payout ({}) must agree with what Clawback::recovered_base_units() reported \
-         ({driver_reported})",
         paid[0].coin.amount
     );
 
