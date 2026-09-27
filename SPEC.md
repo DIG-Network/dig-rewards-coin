@@ -1540,7 +1540,7 @@ Therefore:
    nobody else. That is the proof — a recorded puzzle hash from the commit spend, not an operator
    role, not the manager singleton, and not the launcher.
 4. Clawback returns `withdrawal_share_bps / 10000` of the committed value
-   (`withdraw_incentives.rs:71`); the remainder stays in the reserve for the mirrors.
+   (`withdraw_incentives.rs:105-107`); the remainder stays in the reserve for the mirrors.
 5. A clawback is per commitment slot, so the UI MUST present the funder's commitments **per epoch**
    with the recoverable amount computed per slot. A single "balance" figure cannot express which part
    is recoverable, and presenting one is the money-honesty failure of this section.
