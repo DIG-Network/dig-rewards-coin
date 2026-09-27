@@ -120,7 +120,7 @@ use dig_rewards_coin::constants::{
 use dig_rewards_coin::epoch::{current_distributor_epoch_end, start_next_distributor_epoch};
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
-use dig_rewards_coin::recoverable_base_units;
+use dig_rewards_coin::state::{read_distributor, DistributorSnapshot};
 
 /// The first distributor epoch starts here -- small, because the simulator's clock starts at zero.
 const FIRST_EPOCH_START: u64 = 1_234;
@@ -333,6 +333,88 @@ struct Committed {
     reward_slot: Slot<RewardDistributorRewardSlotValue>,
     funder: chia_sdk_test::BlsPairWithCoin,
     asset_id: Bytes32,
+
+    /// The distributor's own singleton coin id at every post-eve generation so far, launcher
+    /// first -- what [`read_snapshot`] needs to rebuild a [`dig_chainsource_interface::MockChainSource`]
+    /// wide enough for [`read_distributor`] to walk, mirroring `tests/simulator.rs::mock_chain_source`'s
+    /// own convention (that file cannot be reused here: each `tests/*.rs` file is its own binary).
+    singleton_members: Vec<Bytes32>,
+    launcher_id: Bytes32,
+    reserve_launch_id: Bytes32,
+    reserve_parent_id: Bytes32,
+}
+
+/// Rebuild a [`DistributorSnapshot`] from `committed`'s own simulator state, at chain time
+/// `peak_timestamp` -- the SAME `t` the caller passes to `committed.sim.set_next_timestamp(t)`
+/// before submitting. `mock_chain_source` (`tests/simulator.rs:1624-1633`) stamps every height with
+/// a SYNTHETIC timestamp; feeding a different clock here than the one the simulator validates the
+/// submit against would compare two unrelated numbers and prove nothing (dig_ecosystem#3439, the
+/// decision's F4). The assertion below is what turns that mismatch into a loud failure instead of a
+/// silent one.
+fn read_snapshot(committed: &Committed, peak_timestamp: u64) -> anyhow::Result<DistributorSnapshot> {
+    let mut source = dig_chainsource_interface::MockChainSource::new();
+
+    // The eve coin is a child of the launcher, spent to produce the first post-eve generation.
+    // `read_distributor` needs that spend (`from_eve_coin_spend` parses it) even though it is
+    // never itself a member of `singleton_members` -- the same exception
+    // `tests/simulator.rs::mock_chain_source` makes.
+    let eve_coin_id = committed
+        .sim
+        .children(committed.launcher_id)
+        .first()
+        .map(|state| state.coin.coin_id());
+
+    let reserve_tip_id = committed.distributor.reserve.coin.coin_id();
+
+    let ids = committed
+        .singleton_members
+        .iter()
+        .copied()
+        .chain(eve_coin_id)
+        .chain([
+            committed.reserve_launch_id,
+            committed.reserve_parent_id,
+            reserve_tip_id,
+        ]);
+
+    for id in ids {
+        if let Some(state) = committed.sim.coin_state(id) {
+            source = source.with_coin(
+                id,
+                dig_chainsource_interface::CoinRecord::from_coin_state(state),
+            );
+        }
+        if let Some(spend) = committed.sim.coin_spend(id) {
+            source = source.with_spend(id, spend);
+        }
+    }
+
+    let tip = *committed
+        .singleton_members
+        .last()
+        .expect("a singleton chain always has at least the launcher and one generation");
+    source = source.with_lineage(
+        committed.launcher_id,
+        dig_chainsource_interface::SingletonLineage::new(
+            tip,
+            committed.singleton_members.iter().copied(),
+        ),
+    );
+
+    let peak = committed.sim.height();
+    let source = source.with_timestamp(peak, peak_timestamp).with_peak(peak);
+
+    let snapshot = read_distributor(&source, committed.launcher_id)?
+        .expect("the distributor's launcher coin is on chain");
+
+    assert_eq!(
+        snapshot.observed().peak_timestamp(),
+        peak_timestamp,
+        "the report must be read against the SAME clock the chain validates the submit against, \
+         or the two sides of assert_report_agrees_with_chain compare unrelated numbers"
+    );
+
+    Ok(snapshot)
 }
 
 /// Launch, then commit `amount_base_units` to [`FIRST_EPOCH_START`], leaving the commitment
@@ -345,6 +427,11 @@ fn commit_to_first_epoch(
     let (mut sim, mut distributor, reward_slot, source_cat, funder) =
         launch_harness(ctx, amount_base_units + FUNDING_HEADROOM)?;
     let asset_id = source_cat.info.asset_id;
+
+    let launcher_id = distributor.info.constants.launcher_id;
+    let mut singleton_members = vec![launcher_id, distributor.coin.coin_id()];
+    let reserve_launch_id = distributor.reserve.coin.coin_id();
+    let reserve_parent_id = distributor.reserve.coin.parent_coin_info;
 
     let secure_conditions = commit_incentives_for_distributor_epoch(
         ctx,
@@ -386,6 +473,7 @@ fn commit_to_first_epoch(
 
     let (distributor, _) = distributor.finish_spend(ctx, vec![source_cat_spend])?;
     sim.spend_coins(ctx.take(), std::slice::from_ref(&funder.sk))?;
+    singleton_members.push(distributor.coin.coin_id());
 
     let reward_slot = reward_slots
         .into_iter()
@@ -399,6 +487,10 @@ fn commit_to_first_epoch(
         reward_slot,
         funder,
         asset_id,
+        singleton_members,
+        launcher_id,
+        reserve_launch_id,
+        reserve_parent_id,
     })
 }
 
@@ -444,6 +536,9 @@ fn roll_into_first_epoch(
     let (distributor, _) = committed.distributor.clone().finish_spend(ctx, vec![])?;
     committed.distributor = distributor;
     committed.sim.spend_coins(ctx.take(), &[])?;
+    committed
+        .singleton_members
+        .push(committed.distributor.coin.coin_id());
 
     Ok(rolled_reward_slot)
 }
@@ -546,8 +641,16 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
     let hinted_before = committed.sim.hinted_coins(funder_puzzle_hash);
     let reward_slot = committed.reward_slot.clone();
 
-    let driver_reported = submit_withdraw(ctx, &mut committed, reward_slot)
-        .expect("CONFIRMED: a not-yet-started commitment's withdraw was accepted on chain");
+    let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
+
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let driver_reported = match &submit_result {
+        Ok(amount) => *amount,
+        Err(error) => panic!(
+            "CONFIRMED: a not-yet-started commitment's withdraw was accepted on chain, got {error:#}"
+        ),
+    };
+    assert_report_agrees_with_chain(reported, submit_result);
 
     let paid = paid_on_chain(&committed.sim, asset_id, funder_puzzle_hash, &hinted_before);
     assert_eq!(
@@ -557,11 +660,10 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
         paid.len()
     );
 
-    let expected = recoverable_base_units(
-        COMMITTED_BASE_UNITS,
-        u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap(),
-    )
-    .expect("9_000 bps is inside the legitimate domain");
+    let expected = reported.expect(
+        "commitments() must have reported a figure for a not-yet-started commitment -- \
+         assert_report_agrees_with_chain above would already have failed otherwise",
+    );
 
     assert_eq!(
         paid[0].coin.amount, expected,
@@ -577,6 +679,53 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
     );
 
     Ok(())
+}
+
+/// The figure `commitments()` reports for `committed`'s own commitment slot, read against the
+/// chain clock `peak_timestamp` -- the same clock `submit_withdraw` is about to be validated
+/// against, so a caller can compare the two honestly.
+fn reported_recoverable(
+    committed: &Committed,
+    peak_timestamp: u64,
+) -> anyhow::Result<Option<u64>> {
+    let snapshot = read_snapshot(committed, peak_timestamp)?;
+    let commitment = snapshot
+        .commitments()
+        .iter()
+        .find(|commitment| commitment.slot().info.value == committed.commitment_slot.info.value)
+        .expect("read_distributor must report the commitment slot this test just created");
+    Ok(commitment.recoverable_base_units())
+}
+
+/// The money-honesty invariant dig_ecosystem#3439 is about: what `commitments()` REPORTED before a
+/// withdraw was attempted must agree with what the chain actually did with it.
+///
+/// - `Some(amount)` reported + accepted: the chain must have paid exactly `amount`.
+/// - `None` reported + refused: the refusal must be `AssertBeforeSecondsAbsoluteFailed` -- a
+///   correct withheld figure, not a coincidence.
+/// - Any other pairing is the false report this whole change exists to prevent, and panics naming
+///   which side lied.
+fn assert_report_agrees_with_chain(reported: Option<u64>, submit_result: anyhow::Result<u64>) {
+    match (reported, submit_result) {
+        (Some(amount), Ok(paid)) => assert_eq!(
+            amount, paid,
+            "commitments() reported {amount} recoverable but the chain paid {paid}"
+        ),
+        (None, Ok(paid)) => panic!(
+            "commitments() reported nothing recoverable, but the chain accepted the withdraw and \
+             paid {paid} -- a false negative"
+        ),
+        (Some(amount), Err(refusal)) => panic!(
+            "commitments() reported {amount} recoverable, but the chain refused the withdraw: \
+             {refusal:#} -- exactly the false-positive dig_ecosystem#3439 is about"
+        ),
+        (None, Err(refusal)) => assert_eq!(
+            validation_error_code(&refusal),
+            ErrorCode::AssertBeforeSecondsAbsoluteFailed,
+            "commitments() correctly withheld a figure, and the chain refused, but for the wrong \
+             reason: {refusal:#}"
+        ),
+    }
 }
 
 /// Extract the `chia_consensus` validator's [`ErrorCode`] out of a [`submit_withdraw`] refusal, so
@@ -620,7 +769,15 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
         "the epoch must actually have rolled forward before the withdraw is attempted"
     );
 
-    let refusal = match submit_withdraw(ctx, &mut committed, rolled_reward_slot) {
+    let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
+    assert_eq!(
+        reported, None,
+        "dig_ecosystem#3439: commitments() must withhold a figure once the epoch has started, \
+         since the chain is about to refuse this withdraw"
+    );
+
+    let submit_result = submit_withdraw(ctx, &mut committed, rolled_reward_slot);
+    let refusal = match &submit_result {
         Ok(amount) => panic!(
             "a started-epoch commitment's withdraw was accepted on chain and paid {amount} base \
              units -- this ticket's premise (that this might be refused) no longer holds; update \
@@ -630,10 +787,11 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
     };
 
     assert_eq!(
-        validation_error_code(&refusal),
+        validation_error_code(refusal),
         ErrorCode::AssertBeforeSecondsAbsoluteFailed,
         "expected the puzzle's own epoch_start bound to refuse this, got: {refusal:#}"
     );
+    assert_report_agrees_with_chain(reported, submit_result);
 
     Ok(())
 }
@@ -663,7 +821,15 @@ fn a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_
         "precondition: no NewEpoch has run, so the distributor's own state must not have rolled"
     );
 
-    let refusal = match submit_withdraw(ctx, &mut committed, reward_slot) {
+    let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
+    assert_eq!(
+        reported, None,
+        "dig_ecosystem#3439: commitments() must withhold a figure once the chain clock has \
+         reached epoch_start, even with no NewEpoch involved"
+    );
+
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let refusal = match &submit_result {
         Ok(amount) => panic!(
             "a withdraw at the exact epoch_start instant was accepted and paid {amount} base \
              units with no epoch roll involved -- the wall-clock-bound hypothesis is wrong; \
@@ -673,10 +839,11 @@ fn a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_
     };
 
     assert_eq!(
-        validation_error_code(&refusal),
+        validation_error_code(refusal),
         ErrorCode::AssertBeforeSecondsAbsoluteFailed,
         "expected the identical refusal as the rolled-epoch case, got: {refusal:#}"
     );
+    assert_report_agrees_with_chain(reported, submit_result);
 
     Ok(())
 }
@@ -701,23 +868,29 @@ fn a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_bou
 
     let hinted_before = committed.sim.hinted_coins(funder_puzzle_hash);
 
-    let driver_reported = submit_withdraw(ctx, &mut committed, reward_slot).expect(
-        "one second before epoch_start must still succeed -- if this fails, the boundary moved",
-    );
+    let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
 
-    let expected = recoverable_base_units(
-        COMMITTED_BASE_UNITS,
-        u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap(),
-    )
-    .expect("9_000 bps is inside the legitimate domain");
-    assert_eq!(
-        expected, 900_000,
-        "pinned to the same figure a prior lane's BUILD-only measurement reported"
-    );
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let driver_reported = match &submit_result {
+        Ok(amount) => *amount,
+        Err(error) => panic!(
+            "one second before epoch_start must still succeed -- if this fails, the boundary \
+             moved: {error:#}"
+        ),
+    };
+
+    let expected = 900_000;
     assert_eq!(
         driver_reported, expected,
-        "Clawback::recovered_base_units() reported {driver_reported}, expected {expected}"
+        "Clawback::recovered_base_units() reported {driver_reported}, expected {expected} -- \
+         pinned to the same figure a prior lane's BUILD-only measurement reported"
     );
+    assert_eq!(
+        reported,
+        Some(expected),
+        "commitments() must report the same figure the chain is about to pay"
+    );
+    assert_report_agrees_with_chain(reported, submit_result);
 
     let paid = paid_on_chain(&committed.sim, asset_id, funder_puzzle_hash, &hinted_before);
     assert_eq!(
