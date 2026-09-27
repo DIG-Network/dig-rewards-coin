@@ -94,6 +94,7 @@
 //! `recoverable_share.rs`'s own precedent ("this is a separate file ... so this ticket does not
 //! collide with the concurrent #3267 work landing in that file").
 
+use chia_consensus::validation_error::ErrorCode;
 use chia_protocol::{Bytes32, CoinState, SpendBundle};
 use chia_puzzle_types::cat::CatArgs;
 use chia_puzzle_types::{CoinProof, Memos};
@@ -103,7 +104,6 @@ use chia_sdk_driver::{
     RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
     SpendWithConditions, StandardLayer,
 };
-use chia_consensus::validation_error::ErrorCode;
 use chia_sdk_test::{Simulator, SimulatorError};
 use chia_sdk_types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
@@ -416,7 +416,11 @@ fn roll_into_first_epoch(
 ) -> anyhow::Result<Slot<RewardDistributorRewardSlotValue>> {
     committed.sim.set_next_timestamp(FIRST_EPOCH_START)?;
 
-    let roll = start_next_distributor_epoch(ctx, &mut committed.distributor, committed.reward_slot.clone())?;
+    let roll = start_next_distributor_epoch(
+        ctx,
+        &mut committed.distributor,
+        committed.reward_slot.clone(),
+    )?;
     assert_eq!(
         roll.fee_base_units, 0,
         "SPEC.md §7.3: fee_bps is zero for a DIG distributor"
