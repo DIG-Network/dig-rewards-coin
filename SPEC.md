@@ -628,11 +628,13 @@ Four methods in `modules/crates/00-foundation/dig-rpc-protocol/src/method.rs` (t
 
 All four are **shipped** in `dig-rpc-protocol` **v0.11.0**; line citations in this subsection are to
 that version. The enumeration test
-`reward_distributor_methods_present_control_and_not_peer_reachable`
-(`src/method.rs:518-539`) asserts that all four are present, resolve by name, appear in `ALL`, are
-`Tier::Control`, and are never peer-reachable. A method added to this section later MUST be added
-to that test in the same change: an enumeration test only covers the enumeration it lists, so a
-fifth method left out of it is unguarded while the test still passes.
+`every_reward_method_is_control_and_not_peer_reachable`
+(`src/method.rs:607`) derives the reward method set from `Method::is_reward()` (`src/method.rs:312-318`),
+an exhaustive match. For each method, the test asserts name round-trip, `tier() == Tier::Control`,
+`!is_peer_reachable()`, and absence from `Method::peer_reachable_names()`, and asserts the reward
+set is non-empty. Because `Method::is_reward()` is an exhaustive match, a new `Method` variant fails
+to compile until it is classified, and classifying it as a reward method puts it under every assertion
+automatically. The guard is therefore compiler-bound and needs no manual extension.
 
 `Tier::Control` is loopback / in-process only
 (`modules/crates/00-foundation/dig-rpc-protocol/src/tier.rs:29-36`). All four are Control in the MVP
@@ -647,7 +649,7 @@ sets, and MUST NOT be done as a convenience. `dig.listRewardDistributorCommitmen
 promoted with it: a commitment schedule is a forward statement about the funder's money and it has
 no peer-facing use.
 
-**Two axes, stated explicitly (dig_ecosystem#3354).** `Tier::Control` governs TRANSPORT only—where the method is served, never whether it requires a token. `Tier::Control` means loopback / in-process only, served by dig-node's local dispatch and unreachable over mTLS peer surface. Whether a call needs a control token is decided per method and recorded in dig-node's `SPEC.md` §5.5 in the `meta::methods()` catalogue, not here. Of the four methods tabulated above, two are OPEN (no token, rate-bounded per source) and two are token-gated. A fifth reward method, `dig.getPayeeRewardClaimStatus`, was added to `dig-rpc-protocol` in v0.12.0 and is also `Tier::Control` and token-gated; it is in neither the table above nor that enumeration test, which is the unguarded-fifth-method gap this subsection warns about — tracked in dig_ecosystem#3417. Tier prevents the peer surface from learning the operator's distributor set; the token tier enforces confidentiality for volunteer-sensitive reads.
+**Two axes, stated explicitly (dig_ecosystem#3354).** `Tier::Control` governs TRANSPORT only—where the method is served, never whether it requires a token. `Tier::Control` means loopback / in-process only, served by dig-node's local dispatch and unreachable over mTLS peer surface. Whether a call needs a control token is decided per method and recorded in dig-node's `SPEC.md` §5.5 in the `meta::methods()` catalogue, not here. Of the four methods tabulated above, two are OPEN (no token, rate-bounded per source) and two are token-gated. A fifth reward method, `dig.getPayeeRewardClaimStatus`, was added to `dig-rpc-protocol` in v0.12.0 and is also `Tier::Control` and token-gated; it is not tabulated above, but is nonetheless covered by the derived guard via `Method::is_reward()` — so its absence from this table is a documentation scope choice, not an enforcement hole. Tier prevents the peer surface from learning the operator's distributor set; the token tier enforces confidentiality for volunteer-sensitive reads.
 
 **Control is the correct default because the two directions are not symmetric.** Promoting a method
 later is **additive** — no existing caller breaks. Demoting one is **breaking**, and it breaks exactly
