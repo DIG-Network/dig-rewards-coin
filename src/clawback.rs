@@ -156,7 +156,10 @@ pub fn commitment_distributor_epoch_start(
 /// is meant silently answers the wrong question at the wrong scale — refs #3304 item 3.
 ///
 #[must_use]
-pub fn recoverable_base_units(rewards_base_units: u64, withdrawal_share_bps: u16) -> Option<u64> {
+pub(crate) fn recoverable_base_units(
+    rewards_base_units: u64,
+    withdrawal_share_bps: u16,
+) -> Option<u64> {
     if withdrawal_share_bps > 10_000 {
         return None;
     }
@@ -254,4 +257,65 @@ pub fn withdraw_committed_incentives(
         conditions,
         recovered_base_units,
     })
+}
+
+/// Pure-arithmetic coverage of [`recoverable_base_units`], moved here (dig_ecosystem#3439) from
+/// `tests/recoverable_share.rs` once that function became `pub(crate)` -- an external integration
+/// test can no longer reach it. Moved unchanged, not deleted: these are what SPEC.md §0.1 clause 1
+/// depends on to hold the restatement's arithmetic to the paying puzzle code. The two SIMULATOR
+/// equality cases that used to live alongside these stay in `tests/recoverable_share.rs`, re-pointed
+/// at the public `Commitment::recoverable_base_units()` instead.
+#[cfg(test)]
+mod tests {
+    use super::recoverable_base_units;
+
+    /// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain
+    /// `u64` multiply, proving the `u128` intermediate in `recoverable_base_units` is load-bearing
+    /// rather than decorative: drop the intermediate and this test panics or returns a wrapped
+    /// value.
+    ///
+    /// **This case deliberately asserts nothing about what a real clawback pays**, because above
+    /// the bound there is no driver-produced amount for our figure to be equal to -- the driver
+    /// misreports instead of refusing (#3286). The on-chain puzzle pays correctly at any scale
+    /// (CLVM arithmetic is bignum).
+    #[test]
+    fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
+        const REWARDS: u64 = 2_000_000_000_000_000_000;
+        const BPS: u16 = 9_000;
+
+        // The expected value, computed independently in u128 so this assertion does not simply
+        // restate the function under test.
+        let expected = u64::try_from(u128::from(REWARDS) * u128::from(BPS) / 10_000)
+            .expect("fits back in u64: the quotient never exceeds rewards_base_units");
+
+        assert_eq!(recoverable_base_units(REWARDS, BPS), Some(expected));
+
+        // Sanity check the overflow premise: `REWARDS * (BPS as u64)` alone cannot fit in a u64.
+        assert!(REWARDS.checked_mul(u64::from(BPS)).is_none());
+    }
+
+    /// Red test for #3269 C1: `withdrawal_share_bps` above the legitimate `0..=10_000` range made
+    /// the `u128 -> u64` narrowing fail, and the `.expect()` that assumed it never could panicked --
+    /// confirmed against `53a73ff1`:
+    /// `panicked at src\clawback.rs:109:26: share of a u64 amount by a bps fraction fits in u64:
+    /// TryFromIntError(PosOverflow)`. `withdrawal_share_bps` is `u16`, so an attacker-controlled
+    /// chain-read value up to `65_535` reaches this -- not just theoretically past
+    /// `u64::MAX / bps`.
+    ///
+    /// `(1_001, 10_001)` pins the boundary one bps above the legitimate range, distinct from the
+    /// `u64::MAX` case so this cannot pass merely by refusing anything huge.
+    #[test]
+    fn recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking() {
+        assert_eq!(recoverable_base_units(u64::MAX, 65_535), None);
+        assert_eq!(recoverable_base_units(1_001, 10_001), None);
+    }
+
+    /// Selectivity: exactly at the boundary (`10_000` bps, the top of the legitimate range) the
+    /// guard must NOT reject -- proving
+    /// `recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking` added a selective
+    /// guard rather than a blanket one.
+    #[test]
+    fn recoverable_base_units_accepts_bps_at_the_10_000_boundary() {
+        assert_eq!(recoverable_base_units(1_001, 10_000), Some(1_001));
+    }
 }

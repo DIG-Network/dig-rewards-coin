@@ -19,7 +19,7 @@
 //! 0.36 (`chia-sdk-driver` + `chia-sdk-types`). This crate therefore:
 //!
 //! - never reimplements or restates puzzle arithmetic — the per-share accrual, the payout division,
-//!   the epoch fee and the withdrawal share belong to the puzzle, except for [`recoverable_base_units`]
+//!   the epoch fee and the withdrawal share belong to the puzzle, except for [`clawback::recoverable_base_units`]
 //!   which is tested equal to the paying code (§0.1 clause 1);
 //! - performs no socket I/O, holds no keys, and never broadcasts; spend builders return unsigned
 //!   spends (§0.1 clause 2). Chain reads arrive through a caller-supplied `ChainSource`
@@ -69,7 +69,7 @@ pub mod manager;
 pub mod payout;
 pub mod state;
 
-pub use clawback::{recoverable_base_units, Clawback, MAX_REPORTABLE_COMMITMENT_BASE_UNITS};
+pub use clawback::{Clawback, MAX_REPORTABLE_COMMITMENT_BASE_UNITS};
 pub use comment::LaunchComment;
 pub use constants::{
     dig_distributor_constants, dig_distributor_constants_with_funder_self_skim,
