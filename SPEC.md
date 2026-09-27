@@ -2263,6 +2263,14 @@ DIG-Network/dig_ecosystem#3251. §15.4 carries the amendment row.
     `dig-peer-protocol`) MUST NOT be a precondition for this decode, for the scan that consumes it,
     or for being paid (§13.2 clause 2). Nothing in clauses 4-9 requires a peer, a gossip message or
     any component other than a chain source.
+11. **The decode is bounded by three constants** (`src/discovery.rs`): `DECODE_MAX_SERIALIZED_BYTES`
+    (65,536) and `DECODE_MAX_COST` (10,000,000) are pre-run gates that refuse oversized or
+    expensive-to-evaluate input before any extraction work runs. `DECODE_MAX_CONDITIONS` (1,024) is
+    checked **after** the run, against the produced condition count rather than input size: the
+    `ctx.extract::< Conditions<..>>` completes fully, and the condition list it produces is tested
+    against this limit before the per-`CREATE_COIN`/memo extraction loop below it. A spend whose
+    extracted condition count exceeds this limit fails closed with `RewardsError::ObservedSpendConditionsTooMany`
+    (`src/error.rs`).
 
 ### 13.2 Off-chain discovery is an optimisation, and it is deferred (#3252)
 
