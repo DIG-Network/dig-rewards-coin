@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.9.2] - 2026-09-27
+
+### Testing
+- **3425:** Started-epoch clawback is submitted and measured REFUSED (#18)
+
 ## [0.9.1] - 2026-09-27
 
 ### Documentation
