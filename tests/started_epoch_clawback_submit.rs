@@ -4,10 +4,15 @@
 //! `commitment_slots()` still lists these commitments after their epoch has started, and
 //! `withdraw_committed_incentives` (`src/clawback.rs:191`) still BUILDS a withdraw for one -- a
 //! prior lane measured a build recovering 900,000 base units against a started epoch. No test in
-//! this crate had ever SUBMITTED that withdraw: the one prior attempt anyone made failed on
-//! `MessageNotSentOrReceived`, which is a missing funder-side message in that attempt's own
-//! fixture (nothing had wired the clawback authority's own coin to carry
-//! `Clawback::into_conditions()`, so the puzzle's `SEND_MESSAGE` was never met by a matching
+//! this crate had ever SUBMITTED *that* withdraw -- a STARTED-epoch one. Clawback submission
+//! itself is not new territory: #3295 (CLOSED SATISFIED, shipped 0.7.0, PR dig-rewards-coin#12)
+//! established that
+//! `tests/recoverable_share.rs::clawback_pays_the_funder_the_amount_actually_observed_on_chain`
+//! already submits a clawback spend via `sim.spend_coins` and asserts the funder's on-chain CAT
+//! amount -- but only for a commitment whose epoch has NOT started. The one prior attempt at a
+//! started-epoch submission failed on `MessageNotSentOrReceived`, which is a missing funder-side
+//! message in that attempt's own fixture (nothing had wired the clawback authority's own coin to
+//! carry `Clawback::into_conditions()`, so the puzzle's `SEND_MESSAGE` was never met by a matching
 //! `RECEIVE_MESSAGE`) -- a fixture bug, not a chain refusal, so it answered nothing about the
 //! epoch question.
 //!
@@ -51,7 +56,7 @@ use chia_sdk_driver::{
     RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
     SpendWithConditions, StandardLayer,
 };
-use chia_sdk_test::{Simulator, SimulatorError};
+use chia_sdk_test::Simulator;
 use chia_sdk_types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
     RewardDistributorSlotNonce,
@@ -425,11 +430,12 @@ fn submit_withdraw(
         .spend(ctx, authority_coin, clawback.into_conditions())
         .context("SIGN: the clawback authority's own coin spend could not be constructed")?;
 
-    committed
+    let (distributor, _signature) = committed
         .distributor
         .clone()
         .finish_spend(ctx, vec![])
         .context("BUILD: the distributor's own generation spend could not be constructed")?;
+    committed.distributor = distributor;
 
     committed
         .sim
@@ -459,13 +465,17 @@ fn paid_on_chain(
         .collect()
 }
 
-/// CONTROL -- rung reached: CONFIRMED AT DEPTH.
+/// CONTROL for the epoch question -- mirrors #3295's already-established, already-passing
+/// `tests/recoverable_share.rs::clawback_pays_the_funder_the_amount_actually_observed_on_chain`
+/// (same construction, reused here via the shared [`submit_withdraw`] helper) so this file's own
+/// harness is not itself a new, unproven code path.
 ///
 /// Commits to [`FIRST_EPOCH_START`] and claws it back with no `Sync`/`NewEpoch` in between, so
 /// `round_time_info.epoch_end` is still `FIRST_EPOCH_START` throughout: the epoch is provably NOT
-/// started. `chia_sdk_test::Simulator::spend_coins` accepted the bundle and advanced a block, and
-/// the resulting coin state at the funder's puzzle hash pays exactly `recoverable_base_units`'s
-/// figure. Without this test passing, a failure in
+/// started. The assertions below require `chia_sdk_test::Simulator::spend_coins` to accept the
+/// bundle and the resulting coin state at the funder's puzzle hash to pay exactly
+/// `recoverable_base_units`'s figure -- running this test is what measures the rung reached, not
+/// this comment. Without this test passing, a failure in
 /// [`a_started_epoch_commitment_is_clawed_back_on_chain`] would answer nothing about the epoch
 /// question -- it would just mean this harness cannot submit a withdraw at all.
 #[test]
@@ -521,34 +531,20 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
 ///
 /// Commits to [`FIRST_EPOCH_START`], rolls the distributor into that epoch (`NewEpoch`), and only
 /// THEN attempts the SAME commitment's withdraw -- the started-epoch case this ticket asks about.
+/// Built via the identical [`submit_withdraw`] helper
+/// [`a_not_yet_started_commitment_is_clawed_back_on_chain`] uses, differing only in the
+/// [`roll_into_first_epoch`] call before the withdraw -- the epoch state is the single variable
+/// under test.
 ///
-/// ## Observed result (measured 2026-09-27 against `main` @ `9c6636f`)
-///
-/// The simulator's real consensus validator **ACCEPTED** the started-epoch withdraw and advanced a
-/// block: `chia_sdk_test::Simulator::spend_coins` returned `Ok`, and the resulting coin state at
-/// the funder's puzzle hash paid exactly `recoverable_base_units(COMMITTED_BASE_UNITS,
-/// WITHDRAWAL_SHARE_BPS)` -- the identical figure the not-yet-started control pays. Rung reached:
-/// **CONFIRMED AT DEPTH**.
-///
-/// Nothing in `RewardDistributorWithdrawIncentivesAction::spend`
-/// (`chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs`)
-/// reads the distributor's `round_time_info` at all -- unlike `NewEpoch`, which explicitly compares
-/// `my_state.round_time_info.epoch_end` against the reward slot before computing a fee. The
-/// withdraw action's solution is built entirely from the commitment slot's and reward slot's OWN
-/// recorded fields (`clawback_ph`, `committed_value`, `epoch_start`, `rewards`, `counter`,
-/// `next_epoch_initialized`); `NewEpoch` re-creates the reward slot for a started epoch with the
-/// SAME `epoch_start` and rewards (only `counter` increments), so a withdraw built against that
-/// re-created slot is, to the puzzle, indistinguishable from a withdraw against a not-yet-started
-/// one. There is no puzzle-level "has this epoch started" check to refuse it.
-///
-/// So: (a) legitimately supported. This is not the phantom-slot class -- the phantom-slot bug was
-/// a stale-generation-derived commitment `distributor.actual_commitment_slot_value` never rebuilt,
-/// which the pre-guard in `withdraw_committed_incentives` (`src/clawback.rs:220`) mitigates for
-/// *within a generation*, and which the pre-guard in this test's own `roll_into_first_epoch` (a
-/// FRESH slot recorded past the `finish_spend` boundary) avoids by construction. Started-epoch
-/// clawback is a different question with a different, and clean, answer: `commitment_slots()` /
-/// `recoverable_base_units` listing a started epoch's commitment is not a money-honesty defect --
-/// the money is exactly as recoverable as the ticket's UI would claim.
+/// This comment asserts no result. Whether the simulator's real consensus validator accepts or
+/// refuses a started-epoch withdraw is exactly what running this test measures, not something to
+/// claim in advance of running it -- BUILT and SIGNED prove nothing about admission either way;
+/// this epic already paid for that lesson once, where a slot derived from a distributor rebuilt at
+/// an earlier generation curried cleanly and signed cleanly, and the network refused it as
+/// `UnknownUnspent` at push time, after a user had watched a ceremony succeed. Only this test's own
+/// `spend_coins` call -- ADMITTED or CONFIRMED, never a lower rung dressed up as this one -- answers
+/// the question; see the ticket (#3425) for the rung actually reached and the chain's actual
+/// response.
 #[test]
 fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
@@ -565,7 +561,7 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
     let hinted_before = committed.sim.hinted_coins(funder_puzzle_hash);
 
     let driver_reported = submit_withdraw(ctx, &mut committed, rolled_reward_slot)
-        .expect("CONFIRMED: a started-epoch commitment's withdraw was accepted on chain -- see this test's doc comment");
+        .expect("CONFIRMED: a started-epoch commitment's withdraw was accepted on chain");
 
     let paid = paid_on_chain(&committed.sim, asset_id, funder_puzzle_hash, &hinted_before);
     assert_eq!(
