@@ -27,8 +27,10 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    is **bound to the driver's implementation by a test that fails if the two diverge**. **Exactly two**
    such restatements exist and a third MUST NOT be added; the count was widened from one by §12.5
    clause 3b, recorded as §15.4 row A5. The
-   `recoverable_base_units` function restates the withdrawal share arithmetic and is proven equal
-   to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by the equality test
+   crate-private `clawback::recoverable_base_units` restates the withdrawal share arithmetic, is
+   reachable only through `DistributorSnapshot::commitments()[..].recoverable_base_units()` (§7.4
+   clause 6), and is proven equal to `chia-sdk-driver` 0.36.0's implementation
+   (`withdraw_incentives.rs:105-107`) by the equality test
    `recoverable_base_units_matches_a_real_clawback_at_odd_amounts` in `tests/recoverable_share.rs`.
    The second is `accrued_base_units` (§12.5 clause 3b), which restates the payout accrual of
    `chia-sdk-driver` 0.36.0's `RewardDistributorInitiatePayoutAction` (`initiate_payout.rs:127-131`)
@@ -1542,8 +1544,15 @@ Therefore:
 4. Clawback returns `withdrawal_share_bps / 10000` of the committed value
    (`withdraw_incentives.rs:105-107`); the remainder stays in the reserve for the mirrors.
 5. A clawback is per commitment slot, so the UI MUST present the funder's commitments **per epoch**
-   with the recoverable amount computed per slot. A single "balance" figure cannot express which part
-   is recoverable, and presenting one is the money-honesty failure of this section.
+   with the recoverable amount computed per slot, against the clock of the read (clause 6). A single
+   "balance" figure cannot express which part is recoverable, and presenting one is the money-honesty
+   failure of this section.
+6. The puzzle bounds clawback with `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` (measured: refused
+   at `epoch_start`, paid at `epoch_start - 1`, dig_ecosystem#3425). The recoverable amount a reader
+   reports MUST be computed against the chain clock of the same read
+   (`ChainObservation::peak_timestamp`), never the wall clock and never the distributor's epoch-roll
+   state, and MUST be absent — not zero, not the share — for a slot whose
+   `epoch_start <= peak_timestamp`. This crate exposes no other recoverable figure.
 
 ### 7.5 `withdrawal_share_bps = 9000`
 
@@ -1880,7 +1889,7 @@ per-distributor option.
      more than one does. Ambiguity MUST be refused, never resolved by picking: two entries paying one
      puzzle hash is a set this crate cannot reconcile, and choosing silently would pay one and strand
      the other while reporting success.
-   - `commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>]`
+   - `commitments(&self) -> &[Commitment]` — each `Commitment` carries its slot and `recoverable_base_units() -> Option<u64>` (§7.4 clause 6)
    - `reward_slots(&self) -> &[Slot<RewardDistributorRewardSlotValue>]`
 
    `distributor()` (`src/state.rs:237`), `slots()` (`src/state.rs:243`) and `observed()`
@@ -2606,3 +2615,4 @@ document takes, and remain the user's to reverse:
 2. **Is the product willing to pay relay peers a full share?** Position: yes, accepted explicitly
    (§0.4 clause 1, §3.7.1) — availability is what a mirror is for and a relay delivers it — with C8's
    funder-as-source detection as the outstanding mitigation for the one pathological case.
+| A6 | **`recoverable_base_units` reported a nonzero clawback for a started epoch the chain refuses** (dig_ecosystem#3439) — the crate-wide figure ignored the puzzle's `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` bound | **amended, breaking (0.10.0)** — §7.4 clause 6 added; the free function is now crate-private; `DistributorSnapshot::commitment_slots()` and the pub `DistributorSlots.commitments` field are replaced by `DistributorSnapshot::commitments() -> &[Commitment]`, whose `recoverable_base_units()` is `None` once `epoch_start <= peak_timestamp`. §0.1 keeps exactly two restatements |
