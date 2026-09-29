@@ -725,9 +725,10 @@ fn the_driver_panics_one_base_unit_above_the_bound() {
 ///
 /// At `FIRST_UNPAYABLE_COMMITMENT` the wrap lands the product `5_384` above `2^64`, so the integer
 /// division by `10_000` reports **zero**: the driver would tell a caller a clawback recovered
-/// nothing while the puzzle paid out `1_844_674_407_370_955` base units. Both figures are asserted,
-/// because "the driver is wrong" is only half the claim; the other half is that
-/// `recoverable_base_units` is right.
+/// nothing while the on-chain puzzle actually pays out `1_844_674_407_370_955` base units. This
+/// test asserts both: the wrapped result the driver reports and the correct on-chain payout. The
+/// agreement of `recoverable_base_units` with the puzzle at the crate-private bound is pinned
+/// separately by the unit test in `src/clawback.rs`.
 ///
 /// Run by the `Tests (release profile)` CI job. `cargo test` alone never reaches it.
 #[cfg(not(debug_assertions))]

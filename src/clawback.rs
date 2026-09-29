@@ -318,4 +318,16 @@ mod tests {
     fn recoverable_base_units_accepts_bps_at_the_10_000_boundary() {
         assert_eq!(recoverable_base_units(1_001, 10_000), Some(1_001));
     }
+
+    /// The restatement agrees with the puzzle at the largest amount the crate will report
+    /// (`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`, dig_ecosystem#3439). The expected value is a
+    /// decimal literal computed independently (u128 arithmetic outside this crate), not a
+    /// restatement of `* bps / 10_000`.
+    #[test]
+    fn recoverable_base_units_is_pinned_at_the_largest_reportable_commitment() {
+        assert_eq!(
+            recoverable_base_units(super::MAX_REPORTABLE_COMMITMENT_BASE_UNITS, 9_000),
+            Some(1_660_206_966_633_859)
+        );
+    }
 }
