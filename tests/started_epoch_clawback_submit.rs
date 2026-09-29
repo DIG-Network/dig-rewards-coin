@@ -61,12 +61,7 @@
 //! **This is legitimate design, not a bug in the reward distributor's own logic.** Once an epoch's
 //! wall-clock time arrives, that epoch's committed incentives are what fund its payouts to
 //! entries; a funder cannot unilaterally claw a commitment back out from under payouts that are
-//! about to be computed against it. The separate, real gap this ticket's body raised --
-//! `commitment_slots()` and `recoverable_base_units` do not know this and keep reporting a
-//! nonzero recoverable figure for a commitment the chain will now refuse to pay back on withdraw
-//! -- is confirmed a genuine money-honesty defect by this measurement, but changing that read path
-//! is out of this ticket's scope (the acceptance bar was the measuring test); see the ticket for
-//! that follow-up.
+//! about to be computed against it. That money-honesty gap is closed in 0.10.0 (dig_ecosystem#3439): the only recoverable figure this crate reports is `Commitment::recoverable_base_units()`, computed against the chain clock of the read, and the cases below assert it agrees with what the chain pays or refuses.
 //!
 //! ## Four tests, each isolating one variable
 //!
@@ -756,8 +751,8 @@ fn validation_error_code(error: &anyhow::Error) -> ErrorCode {
 /// `chia_consensus` validator -- with `Validation error: AssertBeforeSecondsAbsoluteFailed`. This
 /// is CONFIRMED AT DEPTH, the top rung of the evidence ladder this file's module doc describes,
 /// and the two isolation tests below pin the exact mechanism: a wall-clock bound against the
-/// commitment's own `epoch_start`, not an epoch-roll state check. See the module doc for the
-/// money-honesty consequence for `commitment_slots()` / `recoverable_base_units`.
+/// commitment's own `epoch_start`, not an epoch-roll state check. See the module doc for how
+/// `Commitment::recoverable_base_units()` reports this boundary.
 #[test]
 fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
