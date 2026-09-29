@@ -14,7 +14,7 @@
 //!    authority and its own epoch.
 //!
 //! This module carries exactly **one** authoritative restatement of the puzzle's share
-//! arithmetic — [`recoverable_base_units`] — bound to the paying code
+//! arithmetic — `recoverable_base_units` — bound to the paying code
 //! (`withdraw_incentives.rs:105-107`) by a simulator equality test, so a future upstream drift
 //! arrives as a red build rather than a silent mismatch. §0.1 clause 1 forbids an *untested* copy
 //! scattered into a consumer that can drift unnoticed; a single tested restatement, kept here in
@@ -28,7 +28,7 @@
 //! checked arithmetic, silently misreports) what the on-chain puzzle actually pays (#3286). This
 //! function therefore refuses BEFORE calling the upstream driver when the share cannot be
 //! represented at all, and cross-checks the driver's returned figure against
-//! [`recoverable_base_units`] afterwards, refusing rather than returning a tuple that may not
+//! `recoverable_base_units` afterwards, refusing rather than returning a tuple that may not
 //! describe the real spend.
 //!
 //! The puzzle itself pays the correct share at **any** scale — CLVM arithmetic is bignum, so there
@@ -36,7 +36,7 @@
 //! `u64::MAX / withdrawal_share_bps` is only the `chia-sdk-driver` 0.36.0 Rust driver's own plain
 //! `u64` multiply (`withdraw_incentives.rs:105-107`), which misreports rather than refuses — a
 //! driver bug tracked as #3286, not a property of the reward system. See
-//! [`recoverable_base_units`] for the `bps` domain rule and that bound.
+//! `recoverable_base_units` for the `bps` domain rule and that bound.
 
 use chia_protocol::Bytes32;
 use chia_sdk_driver::{

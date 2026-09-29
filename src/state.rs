@@ -421,7 +421,7 @@ impl DistributorSnapshot {
     /// Derived from the reward slots, which is where the puzzle keeps them; this performs no
     /// accrual arithmetic of its own.
     ///
-    /// **Not the same quantity as [`crate::clawback::recoverable_base_units`]**, despite both being
+    /// **Not the same quantity as `clawback::recoverable_base_units`**, despite both being
     /// "base units of reward" in prose: this is a per-epoch AGGREGATE (every entry's committed
     /// reward, summed, for one epoch), while `recoverable_base_units` is a per-COMMITMENT figure
     /// (one entry's own withdrawal-share preview). Reading one where the other is meant silently
@@ -651,7 +651,7 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// and `from_spend`/this reader's walk calls only `get_log` -- see dig-rewards-coin#10, which
 /// stays deferred on that ground and is not closed by this pre-screen. `refresh.rs:143-144`
 /// already uses the safe wide-int pattern this crate's own
-/// [`crate::clawback::recoverable_base_units`] follows (`i128::from(x) + i128::from(y)` then
+/// `clawback::recoverable_base_units` follows (`i128::from(x) + i128::from(y)` then
 /// `u64::try_from`) -- the contrast that shows the unchecked sites above are oversights, not a
 /// deliberate design upstream chose.
 ///
