@@ -41,6 +41,7 @@ use dig_rewards_coin::constants::{
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::state::{read_distributor, DistributorSnapshot};
+use dig_rewards_coin::MAX_REPORTABLE_COMMITMENT_BASE_UNITS;
 
 /// The first distributor epoch starts here — small, because the simulator's clock starts at zero.
 const FIRST_EPOCH_START: u64 = 1_234;
@@ -491,10 +492,12 @@ fn assert_matches_a_real_clawback(
 /// is `...954.8` -- so none would pass under a rounding bug, and none would pass if the restatement
 /// divided before it multiplied (`1_001 / 10_000` is `0`).
 ///
-/// The third case sits exactly at [`LARGEST_PAYABLE_COMMITMENT`]. A documented boundary that no
-/// test touches is a claim rather than a proof, so this pins it: equality holds at the very last
-/// amount a real clawback can pay on, and one base unit further up upstream stops having an answer
-/// at all (`the_driver_panics_one_base_unit_above_the_bound`).
+/// The third case sits exactly at [`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`], the largest commitment
+/// `read_distributor` will carry (`u64::MAX / 10_000`). That is stricter than upstream's own bound,
+/// [`LARGEST_PAYABLE_COMMITMENT`] (`u64::MAX / 9_000`), and it is the ceiling of what a reader can
+/// report at all, so equality is proved at the last amount a snapshot can quote. Between the two
+/// bounds the reader refuses; one base unit above upstream's the driver panics
+/// (`the_driver_panics_one_base_unit_above_the_bound`).
 ///
 /// The expected figures are decimal literals ON PURPOSE, and are not bounds: each was computed
 /// independently of the code under test, which is what makes the comparison evidence rather than
@@ -508,7 +511,7 @@ fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Re
 
     assert_matches_a_real_clawback(1_001, 900)?;
     assert_matches_a_real_clawback(7_777, 6_999)?;
-    assert_matches_a_real_clawback(LARGEST_PAYABLE_COMMITMENT, 1_844_674_407_370_954)?;
+    assert_matches_a_real_clawback(MAX_REPORTABLE_COMMITMENT_BASE_UNITS, 1_660_206_966_633_859)?;
 
     Ok(())
 }

@@ -281,7 +281,6 @@ impl Commitment {
     /// (`SPEC.md` §12.1 clause 1b) — what [`crate::clawback::withdraw_committed_incentives`] takes.
     /// Still handed out for a started epoch: the slot exists on chain and a caller may need it (to
     /// build a spend the chain will refuse, or simply to know it exists).
-    #[must_use]
     pub fn slot(&self) -> &Slot<RewardDistributorCommitmentSlotValue> {
         &self.slot
     }
