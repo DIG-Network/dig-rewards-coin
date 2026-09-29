@@ -351,7 +351,10 @@ struct Committed {
 /// submit against would compare two unrelated numbers and prove nothing (dig_ecosystem#3439, the
 /// decision's F4). The assertion below is what turns that mismatch into a loud failure instead of a
 /// silent one.
-fn read_snapshot(committed: &Committed, peak_timestamp: u64) -> anyhow::Result<DistributorSnapshot> {
+fn read_snapshot(
+    committed: &Committed,
+    peak_timestamp: u64,
+) -> anyhow::Result<DistributorSnapshot> {
     let mut source = dig_chainsource_interface::MockChainSource::new();
 
     // The eve coin is a child of the launcher, spent to produce the first post-eve generation.
@@ -684,10 +687,7 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
 /// The figure `commitments()` reports for `committed`'s own commitment slot, read against the
 /// chain clock `peak_timestamp` -- the same clock `submit_withdraw` is about to be validated
 /// against, so a caller can compare the two honestly.
-fn reported_recoverable(
-    committed: &Committed,
-    peak_timestamp: u64,
-) -> anyhow::Result<Option<u64>> {
+fn reported_recoverable(committed: &Committed, peak_timestamp: u64) -> anyhow::Result<Option<u64>> {
     let snapshot = read_snapshot(committed, peak_timestamp)?;
     let commitment = snapshot
         .commitments()
