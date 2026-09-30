@@ -27,8 +27,10 @@ The on-chain mechanism is **not ours**. It is CHIP-0051, implemented upstream in
    is **bound to the driver's implementation by a test that fails if the two diverge**. **Exactly two**
    such restatements exist and a third MUST NOT be added; the count was widened from one by §12.5
    clause 3b, recorded as §15.4 row A5. The
-   `recoverable_base_units` function restates the withdrawal share arithmetic and is proven equal
-   to `chia-sdk-driver` 0.36.0's implementation (`withdraw_incentives.rs:105-107`) by the equality test
+   crate-private `clawback::recoverable_base_units` restates the withdrawal share arithmetic, is
+   reachable only through `DistributorSnapshot::commitments()[..].recoverable_base_units()` (§7.4
+   clause 6), and is proven equal to `chia-sdk-driver` 0.36.0's implementation
+   (`withdraw_incentives.rs:105-107`) by the equality test
    `recoverable_base_units_matches_a_real_clawback_at_odd_amounts` in `tests/recoverable_share.rs`.
    The second is `accrued_base_units` (§12.5 clause 3b), which restates the payout accrual of
    `chia-sdk-driver` 0.36.0's `RewardDistributorInitiatePayoutAction` (`initiate_payout.rs:127-131`)
@@ -1542,8 +1544,15 @@ Therefore:
 4. Clawback returns `withdrawal_share_bps / 10000` of the committed value
    (`withdraw_incentives.rs:105-107`); the remainder stays in the reserve for the mirrors.
 5. A clawback is per commitment slot, so the UI MUST present the funder's commitments **per epoch**
-   with the recoverable amount computed per slot. A single "balance" figure cannot express which part
-   is recoverable, and presenting one is the money-honesty failure of this section.
+   with the recoverable amount computed per slot, against the clock of the read (clause 6). A single
+   "balance" figure cannot express which part is recoverable, and presenting one is the money-honesty
+   failure of this section.
+6. The puzzle bounds clawback with `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` (measured: refused
+   at `epoch_start`, paid at `epoch_start - 1`, dig_ecosystem#3425). The recoverable amount a reader
+   reports MUST be computed against the chain clock of the same read
+   (`ChainObservation::peak_timestamp`), never the wall clock and never the distributor's epoch-roll
+   state, and MUST be absent — not zero, not the share — for a slot whose
+   `epoch_start <= peak_timestamp`. This crate exposes no other recoverable figure.
 
 ### 7.5 `withdrawal_share_bps = 9000`
 
@@ -1880,7 +1889,7 @@ per-distributor option.
      more than one does. Ambiguity MUST be refused, never resolved by picking: two entries paying one
      puzzle hash is a set this crate cannot reconcile, and choosing silently would pay one and strand
      the other while reporting success.
-   - `commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>]`
+   - `commitments(&self) -> &[Commitment]` — each `Commitment` carries its slot and `recoverable_base_units() -> Option<u64>` (§7.4 clause 6)
    - `reward_slots(&self) -> &[Slot<RewardDistributorRewardSlotValue>]`
 
    `distributor()` (`src/state.rs:237`), `slots()` (`src/state.rs:243`) and `observed()`
@@ -2593,6 +2602,7 @@ a later reader can tell a decision from an open item.
 | A3 | **§12.5 clause 1 contradicted its own clauses 2 and 3** — "a **terminal, non-error** outcome for that distributor: stop retrying" admits the reading *never read that distributor again*, which makes clause 2's re-entry unobservable and clause 3 vacuous. Implemented literally in DIG-Network/dig-node#594, as a process-lifetime blacklist keyed by launcher id, it produced two reachable states in which a peer earns nothing while reporting nothing wrong: a peer legitimately re-admitted after `REENTRY_COOLDOWN_SECONDS`, and a peer that discovers a newly funded distributor before the funder's `AddEntry` lands — which §15 clause 9a makes the **ordinary** case rather than an edge | **fixed** — clause 1 now scopes "terminal" to the claim **attempt** and keeps every guarantee it had (no spend, no chain fault, no report of a lost payment, because §6.4 clause 1 already settled everything accrued including a sub-threshold remainder); new clause **1a** requires continued observation on §8.6's cadence and states that a slot read is a chain read, not a spend, so §6.3's write bounds do not reach it; clause **4** reconciles this with clause 3 explicitly — an absence MUST NOT be cached any more than a value is; clause **5** bans a permanent per-distributor exclusion set; clause **6** requires the absence be surfaced in the vocabulary §2.3/§2.4 already define, and states what the shipped v0.11.0 `RewardDistributorRef` cannot carry instead of ordering a presentation no wire can feed; clause **7** forbids guessing "never admitted" apart from "evicted after settlement". The heading widened from "A peer claiming after eviction", which pointed a reader looking for the not-yet-added case at no section at all. Clauses 2 and 3 are unchanged, so §15.1's "§12.5 clause 3" allocation still resolves. No constant, default or driver shape changed |
 | A4 | **Two clauses ordered work no caller could perform.** §7.2 clause 1a and §15 clause 3a order a launch-time manager-singleton inner-puzzle choice, while the crate ships **no singleton launcher at all**: `DistributorLaunchTerms` requires `manager_singleton_launcher_id` (`src/constants.rs:91`) and refuses a zero one (`src/constants.rs:197-203`), so at 0.5.0 no distributor can be minted through this crate without an id it offers no way to obtain. Separately, §13.1 clause 2 requires a peer with nothing but a chain source to find a distributor, while `LaunchComment` was written at launch and never read back from a spend | **specified** — new **§7.2a** (the manager singleton launch: launcher id derived from the spend this crate builds, inner puzzle an explicit un-defaulted choice named by **provenance** rather than by a capability this crate cannot verify of 32 opaque bytes, zero hash refused, both spends in one bundle) and **§13.1 clauses 4-10** (the decode: the comment is in the memos of the launcher-creating `CREATE_COIN`, not in the launcher solution, so every value is derived from the observed spend; absence over a zero generation; what a decoded result does not prove). §15 clauses **3b** and **10** carry them into conformance, §15 clause 9a gains the assertions its test must make, and §15.1 reallocates the §13.1 decode from the prover to this crate. Tracked by DIG-Network/dig_ecosystem#3308 and #3249. No constant, default or driver shape changed |
 | A5 | **§0.1 clause 1's exception admitted “exactly one” restatement of puzzle arithmetic**, and §12.5 clause 3b needs a second: a claim loop cannot decide whether a claim clears §8.3's `payout_threshold` without computing the accrual, and the only alternative — building a spend to find out — pays a fee to ask a question | **amended** — §0.1 clause 1 now admits **two**, on identical terms, and bans a third: each MUST be bound by a test that fails if it diverges from `chia-sdk-driver` 0.36.0's own implementation (`withdraw_incentives.rs:105-107` for `recoverable_base_units`, `initiate_payout.rs:127-131` for `accrued_base_units`). The prohibition itself is unchanged — no third restatement, and no new division anywhere else in the crate |
+| A6 | **`recoverable_base_units` reported a nonzero clawback for a started epoch the chain refuses** (dig_ecosystem#3439) — the crate-wide figure ignored the puzzle's `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` bound | **amended, breaking (0.10.0)** — §7.4 clause 6 added; the free function is now crate-private; `DistributorSnapshot::commitment_slots()` and the pub `DistributorSlots.commitments` field are replaced by `DistributorSnapshot::commitments() -> &[Commitment]`, whose `recoverable_base_units()` is `None` once `epoch_start <= peak_timestamp`. §0.1 keeps exactly two restatements |
 
 Rows prefixed **A** are amendments made **after** PR #2 merged, and are recorded for the same
 reason the gate conditions are: a reader must be able to tell a decision from a correction, and a

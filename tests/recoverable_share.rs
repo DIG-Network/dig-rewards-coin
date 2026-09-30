@@ -5,7 +5,7 @@
 //! arithmetic to the paying puzzle code
 //! (`chia-sdk-driver-0.36.0/src/layers/action_layer/actions/reward_distributor/withdraw_incentives.rs:105-107`):
 //! if a future upstream bump changes that arithmetic, [`Clawback::recovered_base_units`] and
-//! [`recoverable_base_units`] diverge and this test goes red. A simulator test proving equality on
+//! [`Commitment::recoverable_base_units`] diverge and this test goes red. A simulator test proving equality on
 //! a round number would pass under a rounding bug (round numbers do not exercise truncation) and
 //! under a lost precision bug (small numbers never overflow), so no case here is round.
 //!
@@ -40,7 +40,8 @@ use dig_rewards_coin::constants::{
 };
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
-use dig_rewards_coin::recoverable_base_units;
+use dig_rewards_coin::state::{read_distributor, DistributorSnapshot};
+use dig_rewards_coin::MAX_REPORTABLE_COMMITMENT_BASE_UNITS;
 
 /// The first distributor epoch starts here — small, because the simulator's clock starts at zero.
 const FIRST_EPOCH_START: u64 = 1_234;
@@ -240,6 +241,14 @@ struct Committed {
     /// is what pins that on chain rather than assuming it.
     reserves_before_commit: u64,
     reserve_amount_after_commit: u64,
+
+    /// What [`read_snapshot`] needs to rebuild a chain source `read_distributor` can walk: the
+    /// distributor singleton's coin id at every generation so far (launcher first) and the reserve
+    /// coin's launch and parent ids.
+    singleton_members: Vec<Bytes32>,
+    launcher_id: Bytes32,
+    reserve_launch_id: Bytes32,
+    reserve_parent_id: Bytes32,
 }
 
 /// Launch, then commit `amount_base_units` to [`FIRST_EPOCH_START`], leaving the commitment
@@ -252,6 +261,10 @@ fn commit_to_first_epoch(
         launch_harness(ctx, amount_base_units + FUNDING_HEADROOM)?;
     let asset_id = source_cat.info.asset_id;
     let reserves_before_commit = distributor.info.state.total_reserves;
+    let launcher_id = distributor.info.constants.launcher_id;
+    let mut singleton_members = vec![launcher_id, distributor.coin.coin_id()];
+    let reserve_launch_id = distributor.reserve.coin.coin_id();
+    let reserve_parent_id = distributor.reserve.coin.parent_coin_info;
 
     let secure_conditions = commit_incentives_for_distributor_epoch(
         ctx,
@@ -298,6 +311,7 @@ fn commit_to_first_epoch(
         .expect("committing created a commitment slot");
 
     let (distributor, _) = distributor.finish_spend(ctx, vec![source_cat_spend])?;
+    singleton_members.push(distributor.coin.coin_id());
     sim.spend_coins(ctx.take(), std::slice::from_ref(&funder.sk))?;
 
     let reward_slot = reward_slots
@@ -314,13 +328,115 @@ fn commit_to_first_epoch(
         funder,
         asset_id,
         reserves_before_commit,
+        singleton_members,
+        launcher_id,
+        reserve_launch_id,
+        reserve_parent_id,
     })
 }
 
+/// Rebuild a [`DistributorSnapshot`] from `committed`'s own simulator state, at chain time
+/// `peak_timestamp` -- the SAME `t` the caller passes to `committed.sim.set_next_timestamp(t)`
+/// before submitting. `tests/simulator.rs::mock_chain_source` stamps every height with
+/// a SYNTHETIC timestamp; feeding a different clock here than the one the simulator validates the
+/// submit against would compare two unrelated numbers and prove nothing (dig_ecosystem#3439, the
+/// decision's F4). The assertion below is what turns that mismatch into a loud failure instead of a
+/// silent one.
+fn read_snapshot(
+    committed: &Committed,
+    peak_timestamp: u64,
+) -> anyhow::Result<DistributorSnapshot> {
+    let mut source = dig_chainsource_interface::MockChainSource::new();
+
+    // The eve coin is a child of the launcher, spent to produce the first post-eve generation.
+    // `read_distributor` needs that spend (`from_eve_coin_spend` parses it) even though it is
+    // never itself a member of `singleton_members` -- the same exception
+    // `tests/simulator.rs::mock_chain_source` makes.
+    let eve_coin_id = committed
+        .sim
+        .children(committed.launcher_id)
+        .first()
+        .map(|state| state.coin.coin_id());
+
+    let reserve_tip_id = committed.distributor.reserve.coin.coin_id();
+
+    let ids = committed
+        .singleton_members
+        .iter()
+        .copied()
+        .chain(eve_coin_id)
+        .chain([
+            committed.reserve_launch_id,
+            committed.reserve_parent_id,
+            reserve_tip_id,
+        ]);
+
+    for id in ids {
+        if let Some(state) = committed.sim.coin_state(id) {
+            source = source.with_coin(
+                id,
+                dig_chainsource_interface::CoinRecord::from_coin_state(state),
+            );
+        }
+        if let Some(spend) = committed.sim.coin_spend(id) {
+            source = source.with_spend(id, spend);
+        }
+    }
+
+    let tip = *committed
+        .singleton_members
+        .last()
+        .expect("a singleton chain always has at least the launcher and one generation");
+    source = source.with_lineage(
+        committed.launcher_id,
+        dig_chainsource_interface::SingletonLineage::new(
+            tip,
+            committed.singleton_members.iter().copied(),
+        ),
+    );
+
+    let peak = committed.sim.height();
+    let source = source.with_timestamp(peak, peak_timestamp).with_peak(peak);
+
+    let snapshot = read_distributor(&source, committed.launcher_id)?
+        .expect("the distributor's launcher coin is on chain");
+
+    assert_eq!(
+        snapshot.observed().peak_timestamp(),
+        peak_timestamp,
+        "the report must be read against the SAME clock the chain validates the submit against, \
+         or the two sides of assert_report_agrees_with_chain compare unrelated numbers"
+    );
+
+    Ok(snapshot)
+}
+
+/// What [`read_snapshot`] reports as the recoverable figure for the commitment to
+/// [`FIRST_EPOCH_START`], read at chain time `peak_timestamp`.
+fn reported_recoverable(committed: &Committed, peak_timestamp: u64) -> anyhow::Result<Option<u64>> {
+    let snapshot = read_snapshot(committed, peak_timestamp)?;
+    let commitment = snapshot
+        .commitments()
+        .iter()
+        .find(|commitment| commitment.distributor_epoch_start() == FIRST_EPOCH_START)
+        .expect("the snapshot carries the commitment to the first epoch");
+    Ok(commitment.recoverable_base_units())
+}
+
+/// A chain time strictly before [`FIRST_EPOCH_START`], where the puzzle's
+/// `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` still pays.
+const CLOCK_BEFORE_EPOCH_START: u64 = FIRST_EPOCH_START - 1;
+
 /// Commit `amount_base_units` to [`FIRST_EPOCH_START`], then immediately claw it back through this
-/// crate's own guarded entry point, returning the figure it reports.
-fn commit_then_clawback(ctx: &mut SpendContext, amount_base_units: u64) -> anyhow::Result<u64> {
+/// crate's own guarded entry point, returning the figure it reports and the figure a snapshot read
+/// at [`CLOCK_BEFORE_EPOCH_START`] reports.
+fn commit_then_clawback(
+    ctx: &mut SpendContext,
+    amount_base_units: u64,
+) -> anyhow::Result<(u64, Option<u64>)> {
     let mut committed = commit_to_first_epoch(ctx, amount_base_units)?;
+    committed.sim.set_next_timestamp(CLOCK_BEFORE_EPOCH_START)?;
+    let reported = reported_recoverable(&committed, CLOCK_BEFORE_EPOCH_START)?;
 
     let clawback = withdraw_committed_incentives(
         ctx,
@@ -330,7 +446,7 @@ fn commit_then_clawback(ctx: &mut SpendContext, amount_base_units: u64) -> anyho
         committed.funder.puzzle_hash,
     )?;
 
-    Ok(clawback.recovered_base_units())
+    Ok((clawback.recovered_base_units(), reported))
 }
 
 /// The largest commitment upstream can compute a share of at all: one more base unit and
@@ -348,25 +464,22 @@ const FIRST_UNPAYABLE_COMMITMENT: u64 = LARGEST_PAYABLE_COMMITMENT + 1;
 const FUNDING_HEADROOM: u64 = 1_000;
 
 /// One in-range case: commit `rewards_base_units`, claw it back, and require both that the figure
-/// this crate returns is `expected_paid` and that [`recoverable_base_units`] agrees.
+/// this crate returns is `expected_paid` and that [`Commitment::recoverable_base_units`] agrees.
 fn assert_matches_a_real_clawback(
     rewards_base_units: u64,
     expected_paid: u64,
 ) -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
-    let paid = commit_then_clawback(ctx, rewards_base_units)?;
+    let (paid, reported) = commit_then_clawback(ctx, rewards_base_units)?;
 
     assert_eq!(
         paid, expected_paid,
         "the puzzle truncates {rewards_base_units} * 9_000 / 10_000 down to {expected_paid}"
     );
     assert_eq!(
-        recoverable_base_units(
-            rewards_base_units,
-            u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
-        ),
+        reported,
         Some(paid),
-        "recoverable_base_units must equal the driver's returned figure"
+        "Commitment::recoverable_base_units must equal the driver's returned figure"
     );
 
     Ok(())
@@ -379,10 +492,12 @@ fn assert_matches_a_real_clawback(
 /// is `...954.8` -- so none would pass under a rounding bug, and none would pass if the restatement
 /// divided before it multiplied (`1_001 / 10_000` is `0`).
 ///
-/// The third case sits exactly at [`LARGEST_PAYABLE_COMMITMENT`]. A documented boundary that no
-/// test touches is a claim rather than a proof, so this pins it: equality holds at the very last
-/// amount a real clawback can pay on, and one base unit further up upstream stops having an answer
-/// at all (`the_driver_panics_one_base_unit_above_the_bound`).
+/// The third case sits exactly at [`MAX_REPORTABLE_COMMITMENT_BASE_UNITS`], the largest commitment
+/// `read_distributor` will carry (`u64::MAX / 10_000`). That is stricter than upstream's own bound,
+/// [`LARGEST_PAYABLE_COMMITMENT`] (`u64::MAX / 9_000`), and it is the ceiling of what a reader can
+/// report at all, so equality is proved at the last amount a snapshot can quote. Between the two
+/// bounds the reader refuses; one base unit above upstream's the driver panics
+/// (`the_driver_panics_one_base_unit_above_the_bound`).
 ///
 /// The expected figures are decimal literals ON PURPOSE, and are not bounds: each was computed
 /// independently of the code under test, which is what makes the comparison evidence rather than
@@ -396,7 +511,7 @@ fn recoverable_base_units_matches_a_real_clawback_at_odd_amounts() -> anyhow::Re
 
     assert_matches_a_real_clawback(1_001, 900)?;
     assert_matches_a_real_clawback(7_777, 6_999)?;
-    assert_matches_a_real_clawback(LARGEST_PAYABLE_COMMITMENT, 1_844_674_407_370_954)?;
+    assert_matches_a_real_clawback(MAX_REPORTABLE_COMMITMENT_BASE_UNITS, 1_660_206_966_633_859)?;
 
     Ok(())
 }
@@ -413,56 +528,6 @@ fn dig_s_own_withdrawal_share_bps_fits_the_u16_recoverable_base_units_takes() {
         "WITHDRAWAL_SHARE_BPS ({WITHDRAWAL_SHARE_BPS}) must fit the u16 recoverable_base_units \
          takes, or this crate's own launches could not be quoted at all"
     );
-}
-
-/// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain `u64`
-/// multiply, proving the `u128` intermediate in `recoverable_base_units` is load-bearing rather
-/// than decorative: drop the intermediate and this test panics or returns a wrapped value.
-///
-/// **This case deliberately asserts nothing about what a real clawback pays**, because above the
-/// bound there is no driver-produced amount for our figure to be equal to -- the driver misreports
-/// instead of refusing (#3286). The on-chain puzzle pays correctly at any scale (CLVM arithmetic is
-/// bignum). Equality below the bound is
-/// `recoverable_base_units_matches_a_real_clawback_at_odd_amounts`; what the driver does above it
-/// is `the_driver_panics_one_base_unit_above_the_bound` and
-/// `the_driver_reports_a_wrapped_share_where_the_puzzle_pays_correctly`.
-#[test]
-fn recoverable_base_units_does_not_overflow_where_a_plain_u64_multiply_would() {
-    const REWARDS: u64 = 2_000_000_000_000_000_000;
-    const BPS: u16 = 9_000;
-
-    // The expected value, computed independently in u128 so this assertion does not simply
-    // restate the function under test.
-    let expected = u64::try_from(u128::from(REWARDS) * u128::from(BPS) / 10_000)
-        .expect("fits back in u64: the quotient never exceeds rewards_base_units");
-
-    assert_eq!(recoverable_base_units(REWARDS, BPS), Some(expected));
-
-    // Sanity check the overflow premise: `REWARDS * (BPS as u64)` alone cannot fit in a u64.
-    assert!(REWARDS.checked_mul(u64::from(BPS)).is_none());
-}
-
-/// Red test for #3269 C1: `withdrawal_share_bps` above the legitimate `0..=10_000` range made the
-/// `u128 -> u64` narrowing fail, and the `.expect()` that assumed it never could panicked --
-/// confirmed against `53a73ff1`:
-/// `panicked at src\clawback.rs:109:26: share of a u64 amount by a bps fraction fits in u64:
-/// TryFromIntError(PosOverflow)`. `withdrawal_share_bps` is `u16`, so an attacker-controlled
-/// chain-read value up to `65_535` reaches this -- not just theoretically past `u64::MAX / bps`.
-///
-/// `(1_001, 10_001)` pins the boundary one bps above the legitimate range, distinct from the
-/// `u64::MAX` case so this cannot pass merely by refusing anything huge.
-#[test]
-fn recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking() {
-    assert_eq!(recoverable_base_units(u64::MAX, 65_535), None);
-    assert_eq!(recoverable_base_units(1_001, 10_001), None);
-}
-
-/// Selectivity: exactly at the boundary (`10_000` bps, the top of the legitimate range) the guard
-/// must NOT reject -- proving `recoverable_base_units_rejects_bps_above_10_000_instead_of_panicking`
-/// added a selective guard rather than a blanket one.
-#[test]
-fn recoverable_base_units_accepts_bps_at_the_10_000_boundary() {
-    assert_eq!(recoverable_base_units(1_001, 10_000), Some(1_001));
 }
 
 /// T1: submit a real clawback all the way through the simulator and read the amount paid off the
@@ -499,6 +564,12 @@ fn clawback_pays_the_funder_the_amount_actually_observed_on_chain() -> anyhow::R
     let ctx = &mut SpendContext::new();
     let mut committed = commit_to_first_epoch(ctx, REWARDS_BASE_UNITS)?;
     let funder_puzzle_hash = committed.funder.puzzle_hash;
+
+    // The chain source carries the SAME `t` the simulator validates the submit against, so the
+    // figure read here is the figure the chain is about to honour.
+    committed.sim.set_next_timestamp(CLOCK_BEFORE_EPOCH_START)?;
+    let expected = reported_recoverable(&committed, CLOCK_BEFORE_EPOCH_START)?
+        .expect("the epoch has not started at this clock, so the share is reported");
 
     let clawback = withdraw_committed_incentives(
         ctx,
@@ -548,12 +619,6 @@ fn clawback_pays_the_funder_the_amount_actually_observed_on_chain() -> anyhow::R
         paid_on_chain.len()
     );
     let chain_observed_amount = paid_on_chain[0].coin.amount;
-
-    let expected = recoverable_base_units(
-        REWARDS_BASE_UNITS,
-        u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap(),
-    )
-    .expect("9_000 bps is inside the legitimate domain");
 
     assert_eq!(
         chain_observed_amount, expected,
@@ -619,13 +684,8 @@ fn the_action_solution_carries_the_full_commitment_while_the_return_carries_the_
         params.committed_value
     );
     assert_eq!(
-        share,
-        recoverable_base_units(
-            params.committed_value,
-            u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
-        )
-        .expect("9_000 bps is inside the legitimate domain"),
-        "the share is a re-derivation OF the solution's committed_value, computed in Rust"
+        share, 6_999,
+        "the share is 7_777 * 9_000 / 10_000 truncated, computed independently of the code"
     );
 
     Ok(())
@@ -665,9 +725,10 @@ fn the_driver_panics_one_base_unit_above_the_bound() {
 ///
 /// At `FIRST_UNPAYABLE_COMMITMENT` the wrap lands the product `5_384` above `2^64`, so the integer
 /// division by `10_000` reports **zero**: the driver would tell a caller a clawback recovered
-/// nothing while the puzzle paid out `1_844_674_407_370_955` base units. Both figures are asserted,
-/// because "the driver is wrong" is only half the claim; the other half is that
-/// `recoverable_base_units` is right.
+/// nothing while the on-chain puzzle actually pays out `1_844_674_407_370_955` base units. This
+/// test asserts both: the wrapped result the driver reports and the correct on-chain payout. The
+/// agreement of `recoverable_base_units` with the puzzle at the crate-private bound is pinned
+/// separately by the unit test in `src/clawback.rs`.
 ///
 /// Run by the `Tests (release profile)` CI job. `cargo test` alone never reaches it.
 #[cfg(not(debug_assertions))]
@@ -702,14 +763,6 @@ fn the_driver_reports_a_wrapped_share_where_the_puzzle_pays_correctly() -> anyho
     assert_eq!(
         true_share, 1_844_674_407_370_955,
         "the puzzle's bignum arithmetic pays this, whatever the driver says"
-    );
-    assert_eq!(
-        recoverable_base_units(
-            FIRST_UNPAYABLE_COMMITMENT,
-            u16::try_from(WITHDRAWAL_SHARE_BPS).unwrap()
-        ),
-        Some(true_share),
-        "this crate's restatement agrees with the puzzle, not with the driver"
     );
 
     Ok(())

@@ -94,9 +94,6 @@ pub struct DistributorSlots {
     /// One per entry in the entry set: who gets paid, and the replay guard.
     pub entries: Vec<RewardDistributorEntrySlotValue>,
 
-    /// One per outstanding commitment: which distributor epoch, whose clawback, how much.
-    pub commitments: Vec<RewardDistributorCommitmentSlotValue>,
-
     /// One per distributor epoch with rewards attached.
     pub rewards: Vec<RewardDistributorRewardSlotValue>,
 }
@@ -155,11 +152,6 @@ impl SpendableSlots {
     fn to_value_view(&self) -> DistributorSlots {
         DistributorSlots {
             entries: self.entries.iter().map(|slot| slot.info.value).collect(),
-            commitments: self
-                .commitments
-                .iter()
-                .map(|slot| slot.info.value)
-                .collect(),
             rewards: self.rewards.iter().map(|slot| slot.info.value).collect(),
         }
     }
@@ -266,7 +258,73 @@ pub struct DistributorSnapshot {
     distributor: RewardDistributor,
     slots: DistributorSlots,
     spendable: SpendableSlots,
+    commitments: Vec<Commitment>,
     observed: ChainObservation,
+}
+
+/// One outstanding commitment, paired with the **only** recoverable figure this crate reports for
+/// it (`dig_ecosystem#3439`).
+///
+/// Private fields, no constructor outside [`read_distributor`] — the same discipline as
+/// [`crate::clawback::Clawback`] and [`ChainObservation`]. That is what makes
+/// [`Self::recoverable_base_units`] trustworthy: it is always computed against the
+/// [`ChainObservation`] the snapshot that produced this `Commitment` was itself read under, never
+/// supplied or overridden by a caller.
+#[derive(Debug, Clone)]
+pub struct Commitment {
+    slot: Slot<RewardDistributorCommitmentSlotValue>,
+    recoverable: Option<u64>,
+}
+
+impl Commitment {
+    /// The spendable slot, with the `LineageProof` of the generation that actually created it
+    /// (`SPEC.md` §12.1 clause 1b) — what [`crate::clawback::withdraw_committed_incentives`] takes.
+    /// Still handed out for a started epoch: the slot exists on chain and a caller may need it (to
+    /// build a spend the chain will refuse, or simply to know it exists).
+    pub fn slot(&self) -> &Slot<RewardDistributorCommitmentSlotValue> {
+        &self.slot
+    }
+
+    /// Which distributor epoch this commitment is for.
+    #[must_use]
+    pub fn distributor_epoch_start(&self) -> u64 {
+        self.slot.info.value.epoch_start
+    }
+
+    /// Who — and only who — may withdraw this commitment.
+    #[must_use]
+    pub fn clawback_authority(&self) -> Bytes32 {
+        self.slot.info.value.clawback_ph
+    }
+
+    /// The committed amount, in $DIG base units. **Not** the recoverable share of it — see
+    /// [`Self::recoverable_base_units`].
+    #[must_use]
+    pub fn rewards_base_units(&self) -> u64 {
+        self.slot.info.value.rewards
+    }
+
+    /// `Some(share)` iff the chain's own `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` would still
+    /// pay this commitment as of the read that produced this snapshot
+    /// (`observed.peak_timestamp < epoch_start`, strictly before); `None` once the chain refuses
+    /// (`SPEC.md` §7.4 clause 6).
+    ///
+    /// Compared against [`ChainObservation::peak_timestamp`] — the chain's own clock — **never**
+    /// the wall clock and **never** the distributor's epoch-roll state:
+    /// `dig_ecosystem#3425` measured the puzzle's bound fires on the clock alone, with no epoch
+    /// roll (`start_next_distributor_epoch`) involved at all, so checking the roll instead would
+    /// accept cases the chain refuses.
+    ///
+    /// `None` here has exactly one meaning. It is not `0`: a `withdrawal_share_bps = 0` distributor
+    /// legitimately has a zero share, and "absent" and "zero" must stay distinguishable
+    /// (`dig-rpc-protocol` SPEC §2.6 clause 5). It is not an error: a started commitment is a fact
+    /// about the chain, not a failed read. [`read_distributor`] already refuses a distributor whose
+    /// own `withdrawal_share_bps` exceeds `10_000` before a `Commitment` can ever be built, so the
+    /// share is always representable here.
+    #[must_use]
+    pub fn recoverable_base_units(&self) -> Option<u64> {
+        self.recoverable
+    }
 }
 
 impl DistributorSnapshot {
@@ -283,7 +341,7 @@ impl DistributorSnapshot {
     /// never existed, yet the proof is well-formed, the puzzle hash computes, `initiate_payout`
     /// builds, `finish_spend` succeeds, and the bundle is refused only at chain submission, with no
     /// indication of which part was wrong. Take slots from [`Self::entry_slot`],
-    /// [`Self::commitment_slots`] or [`Self::reward_slots`] instead — those carry the `LineageProof`
+    /// [`Self::commitments`] or [`Self::reward_slots`] instead — those carry the `LineageProof`
     /// of the generation that actually created each one. This type cannot enforce the prohibition
     /// itself: the upstream method lives on `RewardDistributor`, which this crate hands out by
     /// reference.
@@ -293,7 +351,7 @@ impl DistributorSnapshot {
 
     /// The outstanding slots, as a plain value view.
     ///
-    /// Derived once from [`Self::entry_slot`]/[`Self::commitment_slots`]/[`Self::reward_slots`]'s
+    /// Derived once from [`Self::entry_slot`]/[`Self::commitments`]/[`Self::reward_slots`]'s
     /// underlying `Slot` set (`SPEC.md` §12.1 clause 1a) — never bookkept in parallel with it.
     #[must_use]
     pub fn slots(&self) -> &DistributorSlots {
@@ -315,10 +373,13 @@ impl DistributorSnapshot {
         entry_slot_for_payout_puzzle_hash(&self.spendable.entries, payout_puzzle_hash)
     }
 
-    /// The spendable commitment slots, each with the `LineageProof` of the generation that
-    /// actually created it (`SPEC.md` §12.1 clause 1b).
-    pub fn commitment_slots(&self) -> &[Slot<RewardDistributorCommitmentSlotValue>] {
-        &self.spendable.commitments
+    /// The outstanding commitments — the **only** public listing of them (`dig_ecosystem#3439`).
+    /// Each carries the `LineageProof` of the generation that actually created its slot
+    /// (`SPEC.md` §12.1 clause 1b) alongside the one honest recoverable figure this crate reports
+    /// (`SPEC.md` §7.4 clause 6). Built once by [`read_distributor`]; no public constructor.
+    #[must_use]
+    pub fn commitments(&self) -> &[Commitment] {
+        &self.commitments
     }
 
     /// The spendable reward slots, each with the `LineageProof` of the generation that actually
@@ -359,7 +420,7 @@ impl DistributorSnapshot {
     /// Derived from the reward slots, which is where the puzzle keeps them; this performs no
     /// accrual arithmetic of its own.
     ///
-    /// **Not the same quantity as [`crate::recoverable_base_units`]**, despite both being
+    /// **Not the same quantity as `clawback::recoverable_base_units`**, despite both being
     /// "base units of reward" in prose: this is a per-epoch AGGREGATE (every entry's committed
     /// reward, summed, for one epoch), while `recoverable_base_units` is a per-COMMITMENT figure
     /// (one entry's own withdrawal-share preview). Reading one where the other is meant silently
@@ -589,7 +650,7 @@ fn entry_set_is_frozen(kind: RewardDistributorType) -> bool {
 /// and `from_spend`/this reader's walk calls only `get_log` -- see dig-rewards-coin#10, which
 /// stays deferred on that ground and is not closed by this pre-screen. `refresh.rs:143-144`
 /// already uses the safe wide-int pattern this crate's own
-/// [`crate::clawback::recoverable_base_units`] follows (`i128::from(x) + i128::from(y)` then
+/// `clawback::recoverable_base_units` follows (`i128::from(x) + i128::from(y)` then
 /// `u64::try_from`) -- the contrast that shows the unchecked sites above are oversights, not a
 /// deliberate design upstream chose.
 ///
@@ -1388,10 +1449,35 @@ pub fn read_distributor(
 
     let slots = spendable.to_value_view();
 
+    // B1 already refused `withdrawal_share_bps > 10_000` above, so this narrowing is infallible --
+    // and that is exactly what makes `Commitment::recoverable_base_units` able to return `None`
+    // for one reason only (a started epoch), never "the constants were unreadable" silently
+    // reusing the same `None`.
+    let withdrawal_share_bps = u16::try_from(constants.withdrawal_share_bps)
+        .expect("B1 already refused withdrawal_share_bps above 10_000, which fits a u16");
+    let commitments: Vec<Commitment> = spendable
+        .commitments
+        .iter()
+        .cloned()
+        .map(|slot| {
+            let epoch_start = slot.info.value.epoch_start;
+            let recoverable = (peak_timestamp < epoch_start)
+                .then(|| {
+                    crate::clawback::recoverable_base_units(
+                        slot.info.value.rewards,
+                        withdrawal_share_bps,
+                    )
+                })
+                .flatten();
+            Commitment { slot, recoverable }
+        })
+        .collect();
+
     Ok(Some(DistributorSnapshot {
         distributor,
         slots,
         spendable,
+        commitments,
         observed: ChainObservation {
             peak_height,
             peak_timestamp,

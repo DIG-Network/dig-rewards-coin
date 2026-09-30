@@ -116,10 +116,10 @@ pub enum RewardsError {
     },
 
     /// The driver's returned withdrawal share disagrees with this crate's own restatement
-    /// ([`crate::recoverable_base_units`]), or no restatement could even be computed.
+    /// (`clawback::recoverable_base_units`), or no restatement could even be computed.
     ///
     /// `restated` is [`None`] rather than a defaulted `0` when `withdrawal_share_bps` itself is
-    /// out of the `u16` range [`crate::recoverable_base_units`] takes (reachable for any bps in
+    /// out of the `u16` range `clawback::recoverable_base_units` takes (reachable for any bps in
     /// `10_001..=65_535`): a fabricated `0` would read as "this crate's own restatement computes
     /// zero", which is a different -- and false -- claim from "no restatement exists". Either way
     /// the driver's whole returned tuple is untrustworthy, not just the share, so this refuses the
@@ -132,7 +132,7 @@ pub enum RewardsError {
     DriverShareDisagrees {
         /// What `chia-sdk-driver` 0.36.0 returned.
         driver_reported: u64,
-        /// What [`crate::recoverable_base_units`] computes independently, or [`None`] if
+        /// What `clawback::recoverable_base_units` computes independently, or [`None`] if
         /// `withdrawal_share_bps` could not even be narrowed to a `u16` to compute one.
         restated: Option<u64>,
     },
