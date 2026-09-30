@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-09-30
+
+### Bug Fixes
+- **BREAKING** **rewards:** Honest recoverable_base_units for a started epoch (#3439) (#19)
+
 ## [0.9.2] - 2026-09-27
 
 ### Testing
