@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.11.0] - 2026-10-01
+
+### Bug Fixes
+- **BREAKING** **clawback:** Refuse a started-epoch withdraw before building (#3444) (#20)
+
 ## [0.10.0] - 2026-09-30
 
 ### Bug Fixes
