@@ -1096,3 +1096,44 @@ fn withdraw_builds_one_second_before_epoch_start() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Fails if the epoch guard moves below the authority check: a stranger authority on a started
+/// epoch must still be refused with `CommitmentEpochStarted`, not `NotTheClawbackAuthority`.
+#[test]
+fn withdraw_refuses_a_started_epoch_before_checking_the_authority() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let reward_slot = committed.reward_slot.clone();
+
+    committed.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let observed = observed_at(&committed, FIRST_EPOCH_START)?;
+    let stranger = Bytes32::new([0x7e; 32]);
+    assert_ne!(
+        stranger, committed.funder.puzzle_hash,
+        "precondition: the authority must be wrong"
+    );
+
+    let result = withdraw_committed_incentives(
+        ctx,
+        &mut committed.distributor,
+        committed.commitment_slot.clone(),
+        reward_slot,
+        stranger,
+        &observed,
+    );
+
+    match result {
+        Err(RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        }) => {
+            assert_eq!(distributor_epoch_start, FIRST_EPOCH_START);
+            assert_eq!(peak_timestamp, observed.peak_timestamp());
+        }
+        other => {
+            panic!("expected CommitmentEpochStarted ahead of the authority check, got: {other:?}")
+        }
+    }
+
+    Ok(())
+}
