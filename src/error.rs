@@ -66,6 +66,16 @@ pub enum RewardsError {
         now_unix_seconds: u64,
     },
 
+    /// The commitment's distributor epoch has started on the chain clock of the read, so the puzzle's
+    /// `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)` would refuse the withdraw (SPEC.md §7.4 clause 7).
+    #[error("commitment for the distributor epoch starting at {distributor_epoch_start} cannot be clawed back: the chain clock {peak_timestamp} has reached it")]
+    CommitmentEpochStarted {
+        /// The commitment slot's `epoch_start`, in Unix seconds.
+        distributor_epoch_start: u64,
+        /// `ChainObservation::peak_timestamp` of the read the caller supplied.
+        peak_timestamp: u64,
+    },
+
     /// The caller is not the authority recorded in the commitment slot being withdrawn.
     ///
     /// Authority for a clawback is the slot's own `clawback_ph` and nothing else — not the manager

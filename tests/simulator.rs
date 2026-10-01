@@ -53,7 +53,7 @@ use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
 use dig_rewards_coin::manager::{launch_manager_singleton, ManagerInnerPuzzle};
 use dig_rewards_coin::payout::{initiate_payout, EntrySlotSource, PayoutOutcome};
-use dig_rewards_coin::state::MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS;
+use dig_rewards_coin::state::{ChainObservation, MAX_COMMIT_INCENTIVES_BACKFILL_SLOTS};
 use dig_rewards_coin::{
     read_distributor, DistributorSnapshot, RewardsError, MAX_REPORTABLE_COMMITMENT_BASE_UNITS,
     STALE_ENTRY_SET_SECONDS,
@@ -1373,6 +1373,7 @@ fn a_sync_that_cannot_reach_the_window_is_refused_before_the_operator_pays() -> 
 fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow::Result<()> {
     let ctx = &mut SpendContext::new();
     let mut harness = launch_harness(ctx)?;
+    let observed = observe_at_launch(&harness)?;
 
     // Commit to the SECOND epoch: a commitment is withdrawable while its epoch is still in the
     // future.
@@ -1412,6 +1413,7 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         commitment_slot.clone(),
         reward_slot.clone(),
         stranger,
+        &observed,
     ) {
         Ok(_) => panic!("a stranger must not be able to withdraw the funder's commitment"),
         Err(error) => error,
@@ -1428,6 +1430,7 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
         commitment_slot,
         reward_slot,
         harness.funder.puzzle_hash,
+        &observed,
     )?;
     assert_eq!(
         clawback.recovered_base_units(),
@@ -1441,6 +1444,26 @@ fn a_clawback_is_authorized_by_the_commitment_slot_and_nothing_else() -> anyhow:
     );
 
     Ok(())
+}
+
+/// A real [`ChainObservation`] of `harness`'s freshly launched distributor, minted by
+/// `read_distributor` itself, stamped with the clock the simulator will validate its next block at
+/// rather than [`mock_timestamp`]'s synthetic one -- the clock is the only part of the observation
+/// `withdraw_committed_incentives` judges (SPEC.md §7.4 clause 7).
+///
+/// Must be taken right after launch, while the launch generation is still the singleton's tip.
+fn observe_at_launch(harness: &Harness) -> anyhow::Result<ChainObservation> {
+    let launcher_id = harness.distributor.info.constants.launcher_id;
+    let members = [launcher_id, harness.distributor.coin.coin_id()];
+    let extras = [
+        harness.distributor.reserve.coin.coin_id(),
+        harness.distributor.reserve.coin.parent_coin_info,
+    ];
+    let chain = mock_chain_source(&harness.sim, launcher_id, &members, &extras)
+        .with_timestamp(harness.sim.height(), harness.sim.next_timestamp());
+
+    let snapshot = read_distributor(&chain, launcher_id)?.expect("launched");
+    Ok(*snapshot.observed())
 }
 
 /// Pick the reward slot that covers `epoch_start`: an exact match if one exists, otherwise the
@@ -3515,6 +3538,7 @@ fn withdraw_guards_the_substituted_commitment_not_the_callers_stale_one() -> any
         large_commitment + SMALL_COMMITMENT + headroom,
         WITHDRAWAL_SHARE_BPS,
     )?;
+    let observed = observe_at_launch(&harness)?;
 
     let second_epoch_start = FIRST_EPOCH_START + TEST_EPOCH_SECONDS;
 
@@ -3577,6 +3601,7 @@ fn withdraw_guards_the_substituted_commitment_not_the_callers_stale_one() -> any
         stale_commitment_slot,
         reward_slot_after_second_commit,
         harness.funder.puzzle_hash,
+        &observed,
     );
 
     match clawback {

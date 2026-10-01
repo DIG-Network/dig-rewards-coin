@@ -1461,7 +1461,10 @@ pub fn read_distributor(
         .cloned()
         .map(|slot| {
             let epoch_start = slot.info.value.epoch_start;
-            let recoverable = (peak_timestamp < epoch_start)
+            // The SAME predicate `withdraw_committed_incentives` refuses on (SPEC.md §7.4
+            // clause 7), so the read path and the build path cannot disagree by a second.
+            let started = crate::clawback::distributor_epoch_started(epoch_start, peak_timestamp);
+            let recoverable = (!started)
                 .then(|| {
                     crate::clawback::recoverable_base_units(
                         slot.info.value.rewards,

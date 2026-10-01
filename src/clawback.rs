@@ -47,6 +47,7 @@ use chia_sdk_types::puzzles::{
 };
 use chia_sdk_types::Conditions;
 
+use crate::state::ChainObservation;
 use crate::RewardsError;
 
 /// A completed clawback: the conditions to deliver, and what the puzzle returned.
@@ -181,14 +182,28 @@ pub(crate) fn recoverable_base_units(
 /// literal, so the bound cannot silently drift from the domain rule it is paired with.
 pub const MAX_REPORTABLE_COMMITMENT_BASE_UNITS: u64 = u64::MAX / 10_000;
 
+/// SPEC.md §7.4 clauses 6-7: the puzzle refuses a withdraw once `peak_timestamp >= epoch_start`
+/// (measured: refused at `epoch_start`, paid at `epoch_start - 1`, dig_ecosystem#3425).
+pub(crate) fn distributor_epoch_started(distributor_epoch_start: u64, peak_timestamp: u64) -> bool {
+    peak_timestamp >= distributor_epoch_start
+}
+
 /// Withdraw one commitment, recovering the puzzle's withdrawal share of it.
 ///
 /// `expected_clawback_puzzle_hash` is the caller's own hash. It is checked against the slot's
 /// recorded authority first: a mismatch is refused here rather than on chain, because the operator
 /// pays the network fee for a spend the puzzle then rejects.
 ///
+/// `observed` is the chain read the caller took (`DistributorSnapshot::observed`). Its
+/// `peak_timestamp` decides whether the commitment's epoch has started, by the same predicate
+/// [`crate::state::Commitment::recoverable_base_units`] uses, so this never builds a withdraw for a
+/// commitment that read reports nothing recoverable for. A stale observation can only fail toward a
+/// spend the chain refuses, never toward refusing one it would accept (SPEC.md §7.4 clause 7).
+///
 /// # Errors
 ///
+/// - [`RewardsError::CommitmentEpochStarted`] if `observed.peak_timestamp` has reached the
+///   commitment's `epoch_start`. Checked first, before the authority and before anything is built.
 /// - [`RewardsError::NotTheClawbackAuthority`] if the slot records a different authority.
 /// - [`RewardsError::Driver`] if the upstream action could not be built.
 pub fn withdraw_committed_incentives(
@@ -197,7 +212,20 @@ pub fn withdraw_committed_incentives(
     commitment_slot: Slot<RewardDistributorCommitmentSlotValue>,
     reward_slot: Slot<RewardDistributorRewardSlotValue>,
     expected_clawback_puzzle_hash: Bytes32,
+    observed: &ChainObservation,
 ) -> Result<Clawback, RewardsError> {
+    // The slot passed in, not the substituted one: `actual_commitment_slot_value` matches on
+    // `epoch_start` (`reward_distributor.rs:833-849`), so both carry the same value by construction.
+    let distributor_epoch_start = commitment_distributor_epoch_start(&commitment_slot);
+    let peak_timestamp = observed.peak_timestamp();
+
+    if distributor_epoch_started(distributor_epoch_start, peak_timestamp) {
+        return Err(RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        });
+    }
+
     let recorded = clawback_authority(&commitment_slot);
 
     if recorded != expected_clawback_puzzle_hash {
@@ -265,9 +293,30 @@ pub fn withdraw_committed_incentives(
 /// depends on to hold the restatement's arithmetic to the paying puzzle code. The two SIMULATOR
 /// equality cases that used to live alongside these stay in `tests/recoverable_share.rs`, re-pointed
 /// at the public `Commitment::recoverable_base_units()` instead.
+///
+/// Also pins [`distributor_epoch_started`]'s one-second boundary (dig_ecosystem#3444), which the
+/// read path and the build path share.
 #[cfg(test)]
 mod tests {
-    use super::recoverable_base_units;
+    use super::{distributor_epoch_started, recoverable_base_units};
+
+    /// The epoch_start these boundary cases are measured against.
+    const EPOCH_START: u64 = 1_234;
+
+    #[test]
+    fn distributor_epoch_started_is_false_one_second_before() {
+        assert!(!distributor_epoch_started(EPOCH_START, EPOCH_START - 1));
+    }
+
+    #[test]
+    fn distributor_epoch_started_is_true_at_epoch_start() {
+        assert!(distributor_epoch_started(EPOCH_START, EPOCH_START));
+    }
+
+    #[test]
+    fn distributor_epoch_started_is_true_after() {
+        assert!(distributor_epoch_started(EPOCH_START, EPOCH_START + 1));
+    }
 
     /// A value large enough that `rewards_base_units * withdrawal_share_bps` overflows a plain
     /// `u64` multiply, proving the `u128` intermediate in `recoverable_base_units` is load-bearing

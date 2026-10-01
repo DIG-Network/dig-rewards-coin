@@ -1,9 +1,12 @@
 //! #3425 -- is a commitment to an already-STARTED distributor epoch actually clawback-able on
 //! chain, or does the puzzle refuse it?
 //!
-//! `commitment_slots()` still lists these commitments after their epoch has started, and
-//! `withdraw_committed_incentives` (`src/clawback.rs:191`) still BUILDS a withdraw for one -- a
-//! prior lane measured a build recovering 900,000 base units against a started epoch. No test in
+//! `commitment_slots()` still lists these commitments after their epoch has started. Before 0.11.0
+//! `withdraw_committed_incentives` still BUILT a withdraw for one -- a prior lane measured a build
+//! recovering 900,000 base units against a started epoch; since dig_ecosystem#3444 it refuses with
+//! `RewardsError::CommitmentEpochStarted` before building anything (SPEC.md §7.4 clause 7), and the
+//! started-epoch tests below reach the chain through [`submit_withdraw_bypassing_the_guard`]
+//! instead, so they still measure what the chain itself does. No test in
 //! this crate had ever SUBMITTED *that* withdraw -- a STARTED-epoch one. Clawback submission
 //! itself is not new territory: #3295 (CLOSED SATISFIED, shipped 0.7.0, PR dig-rewards-coin#12)
 //! established that
@@ -80,9 +83,18 @@
 //!   isolation pair described above.
 //!
 //! All four use the identical fixture shape (same launch, same commitment amount, same withdraw
-//! wiring) via the shared [`commit_to_first_epoch`] / [`submit_withdraw`] helpers, differing only
-//! in the simulator clock and whether `start_next_distributor_epoch` runs, so the epoch/clock
-//! state is the only variable under test in each.
+//! wiring) via the shared [`commit_to_first_epoch`] / [`submit_clawback_conditions`] helpers,
+//! differing only in the simulator clock and whether `start_next_distributor_epoch` runs, so the
+//! epoch/clock state is the only variable under test in each. The two refused cases also assert
+//! that the guarded builder, handed the same observation, refuses before building -- guard and
+//! chain pinned together in one test.
+//!
+//! ## The build-path guard (dig_ecosystem#3444)
+//!
+//! [`withdraw_refuses_a_started_epoch_commitment_before_building`],
+//! [`withdraw_refuses_at_exactly_epoch_start`] and [`withdraw_builds_one_second_before_epoch_start`]
+//! pin `withdraw_committed_incentives`' own refusal to the same one-second boundary the chain
+//! enforces.
 //!
 //! This is a new file rather than an addition to `tests/simulator.rs` or
 //! `tests/recoverable_share.rs` -- both carry live work elsewhere in this epic -- per
@@ -96,8 +108,8 @@ use chia_puzzle_types::{CoinProof, Memos};
 use chia_puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_sdk_driver::{
     sign_standard_transaction, Cat, CatSpend, Launcher, Offer, RewardDistributor,
-    RewardDistributorConstants, RewardDistributorType, SingleCatSpend, Slot, Spend, SpendContext,
-    SpendWithConditions, StandardLayer,
+    RewardDistributorConstants, RewardDistributorType, RewardDistributorWithdrawIncentivesAction,
+    SingleCatSpend, Slot, Spend, SpendContext, SpendWithConditions, StandardLayer,
 };
 use chia_sdk_test::{Simulator, SimulatorError};
 use chia_sdk_types::puzzles::{
@@ -115,7 +127,8 @@ use dig_rewards_coin::constants::{
 use dig_rewards_coin::epoch::{current_distributor_epoch_end, start_next_distributor_epoch};
 use dig_rewards_coin::fund::commit_incentives_for_distributor_epoch;
 use dig_rewards_coin::launch::launch_dig_distributor;
-use dig_rewards_coin::state::{read_distributor, DistributorSnapshot};
+use dig_rewards_coin::state::{read_distributor, ChainObservation, DistributorSnapshot};
+use dig_rewards_coin::RewardsError;
 
 /// The first distributor epoch starts here -- small, because the simulator's clock starts at zero.
 const FIRST_EPOCH_START: u64 = 1_234;
@@ -551,28 +564,76 @@ fn roll_into_first_epoch(
 /// here is either BUILD (the driver refused before touching the chain), SIGN (the authority coin's
 /// spend could not be constructed), or SUBMIT (the simulator's validator refused the bundle) --
 /// never conflated.
+///
+/// This is the guarded public path: `observed` is what `withdraw_committed_incentives` judges the
+/// commitment's epoch against (SPEC.md §7.4 clause 7).
 fn submit_withdraw(
     ctx: &mut SpendContext,
     committed: &mut Committed,
     reward_slot: Slot<RewardDistributorRewardSlotValue>,
+    observed: &ChainObservation,
 ) -> anyhow::Result<u64> {
     use anyhow::Context;
-
-    let funder_puzzle_hash = committed.funder.puzzle_hash;
 
     let clawback = withdraw_committed_incentives(
         ctx,
         &mut committed.distributor,
         committed.commitment_slot.clone(),
         reward_slot,
-        funder_puzzle_hash,
+        committed.funder.puzzle_hash,
+        observed,
     )
     .context("BUILD: withdraw_committed_incentives refused before reaching the chain")?;
     let driver_reported = clawback.recovered_base_units();
 
+    submit_clawback_conditions(ctx, committed, clawback.into_conditions(), driver_reported)
+}
+
+/// Build the SAME withdraw [`submit_withdraw`] builds, but straight through `chia-sdk-driver`'s
+/// own action, skipping this crate's guard, and submit it.
+///
+/// Exists only to prove the chain refuses what the guard refuses: since dig_ecosystem#3444 the
+/// guarded path refuses a started epoch before building, so without this the chain's own
+/// `AssertBeforeSecondsAbsoluteFailed` could no longer be observed at all.
+fn submit_withdraw_bypassing_the_guard(
+    ctx: &mut SpendContext,
+    committed: &mut Committed,
+    reward_slot: Slot<RewardDistributorRewardSlotValue>,
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let actual_commitment_slot = committed
+        .distributor
+        .actual_commitment_slot_value(committed.commitment_slot.clone());
+    let (conditions, driver_reported) = committed
+        .distributor
+        .new_action::<RewardDistributorWithdrawIncentivesAction>()
+        .spend(
+            ctx,
+            &mut committed.distributor,
+            actual_commitment_slot,
+            reward_slot,
+        )
+        .context("BUILD: the driver's own withdraw action could not be built")?;
+
+    submit_clawback_conditions(ctx, committed, conditions, driver_reported)
+}
+
+/// The shared tail of both withdraw paths: answer the puzzle's `SEND_MESSAGE` from a fresh coin the
+/// funder controls, finish the distributor's generation and submit, returning `driver_reported` iff
+/// the chain accepted the bundle.
+fn submit_clawback_conditions(
+    ctx: &mut SpendContext,
+    committed: &mut Committed,
+    conditions: Conditions,
+    driver_reported: u64,
+) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let funder_puzzle_hash = committed.funder.puzzle_hash;
     let authority_coin = committed.sim.new_coin(funder_puzzle_hash, 1);
     StandardLayer::new(committed.funder.pk)
-        .spend(ctx, authority_coin, clawback.into_conditions())
+        .spend(ctx, authority_coin, conditions)
         .context("SIGN: the clawback authority's own coin spend could not be constructed")?;
 
     let (distributor, _signature) = committed
@@ -640,8 +701,9 @@ fn a_not_yet_started_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> 
     let reward_slot = committed.reward_slot.clone();
 
     let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
+    let observed = observed_at(&committed, committed.sim.next_timestamp())?;
 
-    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot, &observed);
     let driver_reported = match &submit_result {
         Ok(amount) => *amount,
         Err(error) => panic!(
@@ -690,6 +752,63 @@ fn reported_recoverable(committed: &Committed, peak_timestamp: u64) -> anyhow::R
         .find(|commitment| commitment.slot().info.value == committed.commitment_slot.info.value)
         .expect("read_distributor must report the commitment slot this test just created");
     Ok(commitment.recoverable_base_units())
+}
+
+/// A real [`ChainObservation`] of `committed`'s distributor at chain time `peak_timestamp`, minted
+/// by `read_distributor` itself -- the only way one can exist -- so the guard is judged against the
+/// same clock [`reported_recoverable`] and the simulator use.
+fn observed_at(committed: &Committed, peak_timestamp: u64) -> anyhow::Result<ChainObservation> {
+    Ok(*read_snapshot(committed, peak_timestamp)?.observed())
+}
+
+/// Require the guarded builder to refuse `committed`'s withdraw with the exact typed
+/// [`RewardsError::CommitmentEpochStarted`], and to have built nothing doing so: SPEC.md §7.4
+/// clause 7 puts the refusal before any spend, so the distributor's pending actions and the spend
+/// context must be exactly as they were.
+fn assert_guard_refuses_before_building(
+    ctx: &mut SpendContext,
+    committed: &mut Committed,
+    reward_slot: Slot<RewardDistributorRewardSlotValue>,
+    observed: &ChainObservation,
+) {
+    let actions_before = committed.distributor.pending_spend.actions.len();
+
+    let result = withdraw_committed_incentives(
+        ctx,
+        &mut committed.distributor,
+        committed.commitment_slot.clone(),
+        reward_slot,
+        committed.funder.puzzle_hash,
+        observed,
+    );
+
+    match result {
+        Err(RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        }) => {
+            assert_eq!(distributor_epoch_start, FIRST_EPOCH_START);
+            assert_eq!(peak_timestamp, observed.peak_timestamp());
+        }
+        Ok(clawback) => panic!(
+            "withdraw_committed_incentives built a withdraw recovering {} base units at chain \
+             clock {} for a commitment whose epoch starts at {FIRST_EPOCH_START} -- the chain \
+             refuses exactly this (dig_ecosystem#3444)",
+            clawback.recovered_base_units(),
+            observed.peak_timestamp()
+        ),
+        Err(other) => panic!("expected CommitmentEpochStarted, got: {other}"),
+    }
+
+    assert_eq!(
+        committed.distributor.pending_spend.actions.len(),
+        actions_before,
+        "the refusal must come before any action is added to the distributor's pending spend"
+    );
+    assert!(
+        ctx.take().is_empty(),
+        "the refusal must come before any coin spend is added to the spend context"
+    );
 }
 
 /// The money-honesty invariant dig_ecosystem#3439 is about: what `commitments()` REPORTED before a
@@ -742,10 +861,11 @@ fn validation_error_code(error: &anyhow::Error) -> ErrorCode {
 ///
 /// Commits to [`FIRST_EPOCH_START`], rolls the distributor into that epoch (`NewEpoch`), and only
 /// THEN attempts the SAME commitment's withdraw -- the started-epoch case this ticket asks about.
-/// Built via the identical [`submit_withdraw`] helper
-/// [`a_not_yet_started_commitment_is_clawed_back_on_chain`] uses, differing only in the
-/// [`roll_into_first_epoch`] call before the withdraw -- the epoch state is the single variable
-/// under test.
+/// Submitted via [`submit_withdraw_bypassing_the_guard`], which shares its whole submit tail with
+/// the [`submit_withdraw`] helper [`a_not_yet_started_commitment_is_clawed_back_on_chain`] uses,
+/// differing only in the [`roll_into_first_epoch`] call before the withdraw -- the epoch state is
+/// the single variable under test. The guarded builder is asserted first to refuse the same
+/// withdraw before building it (dig_ecosystem#3444).
 ///
 /// The withdraw builds and signs cleanly and is refused at `Simulator::spend_coins` -- the real
 /// `chia_consensus` validator -- with `Validation error: AssertBeforeSecondsAbsoluteFailed`. This
@@ -771,7 +891,16 @@ fn a_started_epoch_commitment_is_clawed_back_on_chain() -> anyhow::Result<()> {
          since the chain is about to refuse this withdraw"
     );
 
-    let submit_result = submit_withdraw(ctx, &mut committed, rolled_reward_slot);
+    let observed = observed_at(&committed, committed.sim.next_timestamp())?;
+    assert_guard_refuses_before_building(
+        ctx,
+        &mut committed,
+        rolled_reward_slot.clone(),
+        &observed,
+    );
+
+    let submit_result =
+        submit_withdraw_bypassing_the_guard(ctx, &mut committed, rolled_reward_slot);
     let refusal = match &submit_result {
         Ok(amount) => panic!(
             "a started-epoch commitment's withdraw was accepted on chain and paid {amount} base \
@@ -823,7 +952,10 @@ fn a_wall_clock_reaching_epoch_start_refuses_the_withdraw_even_without_an_epoch_
          reached epoch_start, even with no NewEpoch involved"
     );
 
-    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let observed = observed_at(&committed, committed.sim.next_timestamp())?;
+    assert_guard_refuses_before_building(ctx, &mut committed, reward_slot.clone(), &observed);
+
+    let submit_result = submit_withdraw_bypassing_the_guard(ctx, &mut committed, reward_slot);
     let refusal = match &submit_result {
         Ok(amount) => panic!(
             "a withdraw at the exact epoch_start instant was accepted and paid {amount} base \
@@ -864,8 +996,9 @@ fn a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_bou
     let hinted_before = committed.sim.hinted_coins(funder_puzzle_hash);
 
     let reported = reported_recoverable(&committed, committed.sim.next_timestamp())?;
+    let observed = observed_at(&committed, committed.sim.next_timestamp())?;
 
-    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot);
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot, &observed);
     let driver_reported = match &submit_result {
         Ok(amount) => *amount,
         Err(error) => panic!(
@@ -900,6 +1033,107 @@ fn a_withdraw_one_second_before_epoch_start_still_succeeds_pinning_the_exact_bou
          expectation was {expected}",
         paid[0].coin.amount
     );
+
+    Ok(())
+}
+
+/// dig_ecosystem#3444 -- the build-path defect itself. Before 0.11.0 the guarded builder returned
+/// `Ok(Clawback)` recovering 900,000 base units for this commitment, a figure the chain then refused
+/// to pay. Rolls into the first distributor epoch, reads at the clock the simulator will validate the
+/// next block at, and requires the typed refusal before anything is built.
+#[test]
+fn withdraw_refuses_a_started_epoch_commitment_before_building() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let rolled_reward_slot = roll_into_first_epoch(ctx, &mut committed)?;
+
+    let observed = observed_at(&committed, committed.sim.next_timestamp())?;
+    assert!(
+        observed.peak_timestamp() >= FIRST_EPOCH_START,
+        "precondition: the read must be at or after the commitment's epoch_start"
+    );
+
+    assert_guard_refuses_before_building(ctx, &mut committed, rolled_reward_slot, &observed);
+
+    Ok(())
+}
+
+/// The guard's boundary is inclusive at `epoch_start`, matching the chain's strict-before
+/// `ASSERT_BEFORE_SECONDS_ABSOLUTE(epoch_start)`: an observation exactly at [`FIRST_EPOCH_START`],
+/// with no epoch roll, is refused.
+#[test]
+fn withdraw_refuses_at_exactly_epoch_start() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let reward_slot = committed.reward_slot.clone();
+
+    let observed = observed_at(&committed, FIRST_EPOCH_START)?;
+    assert_guard_refuses_before_building(ctx, &mut committed, reward_slot, &observed);
+
+    Ok(())
+}
+
+/// The other side of the boundary: one second before [`FIRST_EPOCH_START`] the guarded builder
+/// builds, the chain accepts the bundle, and it pays exactly what `commitments()` reported -- so
+/// the guard refuses nothing the chain would pay.
+#[test]
+fn withdraw_builds_one_second_before_epoch_start() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let reward_slot = committed.reward_slot.clone();
+    let one_second_before = FIRST_EPOCH_START - 1;
+
+    committed.sim.set_next_timestamp(one_second_before)?;
+    let reported = reported_recoverable(&committed, one_second_before)?;
+    let observed = observed_at(&committed, one_second_before)?;
+    assert!(
+        reported.is_some(),
+        "commitments() must report a figure one second before epoch_start"
+    );
+
+    let submit_result = submit_withdraw(ctx, &mut committed, reward_slot, &observed);
+    assert_report_agrees_with_chain(reported, submit_result);
+
+    Ok(())
+}
+
+/// Fails if the epoch guard moves below the authority check: a stranger authority on a started
+/// epoch must still be refused with `CommitmentEpochStarted`, not `NotTheClawbackAuthority`.
+#[test]
+fn withdraw_refuses_a_started_epoch_before_checking_the_authority() -> anyhow::Result<()> {
+    let ctx = &mut SpendContext::new();
+    let mut committed = commit_to_first_epoch(ctx, COMMITTED_BASE_UNITS)?;
+    let reward_slot = committed.reward_slot.clone();
+
+    committed.sim.set_next_timestamp(FIRST_EPOCH_START)?;
+    let observed = observed_at(&committed, FIRST_EPOCH_START)?;
+    let stranger = Bytes32::new([0x7e; 32]);
+    assert_ne!(
+        stranger, committed.funder.puzzle_hash,
+        "precondition: the authority must be wrong"
+    );
+
+    let result = withdraw_committed_incentives(
+        ctx,
+        &mut committed.distributor,
+        committed.commitment_slot.clone(),
+        reward_slot,
+        stranger,
+        &observed,
+    );
+
+    match result {
+        Err(RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        }) => {
+            assert_eq!(distributor_epoch_start, FIRST_EPOCH_START);
+            assert_eq!(peak_timestamp, observed.peak_timestamp());
+        }
+        other => {
+            panic!("expected CommitmentEpochStarted ahead of the authority check, got: {other:?}")
+        }
+    }
 
     Ok(())
 }

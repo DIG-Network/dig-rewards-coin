@@ -437,6 +437,7 @@ fn commit_then_clawback(
     let mut committed = commit_to_first_epoch(ctx, amount_base_units)?;
     committed.sim.set_next_timestamp(CLOCK_BEFORE_EPOCH_START)?;
     let reported = reported_recoverable(&committed, CLOCK_BEFORE_EPOCH_START)?;
+    let observed = *read_snapshot(&committed, CLOCK_BEFORE_EPOCH_START)?.observed();
 
     let clawback = withdraw_committed_incentives(
         ctx,
@@ -444,6 +445,7 @@ fn commit_then_clawback(
         committed.commitment_slot,
         committed.reward_slot,
         committed.funder.puzzle_hash,
+        &observed,
     )?;
 
     Ok((clawback.recovered_base_units(), reported))
@@ -570,6 +572,7 @@ fn clawback_pays_the_funder_the_amount_actually_observed_on_chain() -> anyhow::R
     committed.sim.set_next_timestamp(CLOCK_BEFORE_EPOCH_START)?;
     let expected = reported_recoverable(&committed, CLOCK_BEFORE_EPOCH_START)?
         .expect("the epoch has not started at this clock, so the share is reported");
+    let observed = *read_snapshot(&committed, CLOCK_BEFORE_EPOCH_START)?.observed();
 
     let clawback = withdraw_committed_incentives(
         ctx,
@@ -577,6 +580,7 @@ fn clawback_pays_the_funder_the_amount_actually_observed_on_chain() -> anyhow::R
         committed.commitment_slot.clone(),
         committed.reward_slot.clone(),
         funder_puzzle_hash,
+        &observed,
     )?;
     let driver_reported = clawback.recovered_base_units();
 
@@ -653,6 +657,7 @@ fn the_action_solution_carries_the_full_commitment_while_the_return_carries_the_
 
     let ctx = &mut SpendContext::new();
     let mut committed = commit_to_first_epoch(ctx, REWARDS_BASE_UNITS)?;
+    let observed = *read_snapshot(&committed, CLOCK_BEFORE_EPOCH_START)?.observed();
 
     let actions_before = committed.distributor.pending_spend.actions.len();
     let clawback = withdraw_committed_incentives(
@@ -661,6 +666,7 @@ fn the_action_solution_carries_the_full_commitment_while_the_return_carries_the_
         committed.commitment_slot,
         committed.reward_slot,
         committed.funder.puzzle_hash,
+        &observed,
     )?;
     let share = clawback.recovered_base_units();
 
