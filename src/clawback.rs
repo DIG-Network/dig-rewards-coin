@@ -47,6 +47,7 @@ use chia_sdk_types::puzzles::{
 };
 use chia_sdk_types::Conditions;
 
+use crate::state::ChainObservation;
 use crate::RewardsError;
 
 /// A completed clawback: the conditions to deliver, and what the puzzle returned.
@@ -197,6 +198,7 @@ pub fn withdraw_committed_incentives(
     commitment_slot: Slot<RewardDistributorCommitmentSlotValue>,
     reward_slot: Slot<RewardDistributorRewardSlotValue>,
     expected_clawback_puzzle_hash: Bytes32,
+    _observed: &ChainObservation,
 ) -> Result<Clawback, RewardsError> {
     let recorded = clawback_authority(&commitment_slot);
 
