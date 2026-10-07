@@ -71,21 +71,39 @@ jobs:
         id: extract_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
+      # release.yml commits the git-cliff CHANGELOG.md BEFORE it tags, so the tagged tree holds
+      # this version's section. Render that section as the release body (#3445) instead of a
+      # static template. Fail loudly when the section is missing: an empty or generic body would
+      # read as a confident release note that says nothing.
+      - name: Build release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.extract_version.outputs.VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed -e 's/\r$//' > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section; refusing an empty release body"
+            exit 1
+          fi
+          {
+            echo
+            echo '### Installation'
+            echo '```toml'
+            echo '[dependencies]'
+            echo "dig-rewards-coin = \"$VERSION\""
+            echo '```'
+          } >> release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "dig-rewards-coin v${{ steps.extract_version.outputs.VERSION }}"
-          body: |
-            ## dig-rewards-coin v${{ steps.extract_version.outputs.VERSION }}
-
-            Reward-distributor coin driver for the DIG Network, on Chia. This release is
-            scaffolding: CI, release model and dependency ceiling only — no driver logic yet.
-
-            ### Installation
-            ```toml
-            [dependencies]
-            dig-rewards-coin = "${{ steps.extract_version.outputs.VERSION }}"
-            ```
+          body_path: release-notes.md
           draft: false
           prerelease: false
