@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.11.1] - 2026-10-07
+## [0.11.2] - 2026-10-07
 
 ### Bug Fixes
-- **release:** Build the GitHub release body from CHANGELOG.md (#21)
+- **release:** Build the GitHub release body from CHANGELOG.md (#21)- **release:** Re-cut stranded v0.11.1 as 0.11.2 and retry the tag push (#22)
 
 ## [0.11.0] - 2026-10-01
 
