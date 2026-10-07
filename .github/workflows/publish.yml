@@ -85,7 +85,7 @@ jobs:
             index($0, "## [" ver "]") == 1 { found = 1; next }
             found && /^## \[/ { exit }
             found { print }
-          ' CHANGELOG.md | sed -e 's/$//' > release-notes.md
+          ' CHANGELOG.md | sed -e 's/\r$//' > release-notes.md
           if ! grep -q '[^[:space:]]' release-notes.md; then
             echo "::error::CHANGELOG.md has no '## [$VERSION]' section; refusing an empty release body"
             exit 1
