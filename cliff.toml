@@ -20,9 +20,9 @@ body = """
 ### {{ group | striptags | trim | upper_first }}
 {% for commit in commits %}\
 - {% if commit.breaking %}**BREAKING** {% endif %}\
-{% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
 {% endfor %}
-{% endfor %}\n
+{% endfor %}
 """
 trim = true
 footer = ""
