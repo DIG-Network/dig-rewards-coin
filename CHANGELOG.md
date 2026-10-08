@@ -4,10 +4,16 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.11.3] - 2026-10-08
+
+### Bug Fixes
+- **changelog:** Render one bullet per commit in cliff.toml (#23)
+
 ## [0.11.2] - 2026-10-07
 
 ### Bug Fixes
-- **release:** Build the GitHub release body from CHANGELOG.md (#21)- **release:** Re-cut stranded v0.11.1 as 0.11.2 and retry the tag push (#22)
+- **release:** Build the GitHub release body from CHANGELOG.md (#21)
+- **release:** Re-cut stranded v0.11.1 as 0.11.2 and retry the tag push (#22)
 
 ## [0.11.0] - 2026-10-01
 
@@ -97,6 +103,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.1.0] - 2026-09-08
 
 ### Chores
-- Bootstrap repo (README, licenses, gitignore)- Scaffold dig-rewards-coin (CI, release model, dep ceiling, error type)
+- Bootstrap repo (README, licenses, gitignore)
+- Scaffold dig-rewards-coin (CI, release model, dep ceiling, error type)
 
 
